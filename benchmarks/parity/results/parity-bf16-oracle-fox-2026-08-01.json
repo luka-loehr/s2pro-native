@@ -1,0 +1,275 @@
+{
+ "fixture_dir": "/home/administrator/fish-s2-native/fixtures/base",
+ "work_dir": "parity-runs/bf16",
+ "layers": {
+  "backbone_layer00": {
+   "cos": 0.999998,
+   "max_abs": 0.0156
+  },
+  "backbone_layer01": {
+   "cos": 0.999998,
+   "max_abs": 0.0156
+  },
+  "backbone_layer02": {
+   "cos": 0.999997,
+   "max_abs": 0.0156
+  },
+  "backbone_layer03": {
+   "cos": 0.999994,
+   "max_abs": 0.0625
+  },
+  "backbone_layer04": {
+   "cos": 0.999994,
+   "max_abs": 0.0625
+  },
+  "backbone_layer05": {
+   "cos": 0.999994,
+   "max_abs": 0.0625
+  },
+  "backbone_layer06": {
+   "cos": 0.999975,
+   "max_abs": 0.625
+  },
+  "backbone_layer07": {
+   "cos": 0.999981,
+   "max_abs": 0.5
+  },
+  "backbone_layer08": {
+   "cos": 0.999982,
+   "max_abs": 0.5
+  },
+  "backbone_layer09": {
+   "cos": 0.99998,
+   "max_abs": 0.5
+  },
+  "backbone_layer10": {
+   "cos": 0.999979,
+   "max_abs": 0.5
+  },
+  "backbone_layer11": {
+   "cos": 0.999976,
+   "max_abs": 0.5
+  },
+  "backbone_layer12": {
+   "cos": 0.999976,
+   "max_abs": 0.5
+  },
+  "backbone_layer13": {
+   "cos": 0.999978,
+   "max_abs": 0.5
+  },
+  "backbone_layer14": {
+   "cos": 0.999984,
+   "max_abs": 0.1875
+  },
+  "backbone_layer15": {
+   "cos": 0.999985,
+   "max_abs": 0.1875
+  },
+  "backbone_layer16": {
+   "cos": 0.999986,
+   "max_abs": 0.1875
+  },
+  "backbone_layer17": {
+   "cos": 0.999988,
+   "max_abs": 0.1875
+  },
+  "backbone_layer18": {
+   "cos": 0.999989,
+   "max_abs": 0.1875
+  },
+  "backbone_layer19": {
+   "cos": 0.999988,
+   "max_abs": 0.1875
+  },
+  "backbone_layer20": {
+   "cos": 0.999989,
+   "max_abs": 0.1875
+  },
+  "backbone_layer21": {
+   "cos": 0.999989,
+   "max_abs": 0.1875
+  },
+  "backbone_layer22": {
+   "cos": 0.999986,
+   "max_abs": 1.0
+  },
+  "backbone_layer23": {
+   "cos": 0.999981,
+   "max_abs": 2.0
+  },
+  "backbone_layer24": {
+   "cos": 0.999983,
+   "max_abs": 2.0
+  },
+  "backbone_layer25": {
+   "cos": 0.999977,
+   "max_abs": 2.0
+  },
+  "backbone_layer26": {
+   "cos": 0.999981,
+   "max_abs": 2.0
+  },
+  "backbone_layer27": {
+   "cos": 0.999974,
+   "max_abs": 4.0
+  },
+  "backbone_layer28": {
+   "cos": 0.999966,
+   "max_abs": 4.0
+  },
+  "backbone_layer29": {
+   "cos": 0.999957,
+   "max_abs": 8.0
+  },
+  "backbone_layer30": {
+   "cos": 0.99996,
+   "max_abs": 8.0
+  },
+  "backbone_layer31": {
+   "cos": 0.999965,
+   "max_abs": 8.0
+  },
+  "backbone_layer32": {
+   "cos": 0.999968,
+   "max_abs": 8.0
+  },
+  "backbone_layer33": {
+   "cos": 0.999973,
+   "max_abs": 8.0
+  },
+  "backbone_layer34": {
+   "cos": 0.999969,
+   "max_abs": 16.0
+  },
+  "backbone_layer35": {
+   "cos": 0.999998,
+   "max_abs": 32.0
+  },
+  "backbone_final_norm": {
+   "cos": 0.999968,
+   "max_abs": 0.125
+  }
+ },
+ "summary": {
+  "worst_layer": {
+   "name": "backbone_layer29",
+   "cos": 0.999957
+  },
+  "prefill_logits": {
+   "cos": 0.999986,
+   "argmax_fixture": 154636,
+   "argmax_ours": 154636,
+   "argmax_match": true
+  },
+  "step1_logits": {
+   "cos": 0.999415,
+   "argmax_fixture": 151785,
+   "argmax_ours": 151785,
+   "argmax_match": true
+  },
+  "fast_ar_step0": [
+   {
+    "cb": 1,
+    "cos": 0.999994,
+    "argmax_fixture": 499,
+    "argmax_ours": 499,
+    "argmax_match": true
+   },
+   {
+    "cb": 2,
+    "cos": 0.999996,
+    "argmax_fixture": 444,
+    "argmax_ours": 444,
+    "argmax_match": true
+   },
+   {
+    "cb": 3,
+    "cos": 0.999998,
+    "argmax_fixture": 526,
+    "argmax_ours": 526,
+    "argmax_match": true
+   },
+   {
+    "cb": 4,
+    "cos": 0.999995,
+    "argmax_fixture": 801,
+    "argmax_ours": 801,
+    "argmax_match": true
+   },
+   {
+    "cb": 5,
+    "cos": 0.999994,
+    "argmax_fixture": 475,
+    "argmax_ours": 475,
+    "argmax_match": true
+   },
+   {
+    "cb": 6,
+    "cos": 0.999998,
+    "argmax_fixture": 368,
+    "argmax_ours": 368,
+    "argmax_match": true
+   },
+   {
+    "cb": 7,
+    "cos": 0.999994,
+    "argmax_fixture": 172,
+    "argmax_ours": 172,
+    "argmax_match": true
+   },
+   {
+    "cb": 8,
+    "cos": 0.999998,
+    "argmax_fixture": 1019,
+    "argmax_ours": 434,
+    "argmax_match": false
+   },
+   {
+    "cb": 9,
+    "cos": 0.998328,
+    "argmax_fixture": 960,
+    "argmax_ours": 960,
+    "argmax_match": true
+   }
+  ],
+  "semantic_tokens": {
+   "fixture": 64,
+   "ours": 64,
+   "match_prefix": 2,
+   "match_total": 3,
+   "first_divergence": {
+    "step": 2,
+    "fixture": 152663,
+    "ours": 154790
+   }
+  },
+  "frames": {
+   "rows_compared": 64,
+   "rows_exact": 0,
+   "per_codebook_matches": [
+    3,
+    4,
+    2,
+    2,
+    1,
+    1,
+    2,
+    2,
+    1,
+    1
+   ]
+  },
+  "codec_isolated": {
+   "cos": 1.0,
+   "snr_db": 65.85,
+   "n_fixture": 131072,
+   "n_ours": 131072
+  },
+  "pcm_end_to_end": {
+   "cos": 0.05764,
+   "n_fixture": 131072,
+   "n_ours": 131072
+  }
+ }
+}

@@ -228,14 +228,24 @@ s2p_status s2p_session_prefill(s2p_session* s, const int64_t* ids,
                                     (float)S2P_SQRT11, st));
     }
 
-    for (int l = 0; l < S2P_SLOW_LAYERS; l++)
+    for (int l = 0; l < S2P_SLOW_LAYERS; l++) {
         S2P_TRY(run_layer(m, l, n_ids, 0, s, NULL));
+        if (s2psl_dump_dir() != NULL) { /* parity: residual after layer l,
+                                         * last prompt position */
+            char nm[32];
+            snprintf(nm, sizeof(nm), "backbone_layer%02d", l);
+            s2psl_dump_vec_bf16(nm, BF(m->sx) + (size_t)(n_ids - 1) * S2P_DIM,
+                                S2P_DIM, st);
+        }
+    }
 
     /* final-normed LAST hidden -> frame-0 sampling state (pitfall 5: the
      * fast-AR must be primed on THIS, not the pre-norm residual). */
     S2P_CUDA_TRY(s2pk_rms_norm(BF(m->sx) + (size_t)(n_ids - 1) * S2P_DIM,
                                BF(m->final_norm), BF(s->pending_hidden), 1,
                                S2P_DIM, S2P_NORM_EPS, st));
+    s2psl_dump_vec_bf16("backbone_final_norm", s->pending_hidden.data, S2P_DIM,
+                        st);
     S2P_CUDA_TRY(cudaStreamSynchronize(st));
 
     s->kv_len = n_ids;
@@ -375,6 +385,16 @@ s2p_status s2p_model_batch_next_frame(s2p_model* m, s2p_session** sess, int n,
     /* tied lm-head: logits[b] = hidden[b] @ embed^T (always BF16 cuBLAS) */
     S2P_TRY(s2p_gemm_bf16(m->shidden.data, m->embed.data, m->slogits.data,
                           nact, S2P_TEXT_VOCAB, S2P_DIM, st));
+    if (s2psl_dump_dir() != NULL && nact == 1) {
+        /* parity: full logits row of the first two sampling steps (fixture
+         * names prefill_logits / step1_logits); single-session runs only */
+        static int dump_step = 0;
+        if (dump_step < 2)
+            s2psl_dump_vec_bf16(dump_step == 0 ? "prefill_logits"
+                                               : "step1_logits",
+                                m->slogits.data, S2P_TEXT_VOCAB, st);
+        dump_step++;
+    }
 
     /* download the 4097 finite-after-bias candidate logits per row */
     for (int b = 0; b < nact; b++) {

@@ -65,6 +65,11 @@ $(BUILD)/s2pro-server: $(C_OBJS) $(CU_OBJS) $(CPP_OBJS)
 $(BUILD)/s2p-test: $(LIB_OBJS) $(BUILD)/tests/test_forward.o
 	$(NVCC) $(GENCODE) $^ $(FSO_OBJS) -o $@ $(LIBS)
 
+$(BUILD)/s2p-parity: $(LIB_OBJS) $(BUILD)/tests/parity.o
+	$(NVCC) $(GENCODE) $^ $(FSO_OBJS) -o $@ $(LIBS)
+
+parity: $(BUILD)/s2p-parity
+
 # ---- host-side selftests (json parser, tokenizer + prompt builder) --------
 
 $(BUILD)/selftest_json: $(LIB_OBJS) $(BUILD)/tests/selftest_json.o
@@ -103,4 +108,4 @@ $(BUILD)/syntax/fso_wrap.o: src/fso/fso_wrap.cpp src/fso/fso.h
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all nvcc-build syntax selftest clean
+.PHONY: all nvcc-build syntax selftest parity clean

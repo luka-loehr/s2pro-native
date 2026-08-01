@@ -27,10 +27,19 @@ for published releases.
 - Reproducibility scripts: checkpoint fetch from Hugging Face and
   fish-scales-ops object build (`scripts/`).
 
+- Layer-parity gate against a pure-PyTorch oracle
+  (`benchmarks/parity/`): dependency-free fixture tooling
+  (`tools/parity_prep.py`, `tools/parity_compare.py`), env-gated dump hooks,
+  and the `s2p-parity` harness. BF16 **passes** at every stage (backbone
+  cos ≥ 0.99996, DAC SNR 65.9 dB on reference frames; the one first-frame
+  argmax flip is an exact bf16 tie). FP8 **fails** (backbone cos collapses
+  to 0.33; immediate EOS on the oracle prompt) and is rejected as the
+  production decode path.
+
 ### Known gaps
 
-- Layer parity against the PyTorch reference is not yet validated.
-- Single-stream decode is above realtime (RTF 1.39 FP8); the path below 1.0
-  is tracked in the README roadmap.
+- Single-stream decode is above realtime (BF16 RTF 2.38); the path below
+  1.0 is tracked in the README roadmap, with INT8 per-channel weight-only
+  GEMV as the primary 8-bit candidate after the FP8 parity failure.
 - Voice-cloning encode is disabled until the codec converter retains
   `encoder.*` tensors (`S2P_GAP` in `src/dac/dac.c`).

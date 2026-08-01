@@ -21,6 +21,13 @@
 #include "s2pro/kernels.h"
 #include "s2pro/tensor.h"
 
+/* parity dump hooks (src/slowar/debug_dump.c); no-ops without S2P_DUMP_DIR */
+extern "C" {
+const char* s2psl_dump_dir(void);
+void s2psl_dump_vec_bf16(const char* name, const void* dev_bf16, int64_t n,
+                         cudaStream_t st);
+}
+
 /* ---- dims (compile-time, verified against checkpoint config.json) ---- */
 #define FA_DIM      S2P_DIM            /* 2560 */
 #define FA_LAYERS   S2P_FAST_LAYERS    /* 4 */
@@ -454,6 +461,17 @@ s2p_status s2pfa_decode_frame_batch(s2pfa* f, const __nv_bfloat16* hidden,
                                    f->t, B, FA_DIM, S2P_NORM_EPS, stream));
         S2P_TRY(s2p_linear_forward(&f->output, f->t, f->logits, B, f->mode,
                                    stream));
+        if (s2psl_dump_dir() != NULL && B == 1) {
+            /* parity: per-residual-step logits of the FIRST frame only
+             * (fixture fast_ar_step0_logits [9,4096]) */
+            static int dump_frame = 0;
+            if (cb == 1) dump_frame++;
+            if (dump_frame == 1) {
+                char nm[48];
+                snprintf(nm, sizeof(nm), "fast_ar_step0_cb%d", cb);
+                s2psl_dump_vec_bf16(nm, f->logits, FA_CB, stream);
+            }
+        }
         int32_t* dst = f->stage + (size_t)(cb - 1) * B;
         S2P_CUDA_TRY(s2pk_argmax(f->logits, dst, B, FA_CB, stream));
         if (cb < FA_NCB - 1) {

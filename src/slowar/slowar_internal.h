@@ -152,6 +152,14 @@ struct s2p_session {
     s2ps_sampler sampler;
 };
 
+/* ----- parity dump hooks (debug_dump.c) ----------------------------------
+ * Active only when S2P_DUMP_DIR is set; every call is a no-op otherwise.
+ * Device bf16 vectors are downloaded, widened to f32, and written as raw
+ * little-endian f32 files "<dir>/<name>.f32" for tools/parity_compare.py. */
+const char* s2psl_dump_dir(void);
+void s2psl_dump_vec_bf16(const char* name, const void* dev_bf16, int64_t n,
+                         cudaStream_t st);
+
 /* layer l k/v cache base pointers inside a session's kv tensor */
 static inline __nv_bfloat16* s2p_kv_k(const s2p_session* s, int layer) {
     return (__nv_bfloat16*)s->kv.data +
