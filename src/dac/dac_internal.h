@@ -159,6 +159,13 @@ void       s2pd_inc_destroy(s2pd_inc* s);
 s2p_status s2pd_inc_push(s2pd_inc* s,
                          const int32_t frame_codes[S2P_NUM_CODEBOOKS],
                          float* pcm_host, cudaStream_t stream);
+/* Pipelined pair: push_async enqueues one frame (no sync; one in flight),
+ * collect syncs and copies the samples out (n_out 0 if none pending). */
+s2p_status s2pd_inc_push_async(s2pd_inc* s,
+                               const int32_t frame_codes[S2P_NUM_CODEBOOKS],
+                               cudaStream_t stream);
+s2p_status s2pd_inc_collect(s2pd_inc* s, float* pcm_host, int64_t* n_out,
+                            cudaStream_t stream);
 
 /* ---------------- CUDA kernel launchers ---------------------------------- */
 /* All launchers enqueue on `st` and return cudaPeekAtLastError().           */
