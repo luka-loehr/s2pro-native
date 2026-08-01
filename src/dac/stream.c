@@ -43,6 +43,8 @@ static int stream_use_reference(void) {
 struct s2p_dac_stream {
     s2p_dac* d;
     s2pd_inc* inc;        /* non-NULL => incremental path */
+    float*   pend_chunk;  /* reference-mode push_async stash */
+    int64_t  pend_n;
     int32_t* frames;      /* frame-major [count][10] */
     int      cap, count;
     int      code_start;  /* absolute frame index of frames[0] */
@@ -73,9 +75,49 @@ s2p_status s2p_dac_stream_create(s2p_dac* d, s2p_dac_stream** out) {
 void s2p_dac_stream_destroy(s2p_dac_stream* s) {
     if (!s) return;
     s2pd_inc_destroy(s->inc);
+    free(s->pend_chunk);
     free(s->frames);
     free(s->tail);
     free(s);
+}
+
+/* Pipelined pair. Incremental: true enqueue/sync split. Reference: the push
+ * is inherently synchronous, so push_async runs it and stashes the chunk. */
+s2p_status s2p_dac_stream_push_async(s2p_dac_stream* s,
+                                     const int32_t
+                                         frame_codes[S2P_NUM_CODEBOOKS],
+                                     cudaStream_t stream) {
+    if (!s || !frame_codes) return S2P_ERR_INVALID;
+    if (s->finished) return S2P_ERR_STATE;
+    if (s->inc) return s2pd_inc_push_async(s->inc, frame_codes, stream);
+    if (s->pend_chunk) return S2P_ERR_STATE;
+    return s2p_dac_stream_push(s, frame_codes, &s->pend_chunk, &s->pend_n,
+                               stream);
+}
+
+s2p_status s2p_dac_stream_collect(s2p_dac_stream* s, float** pcm_chunk,
+                                  int64_t* n_out, cudaStream_t stream) {
+    if (!s || !pcm_chunk || !n_out) return S2P_ERR_INVALID;
+    *pcm_chunk = NULL;
+    *n_out = 0;
+    if (s->inc) {
+        float* pcm = (float*)malloc(S2P_FRAME_SAMPLES * sizeof(float));
+        if (!pcm) return S2P_ERR_OOM;
+        int64_t n = 0;
+        s2p_status rc = s2pd_inc_collect(s->inc, pcm, &n, stream);
+        if (rc != S2P_OK || n == 0) {
+            free(pcm);
+            return rc;
+        }
+        *pcm_chunk = pcm;
+        *n_out = n;
+        return S2P_OK;
+    }
+    *pcm_chunk = s->pend_chunk;
+    *n_out = s->pend_n;
+    s->pend_chunk = NULL;
+    s->pend_n = 0;
+    return S2P_OK;
 }
 
 static void trim_codes(s2p_dac_stream* s, int keep_from) {
@@ -241,7 +283,9 @@ s2p_status s2p_dac_stream_finish(s2p_dac_stream* s, float** pcm_chunk,
     if (s->finished) return S2P_ERR_STATE;
     s->finished = 1;
 
-    if (s->inc) return S2P_OK;          /* nothing withheld: already emitted */
+    if (s->inc)                         /* nothing withheld beyond a pending
+                                         * pipelined frame, if any */
+        return s2p_dac_stream_collect(s, pcm_chunk, n_out, stream);
 
     int has_codes = s->count > 0;
     int has_tail = s->tail_len > 0;
