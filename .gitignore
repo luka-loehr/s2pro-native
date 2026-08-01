@@ -1,6 +1,6 @@
 build/
 *.o
 .DS_Store
-*.safetensors
-model/*.safetensors*
 artifacts-local/
+model/
+3rdparty/
