@@ -26,8 +26,8 @@ for published releases.
 
 - Voice registry (`include/s2pro/voices.h`, `src/voice/`): named references
   as `<name>.wav` + `<name>.txt` pairs, DAC-encoded once at startup; three
-  multilingual sample voices ship in `voices/` (one ElevenLabs-Multilingual
-  take each cycling DE/EN/FR/ES/RU/UK/TR — docs/VOICES.md documents why
+  multilingual sample voices ship in `voices/` (one Google Gemini TTS take
+  each cycling DE/EN/FR/ES/RU/UK/TR — docs/VOICES.md documents why
   references must come from an accent-free multilingual source).
 - HTTP API: `GET /v1/voices`, `"voice"` selection on `POST /v1/tts`, and
   per-request cloning via `"reference_audio_b64"` + `"reference_text"`
