@@ -46,6 +46,8 @@ typedef struct sched_req {
     char*            ref_text;
     sched_ref*       refs;
     int              n_refs;
+    float*           ref_pcm;   /* on-the-fly clone: encoded on the worker */
+    int64_t          ref_pcm_n;
     s2p_sampling_cfg sampling;
     s2p_audio_cb     cb;
     void*            user;
@@ -94,6 +96,7 @@ static void req_free(sched_req* r) {
     free(r->ref_text);
     for (int i = 0; i < r->n_refs; i++) free(r->refs[i].codes);
     free(r->refs);
+    free(r->ref_pcm);
     free(r);
 }
 
@@ -222,6 +225,32 @@ static void handle_frame(s2p_sched* s, sched_active* a,
  * queue. On failure the client gets a final callback and the req is freed.
  * Returns 1 if the session went active. Called WITHOUT the lock. */
 static int start_request(s2p_sched* s, sched_req* r, sched_active* slot) {
+    /* On-the-fly clone: encode the request's PCM into a single ref now,
+     * on this (the only GPU) thread. */
+    if (r->n_refs == 0 && r->ref_pcm != NULL && r->ref_pcm_n > 0) {
+        int32_t* codes = NULL;
+        int      T = 0;
+        s2p_status erc =
+            s2p_dac_encode(s->dac, r->ref_pcm, r->ref_pcm_n, &codes, &T, 0);
+        free(r->ref_pcm);
+        r->ref_pcm = NULL;
+        r->ref_pcm_n = 0;
+        if (erc != S2P_OK) {
+            fprintf(stderr,
+                    "[s2pro] sched: clone encode failed (%d) req %llu\n",
+                    (int)erc, (unsigned long long)r->id);
+            goto fail_cb;
+        }
+        r->refs = (sched_ref*)calloc(1, sizeof(sched_ref));
+        if (!r->refs) {
+            free(codes);
+            goto fail_cb;
+        }
+        r->refs[0].codes = codes;
+        r->refs[0].T = T;
+        r->n_refs = 1;
+    }
+
     s2p_request_text req_text;
     memset(&req_text, 0, sizeof(req_text));
     req_text.text = r->text;
@@ -514,6 +543,18 @@ s2p_status s2p_sched_submit(s2p_sched* s, const s2p_request_text* req,
             r->refs[i].T = p->T;
             r->n_refs = i + 1;
         }
+    }
+    if (req->n_refs == 0 && req->ref_pcm != NULL && req->ref_pcm_n > 0) {
+        /* on-the-fly clone: deep-copy the PCM; the WORKER encodes it (all
+         * GPU work stays on one thread) */
+        size_t nb = (size_t)req->ref_pcm_n * sizeof(float);
+        r->ref_pcm = (float*)malloc(nb);
+        if (!r->ref_pcm) {
+            req_free(r);
+            return S2P_ERR_OOM;
+        }
+        memcpy(r->ref_pcm, req->ref_pcm, nb);
+        r->ref_pcm_n = req->ref_pcm_n;
     }
 
     pthread_mutex_lock(&s->mu);

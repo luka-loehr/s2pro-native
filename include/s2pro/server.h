@@ -14,6 +14,7 @@
 
 #include "s2pro/status.h"
 #include "s2pro/scheduler.h"
+#include "s2pro/voices.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -24,6 +25,9 @@ typedef struct {
     const char* bind_addr;    /* NULL -> 127.0.0.1 */
     const char* auth_token;   /* NULL -> no auth */
     int         max_conns;    /* 0 -> 64 */
+    /* additive (2026-08-01): named-voice registry for GET /v1/voices and
+     * the "voice" request field; NULL -> zero-shot + inline cloning only */
+    const s2p_voices* voices;
 } s2p_server_opts;
 
 /* Blocks until SIGINT/SIGTERM. */

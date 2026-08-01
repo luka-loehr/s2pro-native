@@ -10,6 +10,21 @@ for published releases.
 
 ### Added
 
+- Voice registry (`include/s2pro/voices.h`, `src/voice/`): named references
+  as `<name>.wav` + `<name>.txt` pairs, DAC-encoded once at startup; three
+  multilingual sample voices ship in `voices/` (one ElevenLabs-Multilingual
+  take each cycling DE/EN/FR/ES/RU/UK/TR — docs/VOICES.md documents why
+  references must come from an accent-free multilingual source).
+- HTTP API: `GET /v1/voices`, `"voice"` selection on `POST /v1/tts`, and
+  per-request cloning via `"reference_audio_b64"` + `"reference_text"`
+  (wav, 16-bit mono 44.1 kHz, max 15 s; encoded on the scheduler thread).
+- Public wav readers (`s2p_wav_read_f32`/`s2p_wav_parse_f32`) and
+  multi-reference prompt support exercised up to a 51 s / 1,099-frame
+  reference block (mixed-language generation in one call).
+- First runtime qualification of `s2pro-server`: healthz, voice listing,
+  named-voice + zero-shot + inline-clone synthesis over HTTP on the DGX
+  Spark; measured TTFA 1.06 s (zero-shot) / 2.45 s (50 s reference block).
+
 - Complete native C11 + CUDA serving stack for Fish Audio S2-Pro on NVIDIA
   DGX Spark (GB10, `sm_121`): safetensors loader (single and sharded),
   arena JSON parser, byte-level BPE tokenizer (bit-exact against the HF
