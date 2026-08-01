@@ -36,10 +36,20 @@ for published releases.
   to 0.33; immediate EOS on the oracle prompt) and is rejected as the
   production decode path.
 
+- Voice-cloning encode activated end to end: `tools/convert_codec_full.py`
+  produces the full codec artifact (encoder conv stack + quantizer
+  pre-module, weight-norm folded), the already-implemented native encode
+  path self-activates, and `s2p-test` gained reference-wav support
+  (`S2P_TEST_REF`/`S2P_TEST_REF_TEXT`). First exercised 2026-08-01: 8.4 s
+  reference → 181 VQ frames (1.1 s encode), prompt with injected reference,
+  generation to natural EOS.
+- Listening-run controls on `s2p-test`: `S2P_TEST_TEMP`, `S2P_TEST_SEED`,
+  `S2P_TEST_FRAMES` (reference sampler temp 0.8 / top-p 0.8; natural EOS).
+
 ### Known gaps
 
 - Single-stream decode is above realtime (BF16 RTF 2.38); the path below
   1.0 is tracked in the README roadmap, with INT8 per-channel weight-only
   GEMV as the primary 8-bit candidate after the FP8 parity failure.
-- Voice-cloning encode is disabled until the codec converter retains
-  `encoder.*` tensors (`S2P_GAP` in `src/dac/dac.c`).
+- Encoder output has no oracle-fixture parity comparison yet (judged by
+  cloning fidelity by ear so far).

@@ -27,11 +27,18 @@ scripts/fetch_model.sh model          # safetensors + tokenizer + config from HF
 ```
 
 The DAC codec ships as `codec.pth` (PyTorch). The native loader reads a raw
-`codec.bin`/`codec.idx` pair instead; convert once with any PyTorch
-environment (tensor name/offset table + raw bf16 payload — the format is
-documented in `src/dac/dac_weights.c`). Note the current converter drops
-`encoder.*` tensors, which disables voice-cloning encode (`S2P_GAP` in
-`src/dac/dac.c`).
+`codec.bin`/`codec.idx` pair instead (format documented in
+`src/dac/dac_weights.c`). Convert once with any torch-capable container:
+
+```sh
+python3 tools/convert_codec_full.py --model /path/with/codec.pth --out codec-full
+```
+
+The full artifact (~1.6 GB FP32) includes the encoder conv stack and
+quantizer pre-module, which activates voice-cloning encode
+(`s2p_dac_encode`); a decode-only artifact loads fine but disables encode.
+For a cloning run: `S2P_TEST_REF=<44.1k mono s16 wav>` +
+`S2P_TEST_REF_TEXT=<transcript>` on `s2p-test`.
 
 ## 3. Build
 
