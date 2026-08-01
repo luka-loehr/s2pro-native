@@ -21,7 +21,7 @@
 #include "s2pro/tokenizer.h"
 #include "s2pro/wav.h"
 
-#define MAX_FRAMES 512 /* default cap 60; override via S2P_TEST_FRAMES */
+#define MAX_FRAMES 2048 /* default cap 60; override via S2P_TEST_FRAMES */
 #define OUT_WAV "/tmp/s2p_smoke.wav"
 
 static double now_ms(void) {
