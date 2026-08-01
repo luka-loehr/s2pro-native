@@ -4,3 +4,9 @@ build/
 artifacts-local/
 model/
 3rdparty/
+
+# Reference voices are generated per deployment with tools/voicegen, never
+# committed: the full 30-voice set is ~160 MB of audio and is reproducible
+# from a single command. voices/README.md stays tracked.
+voices/*.wav
+voices/*.txt

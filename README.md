@@ -53,7 +53,9 @@ gap to below-realtime synthesis.
   cancellation, and graceful shutdown.
 - A multilingual named-voice registry (drop `<name>.wav` + `<name>.txt`
   into `voices/`) plus per-request cloning over HTTP
-  ([docs/VOICES.md](docs/VOICES.md)).
+  ([docs/VOICES.md](docs/VOICES.md)). Reference audio is generated per
+  deployment rather than committed — one command produces any or all 30
+  multilingual voices ([`tools/voicegen`](tools/voicegen/README.md)).
 - Frozen module contracts (`include/s2pro/`) that let independent
   contributors build against stable interfaces ([CONTRACT.md](CONTRACT.md)).
 
@@ -108,6 +110,7 @@ lockstep scheduler (sessions, first-frame priority, backpressure)
 | `src/fso` | The single C++ TU: extern-C shim over the fish-scales-ops FP8 GEMM. |
 | `docs` | Porting spec (`PORTING.md`), Spark build guide (`SPARK.md`). |
 | `scripts` | Checkpoint fetch, fish-scales-ops object build. |
+| `tools/voicegen` | Offline Rust generator for the reference voices (Gemini TTS on Vertex AI, 24 → 44.1 kHz resample, transcript verification). Not part of the runtime. |
 | Root community files | Contribution, security, conduct, changelog, citation, and Apache-2.0 license policies. |
 
 ## Quickstart

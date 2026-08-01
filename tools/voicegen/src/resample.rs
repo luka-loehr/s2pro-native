@@ -71,13 +71,20 @@ fn build_bank() -> Vec<f32> {
 }
 
 /// Resample mono 24 kHz S16 to mono 44.1 kHz S16.
+///
+/// Band-limited interpolation rings slightly above the source's own peaks, so a
+/// take mastered to 0 dBFS — which Gemini's output routinely is — would clip on
+/// conversion. Rather than hard-clamp those samples, the whole take is scaled by
+/// the (fractional-dB) factor that just brings the overshoot back inside range,
+/// which is inaudible and keeps the waveform undistorted.
 pub fn resample(input: &[i16]) -> Vec<i16> {
     if input.is_empty() {
         return Vec::new();
     }
     let bank = build_bank();
     let out_len = input.len() * L / M;
-    let mut out = Vec::with_capacity(out_len);
+    let mut wide = Vec::with_capacity(out_len);
+    let mut peak = 0.0f32;
 
     for n in 0..out_len {
         // Output n samples the input at t = n * M / L, so the integer part is
@@ -94,9 +101,20 @@ pub fn resample(input: &[i16]) -> Vec<i16> {
                 acc += input[idx as usize] as f32 * *tap;
             }
         }
-        out.push(acc.round().clamp(-32768.0, 32767.0) as i16);
+        peak = peak.max(acc.abs());
+        wide.push(acc);
     }
-    out
+
+    // Only ever attenuates; a quiet take is never pumped up to full scale.
+    const FULL_SCALE: f32 = 32767.0;
+    let gain = if peak > FULL_SCALE {
+        FULL_SCALE / peak
+    } else {
+        1.0
+    };
+    wide.into_iter()
+        .map(|s| (s * gain).round().clamp(-32768.0, FULL_SCALE) as i16)
+        .collect()
 }
 
 #[cfg(test)]
@@ -191,5 +209,38 @@ mod tests {
     #[test]
     fn empty_input_yields_empty_output() {
         assert!(resample(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_full_scale_source_does_not_clip_on_conversion() {
+        // 3 kHz at full scale: interpolation overshoot here is what produced
+        // real clipped samples before the headroom guard existed.
+        let n_in = IN_RATE as usize / 2;
+        let input: Vec<i16> = (0..n_in)
+            .map(|i| {
+                let t = i as f64 / IN_RATE as f64;
+                (32767.0 * (2.0 * std::f64::consts::PI * 3000.0 * t).sin()).round() as i16
+            })
+            .collect();
+        assert_eq!(input.iter().map(|s| s.unsigned_abs()).max().unwrap(), 32767);
+
+        let out = resample(&input);
+        let clipped = out
+            .iter()
+            .filter(|s| **s == i16::MAX || **s == i16::MIN)
+            .count();
+        assert_eq!(clipped, 0, "{clipped} samples clipped despite the guard");
+        // The guard must be gentle: still within a fraction of a dB of full scale.
+        let peak = out.iter().map(|s| s.unsigned_abs()).max().unwrap();
+        assert!(peak > 32_000, "guard over-attenuated, peak fell to {peak}");
+    }
+
+    #[test]
+    fn a_quiet_take_is_never_amplified() {
+        let input = vec![1000i16; IN_RATE as usize];
+        let out = resample(&input);
+        let interior = &out[HALF * 4..out.len() - HALF * 4];
+        let peak = interior.iter().map(|s| s.unsigned_abs()).max().unwrap();
+        assert!((998..=1002).contains(&peak), "quiet take drifted to {peak}");
     }
 }

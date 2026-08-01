@@ -73,7 +73,9 @@ impl Vertex {
             let detail: String = detail.chars().take(600).collect();
             bail!("{what} failed with HTTP {status}: {detail}");
         }
-        res.json().await.with_context(|| format!("{what} response JSON"))
+        res.json()
+            .await
+            .with_context(|| format!("{what} response JSON"))
     }
 
     /// Synthesize `text` with one prebuilt voice.
@@ -133,16 +135,48 @@ impl Vertex {
 
     /// Have the text model author one continuous passage that cycles `languages`.
     ///
-    /// Uses `responseSchema` so the reply is a JSON object, not prose wrapped in
-    /// a code fence.
+    /// Retries when the reply leaks a language label into the prose. Observed in
+    /// practice: "French est une très belle journée qui commence". One passage is
+    /// shared by every voice, so a defect here would be frozen into every
+    /// transcript — cheaper to re-ask than to ship it.
     pub async fn write_passage(
         &self,
         languages: &[String],
         seconds: u32,
         topic: Option<&str>,
     ) -> Result<String> {
-        // ~2.6 words/second is a calm read; the model only needs a target.
-        let words = (seconds as f32 * 2.6).round() as u32;
+        const ATTEMPTS: u32 = 3;
+        let mut leaked = Vec::new();
+        for attempt in 1..=ATTEMPTS {
+            let passage = self.write_passage_once(languages, seconds, topic).await?;
+            match leaked_label(&passage, languages) {
+                None => return Ok(passage),
+                Some(label) => {
+                    eprintln!(
+                        "  attempt {attempt}/{ATTEMPTS}: passage leaked the label \
+                         '{label}' into the prose, re-asking"
+                    );
+                    leaked.push(label);
+                }
+            }
+        }
+        bail!(
+            "the model kept writing language labels ({}) into the passage after \
+             {ATTEMPTS} attempts — author it by hand and pass --text-file instead",
+            leaked.join(", ")
+        )
+    }
+
+    async fn write_passage_once(
+        &self,
+        languages: &[String],
+        seconds: u32,
+        topic: Option<&str>,
+    ) -> Result<String> {
+        // Measured on a real 7-language take: 133 words read as 62.7 s, i.e.
+        // ~2.1 words/second. Multilingual prose is slower than the ~2.6 w/s of
+        // an English-only read, so the estimate is calibrated to the former.
+        let words = (seconds as f32 * 2.1).round() as u32;
         let per_language = (words / languages.len().max(1) as u32).max(8);
         let theme = topic.unwrap_or(
             "a warm, welcoming introduction that suits being read aloud as a \
@@ -160,6 +194,10 @@ impl Vertex {
                punctuation and diacritics correctly.\n\
              - The whole thing must read as one flowing piece by one speaker, switching \
                languages mid-passage without announcing the switch.\n\
+             - Never refer to the passage, the languages, the recording, or the act of \
+               speaking or switching. Sentences like 'French is next' or 'this recording \
+               demonstrates my voice' are forbidden — write real content, not narration \
+               about itself.\n\
              - Theme: {theme}.\n\
              - Plain prose only: one paragraph, no headings, no language names or labels, \
                no bullet points, no quotation marks around parts, no square brackets, \
@@ -183,7 +221,9 @@ impl Vertex {
             }
         });
         let url = self.url(&self.config.text_location, &self.config.text_model);
-        let reply = self.post(url, body, TEXT_TIMEOUT, "passage generation").await?;
+        let reply = self
+            .post(url, body, TEXT_TIMEOUT, "passage generation")
+            .await?;
         let text = first_text(&reply).context("passage reply had no text part")?;
         let parsed: Value =
             serde_json::from_str(&text).context("passage reply was not valid JSON")?;
@@ -202,8 +242,11 @@ impl Vertex {
     pub async fn transcribe(&self, wav: &[u8]) -> Result<String> {
         let body = json!({
             "contents": [{ "role": "user", "parts": [
-                { "text": "Transcribe this audio VERBATIM, exactly as spoken, keeping \
-                           every language in its own script. Output only the transcript." },
+                { "text": "Transcribe this audio VERBATIM, exactly as spoken. Write each \
+                           language in its OWN native script — Cyrillic as Cyrillic, never \
+                           romanized or transliterated. Do not translate, and do not \
+                           normalize one language into a related one. Output only the \
+                           transcript." },
                 { "inlineData": { "mimeType": "audio/wav", "data": BASE64.encode(wav) } }
             ]}],
             "generationConfig": { "thinkingConfig": { "thinkingLevel": "MINIMAL" } }
@@ -256,6 +299,41 @@ fn audio_tokens(reply: &Value) -> u64 {
 /// one-line file, and stray newlines would not survive the round trip.
 pub fn normalize_whitespace(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The first requested language label that appears as a standalone word in the
+/// passage, if any.
+///
+/// Matching whole words only: "Turkish" is a leak, "Turkishness" inside a longer
+/// token is not what this is looking for, and a substring test would fire on
+/// ordinary words. Multi-word labels ("Mandarin Chinese") are checked as a
+/// phrase over the word sequence.
+fn leaked_label(passage: &str, languages: &[String]) -> Option<String> {
+    let fold = |text: &str| -> Vec<String> {
+        text.split_whitespace()
+            .map(|word| {
+                word.chars()
+                    .filter(|c| c.is_alphanumeric())
+                    .flat_map(char::to_lowercase)
+                    .collect::<String>()
+            })
+            .filter(|word| !word.is_empty())
+            .collect()
+    };
+    let haystack = fold(passage);
+    for language in languages {
+        let needle = fold(language);
+        if needle.is_empty() || needle.len() > haystack.len() {
+            continue;
+        }
+        if haystack
+            .windows(needle.len())
+            .any(|window| *window == needle[..])
+        {
+            return Some(language.clone());
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -316,12 +394,79 @@ mod tests {
         });
         assert_eq!(body["generationConfig"]["responseModalities"][0], "AUDIO");
         assert_eq!(
-            body["generationConfig"]["speechConfig"]["voiceConfig"]["prebuiltVoiceConfig"]
-                ["voiceName"],
+            body["generationConfig"]["speechConfig"]["voiceConfig"]["prebuiltVoiceConfig"]["voiceName"],
             "Sulafat"
         );
         // Audio requests must not carry a thinkingConfig.
         assert!(body["generationConfig"].get("thinkingConfig").is_none());
+    }
+
+    fn seven_languages() -> Vec<String> {
+        [
+            "German",
+            "English",
+            "French",
+            "Spanish",
+            "Russian",
+            "Ukrainian",
+            "Turkish",
+        ]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect()
+    }
+
+    #[test]
+    fn detects_the_real_observed_leak() {
+        // Verbatim from a real authoring reply.
+        let passage = "Guten Morgen und herzlich willkommen. French est une très belle \
+                       journée qui commence, parfaite pour prendre un café.";
+        assert_eq!(
+            leaked_label(passage, &seven_languages()).as_deref(),
+            Some("French")
+        );
+    }
+
+    #[test]
+    fn a_clean_passage_has_no_leak() {
+        let passage = "Guten Morgen und herzlich willkommen in unserer Runde. We are \
+                       delighted to have you join us today. Le soleil se couche lentement. \
+                       Espero que disfrutes de este momento. Мы искренне рады каждому гостю. \
+                       Нехай цей день подарує вам спокій. Sizinle burada bulunmak güzel.";
+        assert_eq!(leaked_label(passage, &seven_languages()), None);
+    }
+
+    #[test]
+    fn leak_detection_is_case_and_punctuation_insensitive() {
+        assert_eq!(
+            leaked_label("und dann: SPANISH, natürlich.", &seven_languages()).as_deref(),
+            Some("Spanish")
+        );
+    }
+
+    #[test]
+    fn leak_detection_matches_whole_words_only() {
+        // "Russianate" is not the standalone label; no leak.
+        assert_eq!(
+            leaked_label("ein russianate Klang", &seven_languages()),
+            None
+        );
+    }
+
+    #[test]
+    fn multi_word_labels_are_matched_as_a_phrase() {
+        let languages = vec!["Mandarin Chinese".to_owned(), "German".to_owned()];
+        assert_eq!(
+            leaked_label("now in Mandarin Chinese we continue", &languages).as_deref(),
+            Some("Mandarin Chinese")
+        );
+        // "Mandarin" alone is not the full label.
+        assert_eq!(leaked_label("a mandarin orange", &languages), None);
+    }
+
+    #[test]
+    fn empty_passage_has_no_leak() {
+        assert_eq!(leaked_label("", &seven_languages()), None);
     }
 
     #[test]
