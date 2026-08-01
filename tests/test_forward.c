@@ -168,10 +168,10 @@ int main(int argc, char** argv) {
             "[test] prefill  %8.1f ms\n"
             "[test] decode   %8.1f ms  (%.1f ms/frame, %d frames)\n"
             "[test] dac      %8.1f ms\n"
-            "[test] audio    %8.2f s   RTF %.2fx realtime\n"
+            "[test] audio    %8.2f s   RTF %.2f (compute/audio, <1 = faster than playback)\n"
             "[test] wrote %s (%lld samples)\n",
             prefill_ms, gen_ms, gen_ms / (double)T, T, dac_ms, audio_s,
-            audio_s / (total_s > 0 ? total_s : 1e-9), OUT_WAV,
+            total_s / (audio_s > 0 ? audio_s : 1e-9), OUT_WAV,
             (long long)n_samples);
 
     s2p_tok_free(tok);
