@@ -6,8 +6,12 @@
  * sessions. A freshly prefilled session gets its FIRST frame via a
  * single-session step before joining the lockstep rendezvous, so TTFA never
  * pays the batch-alignment penalty. Each session streams its frames into a
- * DAC stream (crossfaded windows); emitted float chunks are converted to
- * S16LE and delivered through the request callback on the worker thread.
+ * DAC stream (bit-exact incremental decode) SOFTWARE-PIPELINED one frame
+ * deep on a dedicated CUDA stream: frame N's vocoding runs on custream
+ * while frame N+1's backbone step runs on the model stream, and N's chunk
+ * is collected/delivered at the start of tick N+1 (the first frame is
+ * collected eagerly for TTFA). Emitted float chunks are converted to S16LE
+ * and delivered through the request callback on the worker thread.
  *
  * Cancellation contract: after s2p_sched_cancel() returns, the request's
  * callback is never invoked again (cancel waits out an in-flight callback).
@@ -153,7 +157,12 @@ static int deliver_chunk(s2p_sched* s, sched_req* r, float* pcm_f, int64_t n,
 /* Tear down one active slot. done_ok: count as a completed request. */
 static void retire(s2p_sched* s, sched_active* a, int done_ok) {
     if (a->sess) s2p_session_destroy(a->sess);
-    if (a->dstream) s2p_dac_stream_destroy(a->dstream);
+    if (a->dstream) {
+        /* a pipelined DAC frame may still be in flight on custream and its
+         * kernels reference the stream state freed next */
+        cudaStreamSynchronize(s->custream);
+        s2p_dac_stream_destroy(a->dstream);
+    }
     pthread_mutex_lock(&s->mu);
     /* If a cancel() is still waiting on in_cb it holds a pointer to req, but
      * deliver() cleared in_cb before we got here, so freeing is safe. */
@@ -166,8 +175,19 @@ static void retire(s2p_sched* s, sched_active* a, int done_ok) {
     pthread_mutex_unlock(&s->mu);
 }
 
-/* Finish the DAC stream and deliver the final chunk. */
+/* Collect a pipelined frame, finish the DAC stream, deliver the tail. */
 static void finish_stream(s2p_sched* s, sched_active* a) {
+    float*  prev = NULL;
+    int64_t pn = 0;
+    if (s2p_dac_stream_collect(a->dstream, &prev, &pn, s->custream) == S2P_OK &&
+        pn > 0) {
+        if (deliver_chunk(s, a->req, prev, pn, 0) != 0) {
+            retire(s, a, 0); /* client gone mid-finish */
+            return;
+        }
+    } else {
+        free(prev);
+    }
     float*  tail = NULL;
     int64_t n = 0;
     s2p_status rc = s2p_dac_stream_finish(a->dstream, &tail, &n, s->custream);
@@ -198,16 +218,36 @@ static void handle_frame(s2p_sched* s, sched_active* a,
         return;
     }
     a->frames++;
+    /* Pipelined: collect the PREVIOUS frame's chunk (sync custream — its
+     * decode overlapped this frame's backbone step), enqueue THIS frame on
+     * custream so the DAC works through the next backbone step, then spend
+     * host time on delivery while the GPU runs. */
     float*  chunk = NULL;
     int64_t n = 0;
-    s2p_status rc = s2p_dac_stream_push(a->dstream, codes, &chunk, &n,
-                                        s->custream);
+    s2p_status rc = s2p_dac_stream_collect(a->dstream, &chunk, &n,
+                                           s->custream);
+    if (rc == S2P_OK)
+        rc = s2p_dac_stream_push_async(a->dstream, codes, s->custream);
     if (rc != S2P_OK) {
         fprintf(stderr, "[s2pro] sched: dac push failed (%d) req %llu\n",
                 (int)rc, (unsigned long long)a->req->id);
+        free(chunk);
         (void)deliver(s, a->req, NULL, 0, 1); /* close the client stream */
         retire(s, a, 0);
         return;
+    }
+    if (a->frames == 1) {
+        /* TTFA: the very first frame is collected eagerly instead of riding
+         * the one-frame pipeline delay. */
+        free(chunk);
+        chunk = NULL;
+        n = 0;
+        rc = s2p_dac_stream_collect(a->dstream, &chunk, &n, s->custream);
+        if (rc != S2P_OK) {
+            (void)deliver(s, a->req, NULL, 0, 1);
+            retire(s, a, 0);
+            return;
+        }
     }
     int drc = deliver_chunk(s, a->req, chunk, n, 0);
     if (drc != 0) { /* client gone or cancelled */

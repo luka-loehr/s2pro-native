@@ -28,14 +28,26 @@ s2p_status s2p_dac_decode(s2p_dac* d, const int32_t* codes, int T,
                           float** pcm_out, int64_t* n_samples,
                           cudaStream_t stream);
 
-/* Streaming decode with crossfade. Push one frame (10 codes); chunk may be
- * empty until enough context accumulated. Chunks are malloc'd host buffers. */
+/* Streaming decode. Default path is the bit-exact incremental engine (one
+ * frame in, its 2048 samples out); S2P_STREAM_REFERENCE=1 selects the ported
+ * window/crossfade scheme. Chunks are malloc'd host buffers.
+ *
+ * Pipelined use (the scheduler's pattern): push_async ENQUEUES the frame's
+ * decode on `stream` and returns immediately; collect SYNCS the stream and
+ * returns the previously pushed frame's chunk. Exactly one frame may be in
+ * flight per s2p_dac_stream. The plain push is push_async + collect. */
 typedef struct s2p_dac_stream s2p_dac_stream;
 s2p_status s2p_dac_stream_create(s2p_dac* d, s2p_dac_stream** out);
 s2p_status s2p_dac_stream_push(s2p_dac_stream* s,
                                const int32_t frame_codes[S2P_NUM_CODEBOOKS],
                                float** pcm_chunk, int64_t* n_out,
                                cudaStream_t stream);
+s2p_status s2p_dac_stream_push_async(s2p_dac_stream* s,
+                                     const int32_t
+                                         frame_codes[S2P_NUM_CODEBOOKS],
+                                     cudaStream_t stream);
+s2p_status s2p_dac_stream_collect(s2p_dac_stream* s, float** pcm_chunk,
+                                  int64_t* n_out, cudaStream_t stream);
 s2p_status s2p_dac_stream_finish(s2p_dac_stream* s, float** pcm_chunk,
                                  int64_t* n_out, cudaStream_t stream);
 void       s2p_dac_stream_destroy(s2p_dac_stream* s);

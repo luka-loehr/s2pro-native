@@ -78,6 +78,8 @@ struct s2pd_inc {
     float *aq, *af1, *af2;                      /* [3072] each */
     float *at1, *at3;                           /* [1024] each */
     int32_t* codes_dev;                         /* [10] */
+    float*   pcm_pin;                           /* pinned [2048] (async D2H) */
+    int      pending;                           /* one frame in flight */
 };
 
 static s2p_status hist_init(inc_hist* h, int C, int len) {
@@ -123,6 +125,11 @@ s2p_status s2pd_inc_create(s2p_dac* d, s2pd_inc** out) {
         cudaMalloc((void**)&s->codes_dev,
                    S2P_NUM_CODEBOOKS * sizeof(int32_t)) != cudaSuccess)
         rc = S2P_ERR_OOM;
+    if (rc == S2P_OK &&
+        cudaMallocHost((void**)&s->pcm_pin,
+                       (size_t)S2P_FRAME_SAMPLES * sizeof(float)) !=
+            cudaSuccess)
+        rc = S2P_ERR_OOM;
     if (rc != S2P_OK) {
         s2pd_inc_destroy(s);
         return rc;
@@ -161,6 +168,7 @@ void s2pd_inc_destroy(s2pd_inc* s) {
     if (s->cf_h.d) cudaFree(s->cf_h.d);
     if (s->scratch) cudaFree(s->scratch);
     if (s->codes_dev) cudaFree(s->codes_dev);
+    if (s->pcm_pin) cudaFreeHost(s->pcm_pin);
     free(s);
 }
 
@@ -281,13 +289,22 @@ static s2p_status inc_post(s2pd_inc* s, float* x, cudaStream_t st) {
     return S2P_OK;
 }
 
-s2p_status s2pd_inc_push(s2pd_inc* s,
-                         const int32_t frame_codes[S2P_NUM_CODEBOOKS],
-                         float* pcm_host, cudaStream_t st) {
-    if (!s || !frame_codes || !pcm_host) return S2P_ERR_INVALID;
+/* Enqueue one frame's full decode on `st`; the 2048 samples land in the
+ * pinned s->pcm_pin via an async D2H. NO sync — s2pd_inc_collect does that.
+ * Exactly one frame may be in flight (the scratch and histories are reused
+ * per frame). */
+s2p_status s2pd_inc_push_async(s2pd_inc* s,
+                               const int32_t frame_codes[S2P_NUM_CODEBOOKS],
+                               cudaStream_t st) {
+    if (!s || !frame_codes) return S2P_ERR_INVALID;
+    if (s->pending) return S2P_ERR_STATE;
     s2p_dac* d = s->dac;
     if (s->pos + 1 > (int64_t)INT32_MAX / 4) return S2P_ERR_INVALID;
 
+    if ((int)s->pos + 1 > d->rope_rows) {
+        /* table growth reallocates d->rope; drain in-flight users first */
+        S2P_CUDA_TRY(cudaStreamSynchronize(st));
+    }
     S2P_TRY(s2pd_rope_ensure(d, (int)s->pos + 1));
 
     /* clamp exactly like s2p_dac_decode */
@@ -373,12 +390,34 @@ s2p_status s2pd_inc_push(s2pd_inc* s,
                       x, st));
     S2P_CUDA_TRY(s2pdk_tanh_ip(x, Lc, st));
 
-    S2P_CUDA_TRY(cudaMemcpyAsync(pcm_host, x,
+    S2P_CUDA_TRY(cudaMemcpyAsync(s->pcm_pin, x,
                                  (size_t)S2P_FRAME_SAMPLES * sizeof(float),
                                  cudaMemcpyDeviceToHost, st));
-    S2P_CUDA_TRY(cudaStreamSynchronize(st));
 
+    s->pending = 1;
     s->pos++;
     if (s->kv_len < INC_KVHIST) s->kv_len++;
     return S2P_OK;
+}
+
+/* Sync `st` and hand out the in-flight frame's samples (0 if none). */
+s2p_status s2pd_inc_collect(s2pd_inc* s, float* pcm_host, int64_t* n_out,
+                            cudaStream_t st) {
+    if (!s || !pcm_host || !n_out) return S2P_ERR_INVALID;
+    *n_out = 0;
+    if (!s->pending) return S2P_OK;
+    S2P_CUDA_TRY(cudaStreamSynchronize(st));
+    memcpy(pcm_host, s->pcm_pin, (size_t)S2P_FRAME_SAMPLES * sizeof(float));
+    s->pending = 0;
+    *n_out = S2P_FRAME_SAMPLES;
+    return S2P_OK;
+}
+
+s2p_status s2pd_inc_push(s2pd_inc* s,
+                         const int32_t frame_codes[S2P_NUM_CODEBOOKS],
+                         float* pcm_host, cudaStream_t st) {
+    if (!s || !frame_codes || !pcm_host) return S2P_ERR_INVALID;
+    S2P_TRY(s2pd_inc_push_async(s, frame_codes, st));
+    int64_t n = 0;
+    return s2pd_inc_collect(s, pcm_host, &n, st);
 }
