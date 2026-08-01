@@ -64,6 +64,15 @@ s2p_status s2pfa_decode_frame_batch(s2pfa* f, const __nv_bfloat16* hidden,
                                     const int32_t* sem_ids, int B,
                                     int32_t* out_codes, cudaStream_t stream);
 
+/* Device-resident variant: sem_dev [B] DEVICE int32, NO sync, NO D2H. On
+ * return *stage_dev points at the internal residual stage [9][B] (device,
+ * valid until the next decode call); the caller packs/downloads it. The
+ * whole call is a fixed kernel sequence — CUDA-graph capturable. */
+s2p_status s2pfa_decode_frame_batch_dev(s2pfa* f, const __nv_bfloat16* hidden,
+                                        const int32_t* sem_dev, int B,
+                                        const int32_t** stage_dev,
+                                        cudaStream_t stream);
+
 #ifdef __cplusplus
 }
 #endif

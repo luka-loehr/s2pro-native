@@ -73,6 +73,37 @@ cudaError_t s2pk_attention_decode(const __nv_bfloat16* q,
                                   const int32_t* pos, int max_seq,
                                   int max_len, float* part, cudaStream_t st);
 
+/* ---- device-side semantic sampler (kernels.cu, exact port of sampling.c) */
+
+/* Per-session sampler state, DEVICE-resident. Field semantics identical to
+ * the host s2ps_sampler; initialized once per session by H2D copy. */
+typedef struct {
+    int64_t  prev[64];       /* rep/RAS window, oldest first */
+    uint64_t count;          /* uncapped emitted count == step counter */
+    uint64_t rng[4];         /* xoshiro256** (unseeded path) */
+    float    temperature, top_p, rep_penalty;
+    int32_t  window, seeded;
+    uint32_t seed31;
+    uint32_t pad_;
+} s2ps_dev_state;
+
+/* One block per row: gathers the 4097-candidate slice straight from the full
+ * logits row, applies penalty/top-k/two-softmax/draw exactly like
+ * s2ps_sample, updates the state in place, and writes token/sem/eos:
+ *   out_tok[r] (i64), out_sem[r] (i32), out_codes[r*10+0] = sem, out_eos[r].
+ * Greedy (temperature 0) is bit-identical to the host sampler; sampled draws
+ * differ only by device expf/logf ULPs (parity-gated). */
+cudaError_t s2pk_sample(const __nv_bfloat16* logits, int64_t vocab_stride,
+                        s2ps_dev_state* const* states, int rows,
+                        int64_t* out_tok, int32_t* out_sem,
+                        int32_t* out_codes, uint8_t* out_eos,
+                        cudaStream_t st);
+
+/* Pack fast-AR residual stage [9][rows] into frame-major codes [rows][10]
+ * (cb0 already written by s2pk_sample). */
+cudaError_t s2pk_pack_frame(const int32_t* stage, int rows, int32_t* codes,
+                            cudaStream_t st);
+
 /* In-place x[i] = bf16(f32(x[i]) / divisor). Replicates the reference prefill
  * VQ scale `x / sqrt(num_codebooks+1)` (a DIVISION — decode uses a multiply;
  * the two round differently in bf16, so both forms exist). */
