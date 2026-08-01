@@ -26,7 +26,7 @@
 #define GEMV_WARPS 4
 
 static __global__ void k_quant(int8_t* q, float* scales,
-                               const __nv_bfloat16* w, int K) {
+                               const __nv_bfloat16* w, int K, int levels) {
     const int n = blockIdx.x;
     const __nv_bfloat16* row = w + (size_t)n * K;
     __shared__ float red[QUANT_THREADS];
@@ -41,14 +41,14 @@ static __global__ void k_quant(int8_t* q, float* scales,
             red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]);
         __syncthreads();
     }
-    const float scale = red[0] > 0.0f ? red[0] / 127.0f : 1.0f;
+    const float scale = red[0] > 0.0f ? red[0] / (float)levels : 1.0f;
     const float inv = 1.0f / scale;
     if (threadIdx.x == 0) scales[n] = scale;
 
     int8_t* qrow = q + (size_t)n * K;
     for (int k = threadIdx.x; k < K; k += blockDim.x) {
         int v = __float2int_rn(__bfloat162float(row[k]) * inv);
-        v = v > 127 ? 127 : (v < -127 ? -127 : v);
+        v = v > levels ? levels : (v < -levels ? -levels : v);
         qrow[k] = (int8_t)v;
     }
 }
@@ -108,12 +108,28 @@ static __global__ void k_dequant(__nv_bfloat16* o, const int8_t* w,
         orow[k] = __float2bfloat16((float)wrow[k] * sc);
 }
 
+/* EXPERIMENT (listening only): S2P_INT4=1 quantizes to 15 levels (±7),
+ * i.e. INT4 value precision inside the int8 container — the audio equals a
+ * real per-channel INT4 deployment; memory and bandwidth stay INT8. */
+static int quant_levels(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("S2P_INT4");
+        v = (e && e[0] == '1' && e[1] == '\0') ? 7 : 127;
+        if (v == 7)
+            fprintf(stderr, "[s2pro] S2P_INT4=1: EXPERIMENTAL 4-bit value "
+                            "precision (int8 container)\n");
+    }
+    return v;
+}
+
 extern "C" s2p_status s2p_int8_quant(void* w_i8, float* scales,
                                      const void* w_bf16, int N, int K,
                                      cudaStream_t stream) {
     if (!w_i8 || !scales || !w_bf16 || N <= 0 || K <= 0) return S2P_ERR_INVALID;
     k_quant<<<N, QUANT_THREADS, 0, stream>>>(
-        (int8_t*)w_i8, scales, (const __nv_bfloat16*)w_bf16, K);
+        (int8_t*)w_i8, scales, (const __nv_bfloat16*)w_bf16, K,
+        quant_levels());
     cudaError_t ce = cudaGetLastError();
     if (ce != cudaSuccess) {
         fprintf(stderr, "[s2pro] int8 quant launch (N=%d,K=%d): %s\n", N, K,
