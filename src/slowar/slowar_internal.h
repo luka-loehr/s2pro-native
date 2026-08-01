@@ -135,6 +135,11 @@ struct s2p_model {
     size_t  out_off_sem, out_off_codes, out_off_eos;
     void**  d_sampptr;     /* [B] device: per-row s2ps_dev_state* */
     void**  h_sampptr;     /* pinned mirror */
+    /* per-batch-size CUDA graphs of the steady decode tick (bd == nact):
+     * captured lazily; all per-frame variation flows through pinned-buffer
+     * CONTENTS, so one instantiation serves every frame at that batch. */
+    cudaGraphExec_t gexec[5];  /* index = batch size 1..4 */
+    int             gready[5];
     s2p_tensor sids;    /* [ctx] i64 prefill ids */
     s2p_tensor svq;     /* [10*ctx] i32 prefill VQ codes staging */
 

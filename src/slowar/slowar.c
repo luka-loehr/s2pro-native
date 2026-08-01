@@ -128,6 +128,16 @@ static int attn_legacy(void) {
     return v;
 }
 
+/* S2P_NO_GRAPHS=1 disables CUDA-graph capture of the decode tick (A/B). */
+static int graphs_disabled(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("S2P_NO_GRAPHS");
+        v = (e && e[0] == '1' && e[1] == '\0') ? 1 : 0;
+    }
+    return v;
+}
+
 static s2p_status run_layer(s2p_model* m, int l, int rows, int pos0,
                             const s2p_session* single,
                             const s2p_batch_refs* batch) {
@@ -300,6 +310,107 @@ s2p_status s2p_session_prefill(s2p_session* s, const int64_t* ids,
 
 /* ------------------------------------------------------ lockstep decode */
 
+typedef struct {
+    int a, t;
+    size_t off;
+} vq_run;
+
+/* Enqueue one whole decode tick (upload -> backbone -> head -> sample ->
+ * fast-AR -> result download) on m->stream. Pure device work: no syncs, no
+ * host reads — the sequence is CUDA-graph capturable when the batch shape
+ * is steady. `act` is only touched for the eager stashed-hidden copies
+ * (bd < nact, never under capture). */
+static s2p_status decode_tick_enqueue(s2p_model* m, s2p_session* const* act,
+                                      int bd, int nact, int nruns,
+                                      const vq_run* runs, int max_len) {
+    cudaStream_t st = m->stream;
+    const size_t B = (size_t)m->max_sessions;
+    char* d = (char*)m->d_up;
+
+    if (bd > 0) {
+        S2P_CUDA_TRY(cudaMemcpyAsync(m->d_up, m->h_up, m->up.total,
+                                     cudaMemcpyHostToDevice, st));
+        s2p_batch_refs refs;
+        refs.pos_dev = (const int32_t*)(d + m->up.off_pos);
+        refs.kptr = (__nv_bfloat16* const*)(d + m->up.off_ptrs);
+        refs.vptr = refs.kptr + (size_t)S2P_SLOW_LAYERS * B;
+        refs.max_len = max_len;
+
+        /* embed fed-back token + previous-frame VQ sum, * 1/sqrt(11) */
+        S2P_CUDA_TRY(s2pk_embed(BF(m->embed),
+                                (const int64_t*)(d + m->up.off_ids), BF(m->sx),
+                                bd, S2P_DIM, st));
+        for (int r = 0; r < nruns; r++)
+            S2P_TRY(s2pfa_vq_embed_add_dev(
+                m->fastar,
+                (const int32_t*)(d + m->up.off_codes) + runs[r].off,
+                runs[r].t, BF(m->sx) + (size_t)runs[r].a * S2P_DIM, st));
+        S2P_CUDA_TRY(s2pk_scale_rows_masked(
+            BF(m->sx), (const uint8_t*)(d + m->up.off_mask), bd, S2P_DIM,
+            (float)(1.0 / S2P_SQRT11), st));
+
+        for (int l = 0; l < S2P_SLOW_LAYERS; l++)
+            S2P_TRY(run_layer(m, l, bd, 0, NULL, &refs));
+
+        S2P_CUDA_TRY(s2pk_rms_norm(BF(m->sx), BF(m->final_norm),
+                                   BF(m->shidden), bd, S2P_DIM, S2P_NORM_EPS,
+                                   st));
+    }
+
+    /* stashed prefill hiddens complete the batch (eager path only) */
+    for (int b = bd; b < nact; b++)
+        S2P_CUDA_TRY(cudaMemcpyAsync(BF(m->shidden) + (size_t)b * S2P_DIM,
+                                     act[b]->pending_hidden.data,
+                                     (size_t)S2P_DIM * sizeof(uint16_t),
+                                     cudaMemcpyDeviceToDevice, st));
+
+    /* tied lm-head: logits[b] = hidden[b] @ embed^T. INT8 mode reads the
+     * per-row-quantized sidecar; batches beyond the GEMV width use the kept
+     * bf16 table. */
+    if (m->mode == S2P_GEMM_INT8 && m->embed_i8.data != NULL &&
+        nact <= S2P_INT8_GEMV_MAX_M)
+        S2P_TRY(s2p_int8_gemv(m->slogits.data, m->shidden.data,
+                              m->embed_i8.data,
+                              (const float*)m->embed_scale.data, nact,
+                              S2P_TEXT_VOCAB, S2P_DIM, st));
+    else
+        S2P_TRY(s2p_gemm_bf16(m->shidden.data, m->embed.data, m->slogits.data,
+                              nact, S2P_TEXT_VOCAB, S2P_DIM, st));
+    if (s2psl_dump_dir() != NULL && nact == 1) {
+        /* parity: full logits row of the first two sampling steps (fixture
+         * names prefill_logits / step1_logits); single-session runs only.
+         * Never active under capture (steady gating excludes dump runs). */
+        static int dump_step = 0;
+        if (dump_step < 2)
+            s2psl_dump_vec_bf16(dump_step == 0 ? "prefill_logits"
+                                               : "step1_logits",
+                                m->slogits.data, S2P_TEXT_VOCAB, st);
+        dump_step++;
+    }
+
+    /* device sampling + fast-AR + packed result download */
+    int64_t* d_tok = (int64_t*)m->d_out;
+    int32_t* d_sem = (int32_t*)((char*)m->d_out + m->out_off_sem);
+    int32_t* d_codes = (int32_t*)((char*)m->d_out + m->out_off_codes);
+    uint8_t* d_eos = (uint8_t*)((char*)m->d_out + m->out_off_eos);
+    S2P_CUDA_TRY(cudaMemcpyAsync(m->d_sampptr, m->h_sampptr,
+                                 (size_t)nact * sizeof(void*),
+                                 cudaMemcpyHostToDevice, st));
+    S2P_CUDA_TRY(s2pk_sample((const __nv_bfloat16*)m->slogits.data,
+                             S2P_TEXT_VOCAB,
+                             (s2ps_dev_state* const*)m->d_sampptr, nact,
+                             d_tok, d_sem, d_codes, d_eos, st));
+    const int32_t* stage = NULL;
+    S2P_TRY(s2pfa_decode_frame_batch_dev(m->fastar,
+                                         (const __nv_bfloat16*)m->shidden.data,
+                                         d_sem, nact, &stage, st));
+    S2P_CUDA_TRY(s2pk_pack_frame(stage, nact, d_codes, st));
+    S2P_CUDA_TRY(cudaMemcpyAsync(m->h_out, m->d_out, m->out_bytes,
+                                 cudaMemcpyDeviceToHost, st));
+    return S2P_OK;
+}
+
+
 s2p_status s2p_model_batch_next_frame(s2p_model* m, s2p_session** sess, int n,
                                       int32_t* out_codes, int* eos) {
     if (m == NULL || sess == NULL || out_codes == NULL || eos == NULL ||
@@ -339,7 +450,9 @@ s2p_status s2p_model_batch_next_frame(s2p_model* m, s2p_session** sess, int n,
         }
     if (nact == 0) return S2P_OK;
 
-    /* ---- decode forward for rows [0, bd) ---- */
+    /* ---- host staging for decode rows [0, bd) ---- */
+    vq_run runs[S2P_SLOWAR_MAX_BATCH];
+    int nruns = 0;
     if (bd > 0) {
         const size_t B = (size_t)m->max_sessions;
         char* h = (char*)m->h_up;
@@ -362,12 +475,6 @@ s2p_status s2p_model_batch_next_frame(s2p_model* m, s2p_session** sess, int n,
         }
         /* previous-frame codes, cb-major per contiguous masked run so each
          * run block matches s2pfa_vq_embed_add's [10*T] layout */
-        typedef struct {
-            int a, t;
-            size_t off;
-        } vq_run;
-        vq_run runs[S2P_SLOWAR_MAX_BATCH];
-        int nruns = 0;
         {
             size_t off = 0;
             int b = 0;
@@ -390,96 +497,53 @@ s2p_status s2p_model_batch_next_frame(s2p_model* m, s2p_session** sess, int n,
                 off += (size_t)S2P_NUM_CODEBOOKS * T;
             }
         }
-        S2P_CUDA_TRY(cudaMemcpyAsync(m->d_up, m->h_up, m->up.total,
-                                     cudaMemcpyHostToDevice, st));
-        char* d = (char*)m->d_up;
-        s2p_batch_refs refs;
-        refs.pos_dev = (const int32_t*)(d + m->up.off_pos);
-        refs.kptr = (__nv_bfloat16* const*)(d + m->up.off_ptrs);
-        refs.vptr = refs.kptr + (size_t)S2P_SLOW_LAYERS * B;
-        refs.max_len = 0;
-        for (int b = 0; b < bd; b++)
-            if (hpos[b] + 1 > refs.max_len) refs.max_len = hpos[b] + 1;
-
-        /* embed fed-back token + previous-frame VQ sum, * 1/sqrt(11) */
-        S2P_CUDA_TRY(s2pk_embed(BF(m->embed),
-                                (const int64_t*)(d + m->up.off_ids), BF(m->sx),
-                                bd, S2P_DIM, st));
-        for (int r = 0; r < nruns; r++)
-            S2P_TRY(s2pfa_vq_embed_add(
-                m->fastar,
-                (const int32_t*)(d + m->up.off_codes) + runs[r].off,
-                runs[r].t, BF(m->sx) + (size_t)runs[r].a * S2P_DIM, st));
-        S2P_CUDA_TRY(s2pk_scale_rows_masked(
-            BF(m->sx), (const uint8_t*)(d + m->up.off_mask), bd, S2P_DIM,
-            (float)(1.0 / S2P_SQRT11), st));
-
-        for (int l = 0; l < S2P_SLOW_LAYERS; l++)
-            S2P_TRY(run_layer(m, l, bd, 0, NULL, &refs));
-
-        S2P_CUDA_TRY(s2pk_rms_norm(BF(m->sx), BF(m->final_norm),
-                                   BF(m->shidden), bd, S2P_DIM, S2P_NORM_EPS,
-                                   st));
-        for (int b = 0; b < bd; b++) act[b]->kv_len++;
     }
-
-    /* stashed prefill hiddens complete the batch */
-    for (int b = bd; b < nact; b++)
-        S2P_CUDA_TRY(cudaMemcpyAsync(BF(m->shidden) + (size_t)b * S2P_DIM,
-                                     act[b]->pending_hidden.data,
-                                     (size_t)S2P_DIM * sizeof(uint16_t),
-                                     cudaMemcpyDeviceToDevice, st));
-
-    /* tied lm-head: logits[b] = hidden[b] @ embed^T. INT8 mode reads the
-     * per-row-quantized sidecar (halves the 0.8 GB head stream); batches
-     * beyond the GEMV width use the kept bf16 table. */
-    if (m->mode == S2P_GEMM_INT8 && m->embed_i8.data != NULL &&
-        nact <= S2P_INT8_GEMV_MAX_M)
-        S2P_TRY(s2p_int8_gemv(m->slogits.data, m->shidden.data,
-                              m->embed_i8.data,
-                              (const float*)m->embed_scale.data, nact,
-                              S2P_TEXT_VOCAB, S2P_DIM, st));
-    else
-        S2P_TRY(s2p_gemm_bf16(m->shidden.data, m->embed.data, m->slogits.data,
-                              nact, S2P_TEXT_VOCAB, S2P_DIM, st));
-    if (s2psl_dump_dir() != NULL && nact == 1) {
-        /* parity: full logits row of the first two sampling steps (fixture
-         * names prefill_logits / step1_logits); single-session runs only */
-        static int dump_step = 0;
-        if (dump_step < 2)
-            s2psl_dump_vec_bf16(dump_step == 0 ? "prefill_logits"
-                                               : "step1_logits",
-                                m->slogits.data, S2P_TEXT_VOCAB, st);
-        dump_step++;
-    }
-
-    /* device sampling (exact port of the two-softmax sampler): logits ->
-     * token/sem/eos entirely on the GPU, state updated in place */
-    int64_t* d_tok = (int64_t*)m->d_out;
-    int32_t* d_sem = (int32_t*)((char*)m->d_out + m->out_off_sem);
-    int32_t* d_codes = (int32_t*)((char*)m->d_out + m->out_off_codes);
-    uint8_t* d_eos = (uint8_t*)((char*)m->d_out + m->out_off_eos);
     for (int b = 0; b < nact; b++) m->h_sampptr[b] = act[b]->dsamp;
-    S2P_CUDA_TRY(cudaMemcpyAsync(m->d_sampptr, m->h_sampptr,
-                                 (size_t)nact * sizeof(void*),
-                                 cudaMemcpyHostToDevice, st));
-    S2P_CUDA_TRY(s2pk_sample((const __nv_bfloat16*)m->slogits.data,
-                             S2P_TEXT_VOCAB,
-                             (s2ps_dev_state* const*)m->d_sampptr, nact,
-                             d_tok, d_sem, d_codes, d_eos, st));
 
-    /* fast-AR residual cascade straight off the device sem ids (EOS rows run
-     * with sem 0 and are dropped afterwards, matching the reference) */
-    const int32_t* stage = NULL;
-    S2P_TRY(s2pfa_decode_frame_batch_dev(m->fastar,
-                                         (const __nv_bfloat16*)m->shidden.data,
-                                         d_sem, nact, &stage, st));
-    S2P_CUDA_TRY(s2pk_pack_frame(stage, nact, d_codes, st));
-
-    /* ONE download of the whole result block, then the only sync */
-    S2P_CUDA_TRY(cudaMemcpyAsync(m->h_out, m->d_out, m->out_bytes,
-                                 cudaMemcpyDeviceToHost, st));
+    /* ---- enqueue the tick: captured CUDA graph in the steady state ----
+     * Steady = every active row is decoding (bd == nact) with the usual
+     * one-contiguous-VQ-run shape and no dump hooks: then the kernel
+     * sequence is invariant and all per-frame variation lives in pinned
+     * buffer contents, so one captured graph replays every frame. */
+    int max_len = 0;
+    if (bd > 0) {
+        const int32_t* hpos = (const int32_t*)((char*)m->h_up + m->up.off_pos);
+        for (int b = 0; b < bd; b++)
+            if (hpos[b] + 1 > max_len) max_len = hpos[b] + 1;
+    }
+    const int steady = bd == nact && bd >= 1 && bd <= 4 &&
+                       s2psl_dump_dir() == NULL && nruns == 1 &&
+                       runs[0].a == 0 && runs[0].t == bd &&
+                       !graphs_disabled();
+    if (steady) {
+        if (!m->gready[bd]) {
+            S2P_CUDA_TRY(cudaStreamBeginCapture(
+                st, cudaStreamCaptureModeThreadLocal));
+            s2p_status rc = decode_tick_enqueue(m, act, bd, nact, nruns, runs,
+                                                m->ctx_len);
+            cudaGraph_t g = NULL;
+            cudaError_t ce = cudaStreamEndCapture(st, &g);
+            if (rc != S2P_OK) return rc;
+            if (ce != cudaSuccess) {
+                fprintf(stderr, "[s2pro] graph capture failed: %s\n",
+                        cudaGetErrorString(ce));
+                return S2P_ERR_CUDA;
+            }
+            ce = cudaGraphInstantiate(&m->gexec[bd], g, 0);
+            cudaGraphDestroy(g);
+            if (ce != cudaSuccess) {
+                fprintf(stderr, "[s2pro] graph instantiate failed: %s\n",
+                        cudaGetErrorString(ce));
+                return S2P_ERR_CUDA;
+            }
+            m->gready[bd] = 1;
+        }
+        S2P_CUDA_TRY(cudaGraphLaunch(m->gexec[bd], st));
+    } else {
+        S2P_TRY(decode_tick_enqueue(m, act, bd, nact, nruns, runs, max_len));
+    }
     S2P_CUDA_TRY(cudaStreamSynchronize(st));
+    for (int b = 0; b < bd; b++) act[b]->kv_len++;
 
     const int64_t* toks = (const int64_t*)m->h_out;
     const int32_t* codes = (const int32_t*)((char*)m->h_out + m->out_off_codes);
