@@ -8,6 +8,20 @@ for published releases.
 
 ## [Unreleased]
 
+### Fixed
+
+- Streaming vocoder fidelity: the reference's 20-frame window overlap is far
+  too little causal warmup for this DAC (post-module attention window is
+  128 frames) — every window after the second decoded audibly differently
+  from the parity-proven whole-buffer path (~5 dB SNR), and the reference
+  crossfade additionally skips 512 samples of timeline per window (an
+  audible click every stride). Overlap now defaults to 160 frames
+  (`S2P_STREAM_OVERLAP` tunes) and the crossfade is timeline-preserving (a
+  deliberate improvement over the reference). Same-codes validation vs the
+  whole-buffer decode: length-exact, SNR 35.9 dB, cos 0.99988 (before:
+  −3 dB, cos 0.02). All HTTP-streamed audio was affected; `s2p-test` gained
+  `S2P_TEST_STREAM_WAV` to diff both DAC paths on identical codes.
+
 ### Added
 
 - Voice registry (`include/s2pro/voices.h`, `src/voice/`): named references
