@@ -102,15 +102,6 @@ static s2p_status alloc_scratch(s2p_model* m) {
         int64_t s1[1] = {(int64_t)S2P_NUM_CODEBOOKS * ctx};
         S2P_TRY(s2p_tensor_device_alloc(&m->svq, S2P_DT_I32, 1, s1));
     }
-    {
-        int64_t s1[1] = {ms};
-        S2P_TRY(s2p_tensor_device_alloc(&m->ssemid, S2P_DT_I32, 1, s1));
-    }
-    {
-        int64_t s1[1] = {ms * S2P_NUM_CODEBOOKS};
-        S2P_TRY(s2p_tensor_device_alloc(&m->sframe, S2P_DT_I32, 1, s1));
-    }
-
     /* per-frame upload block (natural alignment by descending size) */
     const size_t B = (size_t)ms;
     s2p_upload_layout* up = &m->up;
@@ -269,8 +260,6 @@ void s2p_model_free(s2p_model* m) {
     s2p_tensor_free(&m->slogits);
     s2p_tensor_free(&m->sids);
     s2p_tensor_free(&m->svq);
-    s2p_tensor_free(&m->ssemid);
-    s2p_tensor_free(&m->sframe);
     if (m->d_up != NULL) cudaFree(m->d_up);
     if (m->h_up != NULL) cudaFreeHost(m->h_up);
     if (m->h_sem != NULL) cudaFreeHost(m->h_sem);

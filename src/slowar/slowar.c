@@ -403,22 +403,16 @@ s2p_status s2p_model_batch_next_frame(s2p_model* m, s2p_session** sess, int n,
     }
 
     /* fast-AR residual cascade for the whole batch (EOS rows run with
-     * sem_id 0 and are dropped afterwards, matching the reference). */
-    S2P_CUDA_TRY(cudaMemcpyAsync(m->ssemid.data, m->h_semid,
-                                 (size_t)nact * sizeof(int32_t),
-                                 cudaMemcpyHostToDevice, st));
-    S2P_CUDA_TRY(s2pk_i32_scatter_stride((int32_t*)m->sframe.data,
-                                         (const int32_t*)m->ssemid.data, nact,
-                                         S2P_NUM_CODEBOOKS, st));
+     * sem_id 0 and are dropped afterwards, matching the reference).
+     * fastar.h pins sem_ids/out_codes as HOST pointers — it stages through
+     * its own pinned+device scratch and syncs the stream before returning —
+     * so hand it the pinned host buffers; cb0 (= sem_id) is the caller's to
+     * place and is left untouched by the callee. */
+    for (int b = 0; b < nact; b++)
+        m->h_frame[(size_t)b * S2P_NUM_CODEBOOKS] = m->h_semid[b];
     S2P_TRY(s2pfa_decode_frame_batch(m->fastar,
                                      (const __nv_bfloat16*)m->shidden.data,
-                                     (const int32_t*)m->ssemid.data, nact,
-                                     (int32_t*)m->sframe.data, st));
-    S2P_CUDA_TRY(cudaMemcpyAsync(
-        m->h_frame, m->sframe.data,
-        (size_t)nact * S2P_NUM_CODEBOOKS * sizeof(int32_t),
-        cudaMemcpyDeviceToHost, st));
-    S2P_CUDA_TRY(cudaStreamSynchronize(st));
+                                     m->h_semid, nact, m->h_frame, st));
 
     /* harvest */
     for (int b = 0; b < nact; b++) {

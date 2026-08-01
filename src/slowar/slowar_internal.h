@@ -122,8 +122,6 @@ struct s2p_model {
     s2p_tensor slogits; /* [max_sessions, 155776] bf16 */
     s2p_tensor sids;    /* [ctx] i64 prefill ids */
     s2p_tensor svq;     /* [10*ctx] i32 prefill VQ codes staging */
-    s2p_tensor ssemid;  /* [max_sessions] i32 sampled semantic ids */
-    s2p_tensor sframe;  /* [max_sessions*10] i32 frame codes */
 
     /* per-frame upload block */
     s2p_upload_layout up;
@@ -131,8 +129,9 @@ struct s2p_model {
     void* h_up;  /* pinned host mirror */
     /* pinned download staging */
     uint16_t* h_sem;   /* [max_sessions * 4097] bf16 candidate logits */
-    int32_t* h_frame;  /* [max_sessions * 10] */
-    int32_t* h_semid;  /* [max_sessions] (pinned, uploaded to ssemid) */
+    int32_t* h_frame;  /* [max_sessions * 10] frame codes (cb0 = sem_id,
+                          cb1..9 written by s2pfa_decode_frame_batch) */
+    int32_t* h_semid;  /* [max_sessions] sampled semantic ids (pinned) */
 };
 
 typedef enum {
