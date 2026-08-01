@@ -40,9 +40,28 @@ static int stream_use_reference(void) {
     return v;
 }
 
+#define STREAM_BATCH_MAX 4
+
+/* S2P_STREAM_BATCH (1..4, default 4): frames per incremental-engine push.
+ * Bigger pushes amortize kernel launches; the FIRST push always flushes at
+ * one frame so TTFA is unaffected. */
+static int stream_batch(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("S2P_STREAM_BATCH");
+        v = e ? atoi(e) : STREAM_BATCH_MAX;
+        if (v < 1) v = 1;
+        if (v > STREAM_BATCH_MAX) v = STREAM_BATCH_MAX;
+    }
+    return v;
+}
+
 struct s2p_dac_stream {
     s2p_dac* d;
     s2pd_inc* inc;        /* non-NULL => incremental path */
+    int32_t  bat[STREAM_BATCH_MAX][S2P_NUM_CODEBOOKS]; /* pending frames */
+    int      bat_n;
+    int      first_flushed; /* first push goes out at one frame (TTFA) */
     float*   pend_chunk;  /* reference-mode push_async stash */
     int64_t  pend_n;
     int32_t* frames;      /* frame-major [count][10] */
@@ -89,7 +108,20 @@ s2p_status s2p_dac_stream_push_async(s2p_dac_stream* s,
                                      cudaStream_t stream) {
     if (!s || !frame_codes) return S2P_ERR_INVALID;
     if (s->finished) return S2P_ERR_STATE;
-    if (s->inc) return s2pd_inc_push_async(s->inc, frame_codes, stream);
+    if (s->inc) {
+        memcpy(s->bat[s->bat_n], frame_codes,
+               S2P_NUM_CODEBOOKS * sizeof(int32_t));
+        s->bat_n++;
+        int target = s->first_flushed ? stream_batch() : 1;
+        if (s->bat_n < target) return S2P_OK;
+        s2p_status rc =
+            s2pd_inc_push_async(s->inc, &s->bat[0][0], s->bat_n, stream);
+        if (rc == S2P_OK) {
+            s->bat_n = 0;
+            s->first_flushed = 1;
+        }
+        return rc;
+    }
     if (s->pend_chunk) return S2P_ERR_STATE;
     return s2p_dac_stream_push(s, frame_codes, &s->pend_chunk, &s->pend_n,
                                stream);
@@ -101,7 +133,8 @@ s2p_status s2p_dac_stream_collect(s2p_dac_stream* s, float** pcm_chunk,
     *pcm_chunk = NULL;
     *n_out = 0;
     if (s->inc) {
-        float* pcm = (float*)malloc(S2P_FRAME_SAMPLES * sizeof(float));
+        float* pcm = (float*)malloc((size_t)STREAM_BATCH_MAX *
+                                    S2P_FRAME_SAMPLES * sizeof(float));
         if (!pcm) return S2P_ERR_OOM;
         int64_t n = 0;
         s2p_status rc = s2pd_inc_collect(s->inc, pcm, &n, stream);
@@ -239,17 +272,9 @@ s2p_status s2p_dac_stream_push(s2p_dac_stream* s,
     *n_out = 0;
     if (s->finished) return S2P_ERR_STATE;
 
-    if (s->inc) {                       /* incremental: frame in, frame out */
-        float* pcm = (float*)malloc(S2P_FRAME_SAMPLES * sizeof(float));
-        if (!pcm) return S2P_ERR_OOM;
-        s2p_status rc = s2pd_inc_push(s->inc, frame_codes, pcm, stream);
-        if (rc != S2P_OK) {
-            free(pcm);
-            return rc;
-        }
-        *pcm_chunk = pcm;
-        *n_out = S2P_FRAME_SAMPLES;
-        return S2P_OK;
+    if (s->inc) {                       /* through the batcher, then sync */
+        S2P_TRY(s2p_dac_stream_push_async(s, frame_codes, stream));
+        return s2p_dac_stream_collect(s, pcm_chunk, n_out, stream);
     }
 
     if (s->count == s->cap) {
@@ -283,9 +308,17 @@ s2p_status s2p_dac_stream_finish(s2p_dac_stream* s, float** pcm_chunk,
     if (s->finished) return S2P_ERR_STATE;
     s->finished = 1;
 
-    if (s->inc)                         /* nothing withheld beyond a pending
-                                         * pipelined frame, if any */
+    if (s->inc) {
+        /* flush the remainder batch, then hand out whatever is in flight */
+        if (s->bat_n > 0) {
+            /* the caller collected before finishing, so nothing is pending */
+            s2p_status rc =
+                s2pd_inc_push_async(s->inc, &s->bat[0][0], s->bat_n, stream);
+            if (rc != S2P_OK) return rc;
+            s->bat_n = 0;
+        }
         return s2p_dac_stream_collect(s, pcm_chunk, n_out, stream);
+    }
 
     int has_codes = s->count > 0;
     int has_tail = s->tail_len > 0;

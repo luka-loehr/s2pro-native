@@ -38,10 +38,13 @@
 #define INC_HEADS    16
 #define INC_HD       64
 
-/* conv scratch sizing: largest ext buffer is the block-2 RU dil-9 input,
- * [192, 54 + 1024] = 206,  976 floats; activations peak at [96, 2048] =
- * 196,608. One size covers all five rotating buffers. */
-#define INC_BUF_FLOATS 212992
+/* Up to INC_MAX_TN frames decode per push (the stream front end batches;
+ * bigger pushes amortize kernel-launch overhead and raise occupancy of the
+ * small early-stage convs). Scratch sizing follows the largest ext buffer,
+ * the block-2 RU dil-9 input [192, 54 + 1024*tn]; one size covers all five
+ * rotating buffers at tn = 4. */
+#define INC_MAX_TN 4
+#define INC_BUF_FLOATS 802816
 
 /* decoder block dims (mirror dac.c) */
 static const int IDEC_CIN[4] = { 1536, 768, 384, 192 };
@@ -74,12 +77,13 @@ struct s2pd_inc {
     /* scratch (one allocation, carved) */
     float*   scratch;
     float *bx, *by, *bt1, *bt2, *bext;          /* INC_BUF_FLOATS each */
-    float *axk, *axv;                           /* [128, 1024] each */
-    float *aq, *af1, *af2;                      /* [3072] each */
-    float *at1, *at3;                           /* [1024] each */
-    int32_t* codes_dev;                         /* [10] */
-    float*   pcm_pin;                           /* pinned [2048] (async D2H) */
-    int      pending;                           /* one frame in flight */
+    float *axk, *axv;                           /* [127+tn, 1024] each */
+    float *aq, *af1, *af2;                      /* [tn, 3072] each */
+    float *at1, *at3;                           /* [tn, 1024] each */
+    float *brow;                                /* [tn, 1024] transformer x */
+    int32_t* codes_dev;                         /* [10, tn] cb-major */
+    float*   pcm_pin;                           /* pinned [tn*2048] */
+    int      pending;                           /* frames in flight (0=idle) */
 };
 
 static s2p_status hist_init(inc_hist* h, int C, int len) {
@@ -115,20 +119,21 @@ s2p_status s2pd_inc_create(s2p_dac* d, s2pd_inc** out) {
     if (rc == S2P_OK) rc = hist_init(&s->cf_h, 96, 6);
 
     if (rc == S2P_OK) {
-        size_t floats = 5u * INC_BUF_FLOATS + 2u * INC_WINDOW * INC_C +
-                        3u * 3072 + 2u * 1024;
+        size_t floats = 5u * INC_BUF_FLOATS +
+                        2u * (INC_KVHIST + INC_MAX_TN) * INC_C +
+                        3u * INC_MAX_TN * 3072 + 3u * INC_MAX_TN * 1024;
         if (cudaMalloc((void**)&s->scratch, floats * sizeof(float)) !=
             cudaSuccess)
             rc = S2P_ERR_OOM;
     }
     if (rc == S2P_OK &&
-        cudaMalloc((void**)&s->codes_dev,
-                   S2P_NUM_CODEBOOKS * sizeof(int32_t)) != cudaSuccess)
+        cudaMalloc((void**)&s->codes_dev, (size_t)INC_MAX_TN *
+                       S2P_NUM_CODEBOOKS * sizeof(int32_t)) != cudaSuccess)
         rc = S2P_ERR_OOM;
     if (rc == S2P_OK &&
         cudaMallocHost((void**)&s->pcm_pin,
-                       (size_t)S2P_FRAME_SAMPLES * sizeof(float)) !=
-            cudaSuccess)
+                       (size_t)INC_MAX_TN * S2P_FRAME_SAMPLES *
+                           sizeof(float)) != cudaSuccess)
         rc = S2P_ERR_OOM;
     if (rc != S2P_OK) {
         s2pd_inc_destroy(s);
@@ -140,13 +145,14 @@ s2p_status s2pd_inc_create(s2p_dac* d, s2pd_inc** out) {
     s->bt1 = p;  p += INC_BUF_FLOATS;
     s->bt2 = p;  p += INC_BUF_FLOATS;
     s->bext = p; p += INC_BUF_FLOATS;
-    s->axk = p;  p += (size_t)INC_WINDOW * INC_C;
-    s->axv = p;  p += (size_t)INC_WINDOW * INC_C;
-    s->aq = p;   p += 3072;
-    s->af1 = p;  p += 3072;
-    s->af2 = p;  p += 3072;
-    s->at1 = p;  p += 1024;
-    s->at3 = p;
+    s->axk = p;  p += (size_t)(INC_KVHIST + INC_MAX_TN) * INC_C;
+    s->axv = p;  p += (size_t)(INC_KVHIST + INC_MAX_TN) * INC_C;
+    s->aq = p;   p += (size_t)INC_MAX_TN * 3072;
+    s->af1 = p;  p += (size_t)INC_MAX_TN * 3072;
+    s->af2 = p;  p += (size_t)INC_MAX_TN * 3072;
+    s->at1 = p;  p += (size_t)INC_MAX_TN * 1024;
+    s->at3 = p;  p += (size_t)INC_MAX_TN * 1024;
+    s->brow = p;
     *out = s;
     return S2P_OK;
 }
@@ -228,8 +234,8 @@ static s2p_status inc_cnx(s2pd_inc* s, const s2pd_cnx* c, inc_hist* h,
     return S2P_OK;
 }
 
-/* ---- post_module, one new row x [1, 1024] at absolute position pos ---- */
-static s2p_status inc_post(s2pd_inc* s, float* x, cudaStream_t st) {
+/* ---- post_module, tn new rows x [tn, 1024] at absolute position pos ---- */
+static s2p_status inc_post(s2pd_inc* s, float* x, int tn, cudaStream_t st) {
     s2p_dac* d = s->dac;
     const s2pd_tf* tf = &d->post;
     const int hl = s->kv_len;
@@ -237,14 +243,14 @@ static s2p_status inc_post(s2pd_inc* s, float* x, cudaStream_t st) {
 
     for (int l = 0; l < tf->n_layers; l++) {
         const s2pd_tl* ly = &tf->l[l];
-        S2P_CUDA_TRY(s2pdk_rmsnorm(x, ly->attn_norm, 1e-5f, 1, INC_C, s->at1, st));
-        S2P_CUDA_TRY(s2pdk_matmul(s->at1, 1, INC_C, ly->wqkv, 3072, NULL,
+        S2P_CUDA_TRY(s2pdk_rmsnorm(x, ly->attn_norm, 1e-5f, tn, INC_C, s->at1, st));
+        S2P_CUDA_TRY(s2pdk_matmul(s->at1, tn, INC_C, ly->wqkv, 3072, NULL,
                                   s->aq, st));
-        S2P_CUDA_TRY(s2pdk_rope_ip_off(s->aq, t0, 1, INC_HEADS, INC_HD, 3072,
+        S2P_CUDA_TRY(s2pdk_rope_ip_off(s->aq, t0, tn, INC_HEADS, INC_HD, 3072,
                                        d->rope, st));
-        S2P_CUDA_TRY(s2pdk_rope_ip_off(s->aq + 1024, t0, 1, INC_HEADS, INC_HD,
+        S2P_CUDA_TRY(s2pdk_rope_ip_off(s->aq + 1024, t0, tn, INC_HEADS, INC_HD,
                                        3072, d->rope, st));
-        /* kv_ext = [hist | new row] */
+        /* kv_ext = [hist | new rows] */
         if (hl > 0) {
             S2P_CUDA_TRY(cudaMemcpyAsync(s->axk, s->kh[l],
                                          (size_t)hl * INC_C * sizeof(float),
@@ -253,31 +259,33 @@ static s2p_status inc_post(s2pd_inc* s, float* x, cudaStream_t st) {
                                          (size_t)hl * INC_C * sizeof(float),
                                          cudaMemcpyDeviceToDevice, st));
         }
-        S2P_CUDA_TRY(cudaMemcpyAsync(s->axk + (size_t)hl * INC_C,
-                                     s->aq + 1024, INC_C * sizeof(float),
-                                     cudaMemcpyDeviceToDevice, st));
-        S2P_CUDA_TRY(cudaMemcpyAsync(s->axv + (size_t)hl * INC_C,
-                                     s->aq + 2048, INC_C * sizeof(float),
-                                     cudaMemcpyDeviceToDevice, st));
-        S2P_CUDA_TRY(s2pdk_sdpa_inc(s->aq, 3072, s->axk, s->axv, INC_C, hl, 1,
-                                    INC_HEADS, INC_HD, tf->window, s->at1,
+        S2P_CUDA_TRY(cudaMemcpy2DAsync(
+            s->axk + (size_t)hl * INC_C, INC_C * sizeof(float), s->aq + 1024,
+            3072 * sizeof(float), INC_C * sizeof(float), tn,
+            cudaMemcpyDeviceToDevice, st));
+        S2P_CUDA_TRY(cudaMemcpy2DAsync(
+            s->axv + (size_t)hl * INC_C, INC_C * sizeof(float), s->aq + 2048,
+            3072 * sizeof(float), INC_C * sizeof(float), tn,
+            cudaMemcpyDeviceToDevice, st));
+        S2P_CUDA_TRY(s2pdk_sdpa_inc(s->aq, 3072, s->axk, s->axv, INC_C, hl,
+                                    tn, INC_HEADS, INC_HD, tf->window, s->at1,
                                     INC_C, st));
-        S2P_CUDA_TRY(s2pdk_matmul(s->at1, 1, INC_C, ly->wo, INC_C, NULL,
+        S2P_CUDA_TRY(s2pdk_matmul(s->at1, tn, INC_C, ly->wo, INC_C, NULL,
                                   s->at3, st));
-        S2P_CUDA_TRY(s2pdk_scale_add_ip(x, s->at3, ly->g_attn, 1, INC_C, st));
-        S2P_CUDA_TRY(s2pdk_rmsnorm(x, ly->ffn_norm, 1e-5f, 1, INC_C, s->at1, st));
-        S2P_CUDA_TRY(s2pdk_matmul(s->at1, 1, INC_C, ly->w1, 3072, NULL,
+        S2P_CUDA_TRY(s2pdk_scale_add_ip(x, s->at3, ly->g_attn, tn, INC_C, st));
+        S2P_CUDA_TRY(s2pdk_rmsnorm(x, ly->ffn_norm, 1e-5f, tn, INC_C, s->at1, st));
+        S2P_CUDA_TRY(s2pdk_matmul(s->at1, tn, INC_C, ly->w1, 3072, NULL,
                                   s->af1, st));
-        S2P_CUDA_TRY(s2pdk_matmul(s->at1, 1, INC_C, ly->w3, 3072, NULL,
+        S2P_CUDA_TRY(s2pdk_matmul(s->at1, tn, INC_C, ly->w3, 3072, NULL,
                                   s->af2, st));
-        S2P_CUDA_TRY(s2pdk_silu_mul_ip(s->af1, s->af2, 3072, st));
-        S2P_CUDA_TRY(s2pdk_matmul(s->af1, 1, 3072, ly->w2, INC_C, NULL,
+        S2P_CUDA_TRY(s2pdk_silu_mul_ip(s->af1, s->af2, (int64_t)tn * 3072, st));
+        S2P_CUDA_TRY(s2pdk_matmul(s->af1, tn, 3072, ly->w2, INC_C, NULL,
                                   s->at1, st));
-        S2P_CUDA_TRY(s2pdk_scale_add_ip(x, s->at1, ly->g_ffn, 1, INC_C, st));
+        S2P_CUDA_TRY(s2pdk_scale_add_ip(x, s->at1, ly->g_ffn, tn, INC_C, st));
 
-        /* retain last min(127, hl+1) K/V rows: kv_ext tail */
-        int keep = hl + 1 < INC_KVHIST ? hl + 1 : INC_KVHIST;
-        int from = hl + 1 - keep;
+        /* retain last min(127, hl+tn) K/V rows: kv_ext tail */
+        int keep = hl + tn < INC_KVHIST ? hl + tn : INC_KVHIST;
+        int from = hl + tn - keep;
         S2P_CUDA_TRY(cudaMemcpyAsync(s->kh[l], s->axk + (size_t)from * INC_C,
                                      (size_t)keep * INC_C * sizeof(float),
                                      cudaMemcpyDeviceToDevice, st));
@@ -285,43 +293,41 @@ static s2p_status inc_post(s2pd_inc* s, float* x, cudaStream_t st) {
                                      (size_t)keep * INC_C * sizeof(float),
                                      cudaMemcpyDeviceToDevice, st));
     }
-    S2P_CUDA_TRY(s2pdk_rmsnorm(x, tf->norm, 1e-5f, 1, INC_C, x, st));
+    S2P_CUDA_TRY(s2pdk_rmsnorm(x, tf->norm, 1e-5f, tn, INC_C, x, st));
     return S2P_OK;
 }
 
-/* Enqueue one frame's full decode on `st`; the 2048 samples land in the
- * pinned s->pcm_pin via an async D2H. NO sync — s2pd_inc_collect does that.
- * Exactly one frame may be in flight (the scratch and histories are reused
- * per frame). */
 s2p_status s2pd_inc_push_async(s2pd_inc* s,
-                               const int32_t frame_codes[S2P_NUM_CODEBOOKS],
+                               const int32_t* frame_codes, int tn,
                                cudaStream_t st) {
-    if (!s || !frame_codes) return S2P_ERR_INVALID;
+    if (!s || !frame_codes || tn < 1 || tn > INC_MAX_TN)
+        return S2P_ERR_INVALID;
     if (s->pending) return S2P_ERR_STATE;
     s2p_dac* d = s->dac;
-    if (s->pos + 1 > (int64_t)INT32_MAX / 4) return S2P_ERR_INVALID;
+    if (s->pos + tn > (int64_t)INT32_MAX / 4) return S2P_ERR_INVALID;
 
-    if ((int)s->pos + 1 > d->rope_rows) {
+    if ((int)s->pos + tn > d->rope_rows) {
         /* table growth reallocates d->rope; drain in-flight users first */
         S2P_CUDA_TRY(cudaStreamSynchronize(st));
     }
-    S2P_TRY(s2pd_rope_ensure(d, (int)s->pos + 1));
+    S2P_TRY(s2pd_rope_ensure(d, (int)s->pos + tn));
 
-    /* clamp exactly like s2p_dac_decode */
-    int32_t cl[S2P_NUM_CODEBOOKS];
-    {
-        int32_t v = frame_codes[0];
-        cl[0] = v < 0 ? 0 : (v > S2P_CB_SIZE - 1 ? S2P_CB_SIZE - 1 : v);
+    /* clamp exactly like s2p_dac_decode; frame_codes is frame-major
+     * [tn][10], the staging buffer codebook-major [10][tn]. */
+    int32_t cl[S2P_NUM_CODEBOOKS * INC_MAX_TN];
+    for (int t = 0; t < tn; t++) {
+        int32_t v = frame_codes[(size_t)t * S2P_NUM_CODEBOOKS];
+        cl[t] = v < 0 ? 0 : (v > S2P_CB_SIZE - 1 ? S2P_CB_SIZE - 1 : v);
         for (int q = 1; q < S2P_NUM_CODEBOOKS; q++) {
-            v = frame_codes[q];
-            cl[q] = v < 0 ? 0 : (v > 1023 ? 1023 : v);
+            v = frame_codes[(size_t)t * S2P_NUM_CODEBOOKS + q];
+            cl[(size_t)q * tn + t] = v < 0 ? 0 : (v > 1023 ? 1023 : v);
         }
     }
-    S2P_CUDA_TRY(cudaMemcpyAsync(s->codes_dev, cl, sizeof(cl),
+    S2P_CUDA_TRY(cudaMemcpyAsync(s->codes_dev, cl,
+                                 (size_t)S2P_NUM_CODEBOOKS * tn *
+                                     sizeof(int32_t),
                                  cudaMemcpyHostToDevice, st));
 
-    /* RVQ from_indices -> z [1024, 1]; a [1,1024] row and a [1024,1] column
-     * are the same 1024 contiguous floats, so no transpose is needed. */
     s2pdk_rvq_tabs tabs;
     tabs.t[0].cb = d->sem.cb; tabs.t[0].ow = d->sem.out_w;
     tabs.t[0].ob = d->sem.out_b; tabs.t[0].n = d->sem.n;
@@ -332,25 +338,29 @@ s2p_status s2pd_inc_push_async(s2pd_inc* s,
         tabs.t[i + 1].n = d->res[i].n;
     }
     float* x = s->bx;
-    S2P_CUDA_TRY(s2pdk_rvq_from_indices(s->codes_dev, 1, tabs, x, st));
+    /* RVQ emits [1024, tn] channels-first; the transformer runs on rows */
+    S2P_CUDA_TRY(s2pdk_rvq_from_indices(s->codes_dev, tn, tabs, x, st));
+    S2P_CUDA_TRY(s2pdk_transpose(x, INC_C, tn, s->brow, st));   /* [tn,C] */
 
-    S2P_TRY(inc_post(s, x, st));
+    S2P_TRY(inc_post(s, s->brow, tn, st));
+
+    S2P_CUDA_TRY(s2pdk_transpose(s->brow, tn, INC_C, x, st));   /* [C,tn] */
 
     /* upsample x2: tconv k2 s2 is column-local (out j reads only in[j/2]) */
     float* y = s->by;
-    S2P_CUDA_TRY(s2pdk_tconv1d(x, INC_C, 1, d->up_t[0].w, d->up_t[0].b, INC_C,
-                               2, 2, y, 2, st));
-    S2P_TRY(inc_cnx(s, &d->up_cnx[0], &s->cnx_h[0], y, 2, st));
-    S2P_CUDA_TRY(s2pdk_tconv1d(y, INC_C, 2, d->up_t[1].w, d->up_t[1].b, INC_C,
-                               2, 2, x, 4, st));
-    S2P_TRY(inc_cnx(s, &d->up_cnx[1], &s->cnx_h[1], x, 4, st));
+    S2P_CUDA_TRY(s2pdk_tconv1d(x, INC_C, tn, d->up_t[0].w, d->up_t[0].b,
+                               INC_C, 2, 2, y, 2 * tn, st));
+    S2P_TRY(inc_cnx(s, &d->up_cnx[0], &s->cnx_h[0], y, 2 * tn, st));
+    S2P_CUDA_TRY(s2pdk_tconv1d(y, INC_C, 2 * tn, d->up_t[1].w, d->up_t[1].b,
+                               INC_C, 2, 2, x, 4 * tn, st));
+    S2P_TRY(inc_cnx(s, &d->up_cnx[1], &s->cnx_h[1], x, 4 * tn, st));
 
     /* decoder conv0 (input history) */
-    S2P_TRY(conv_hist(&d->dec_conv0, &s->c0_h, INC_C, 1536, 7, 1, x, 4,
+    S2P_TRY(conv_hist(&d->dec_conv0, &s->c0_h, INC_C, 1536, 7, 1, x, 4 * tn,
                       s->bext, y, st));
 
     /* 4 decoder blocks */
-    int Lc = 4;
+    int Lc = 4 * tn;
     for (int i = 0; i < 4; i++) {
         /* y holds block input [cin, Lc] */
         S2P_CUDA_TRY(s2pdk_snake(y, y, d->dec_b[i].alpha, IDEC_CIN[i], Lc, st));
@@ -384,32 +394,34 @@ s2p_status s2pd_inc_push_async(s2pd_inc* s,
         }
         { float* t = x; x = y; y = t; }   /* block output becomes next input */
     }
-    /* y holds [96, 2048] */
+    /* y holds [96, 2048*tn] */
     S2P_CUDA_TRY(s2pdk_snake(y, y, d->dec_alpha, 96, Lc, st));
     S2P_TRY(conv_hist(&d->dec_convf, &s->cf_h, 96, 1, 7, 1, y, Lc, s->bext,
                       x, st));
     S2P_CUDA_TRY(s2pdk_tanh_ip(x, Lc, st));
 
     S2P_CUDA_TRY(cudaMemcpyAsync(s->pcm_pin, x,
-                                 (size_t)S2P_FRAME_SAMPLES * sizeof(float),
+                                 (size_t)tn * S2P_FRAME_SAMPLES *
+                                     sizeof(float),
                                  cudaMemcpyDeviceToHost, st));
 
-    s->pending = 1;
-    s->pos++;
-    if (s->kv_len < INC_KVHIST) s->kv_len++;
+    s->pending = tn;
+    s->pos += tn;
+    s->kv_len = s->kv_len + tn < INC_KVHIST ? s->kv_len + tn : INC_KVHIST;
     return S2P_OK;
 }
 
-/* Sync `st` and hand out the in-flight frame's samples (0 if none). */
+/* Sync `st` and hand out the in-flight frames' samples (0 if none). */
 s2p_status s2pd_inc_collect(s2pd_inc* s, float* pcm_host, int64_t* n_out,
                             cudaStream_t st) {
     if (!s || !pcm_host || !n_out) return S2P_ERR_INVALID;
     *n_out = 0;
     if (!s->pending) return S2P_OK;
     S2P_CUDA_TRY(cudaStreamSynchronize(st));
-    memcpy(pcm_host, s->pcm_pin, (size_t)S2P_FRAME_SAMPLES * sizeof(float));
+    int64_t n = (int64_t)s->pending * S2P_FRAME_SAMPLES;
+    memcpy(pcm_host, s->pcm_pin, (size_t)n * sizeof(float));
     s->pending = 0;
-    *n_out = S2P_FRAME_SAMPLES;
+    *n_out = n;
     return S2P_OK;
 }
 
@@ -417,7 +429,7 @@ s2p_status s2pd_inc_push(s2pd_inc* s,
                          const int32_t frame_codes[S2P_NUM_CODEBOOKS],
                          float* pcm_host, cudaStream_t st) {
     if (!s || !frame_codes || !pcm_host) return S2P_ERR_INVALID;
-    S2P_TRY(s2pd_inc_push_async(s, frame_codes, st));
+    S2P_TRY(s2pd_inc_push_async(s, frame_codes, 1, st));
     int64_t n = 0;
     return s2pd_inc_collect(s, pcm_host, &n, st);
 }
