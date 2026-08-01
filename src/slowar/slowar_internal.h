@@ -125,6 +125,8 @@ struct s2p_model {
     s2p_tensor sffn;    /* [ctx, 9728] */
     s2p_tensor shidden; /* [max_sessions, 2560] final-normed batch hidden */
     s2p_tensor slogits; /* [max_sessions, 155776] bf16 */
+    s2p_tensor sattn_part; /* [max_sessions, 32, ctx/64, 130] f32 split-K
+                            * flash-decode partials (s2pk_attention_decode) */
     s2p_tensor sids;    /* [ctx] i64 prefill ids */
     s2p_tensor svq;     /* [10*ctx] i32 prefill VQ codes staging */
 

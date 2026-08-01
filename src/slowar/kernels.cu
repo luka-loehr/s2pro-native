@@ -338,6 +338,175 @@ extern "C" cudaError_t s2pk_attention_ptrs(
     return cudaGetLastError();
 }
 
+/* ---------------------------------------------- split-K flash decode ----- */
+/* One block = (row, kv_head, split of 64 positions). The K tile (64x128
+ * bf16, 16 KB) is loaded into shared memory coalesced ONCE and scored
+ * against the 4 q_heads sharing this kv_head; then the same shared buffer
+ * is reloaded with the V tile for the weighted accumulation. Per-split
+ * partials (m, l, acc[128]) go to `part`; k_attn_combine merges them. */
+#define S2PK_SPLIT 64
+#define S2PK_GROUP 4
+#define S2PK_HD 128
+
+static __global__ void k_attn_split(const __nv_bfloat16* __restrict__ q,
+                                    const __nv_bfloat16* const* k_caches,
+                                    const __nv_bfloat16* const* v_caches,
+                                    int q_heads, const int32_t* __restrict__
+                                    pos, int max_seq, int n_splits,
+                                    float* __restrict__ part) {
+    const int row = blockIdx.x;
+    const int kvh = blockIdx.y;
+    const int spl = blockIdx.z;
+    const int tid = threadIdx.x;              /* 128 threads */
+    const int len = pos[row] + 1;
+    const int start = spl * S2PK_SPLIT;
+    const int qh0 = kvh * S2PK_GROUP;
+
+    /* header slot even when the split is past this row's length */
+    float* pbase = part + (((size_t)row * q_heads + qh0) * n_splits + spl) *
+                              (S2PK_HD + 2);
+    if (start >= len) {
+        if (tid < S2PK_GROUP) {
+            float* ph = pbase + (size_t)tid * n_splits * (S2PK_HD + 2);
+            ph[0] = -INFINITY;
+            ph[1] = 0.f;
+        }
+        return;
+    }
+    const int cnt = min(S2PK_SPLIT, len - start);
+
+    __shared__ float tile[S2PK_SPLIT * S2PK_HD / 2]; /* bf16x2 as float bits */
+    __shared__ float sq[S2PK_GROUP][S2PK_HD];
+    __shared__ float sc[S2PK_GROUP][S2PK_SPLIT];
+    __shared__ float red[128];
+    __shared__ float hm[S2PK_GROUP], hs[S2PK_GROUP];
+
+    const float scale = rsqrtf((float)S2PK_HD);
+    /* queries, pre-scaled */
+    for (int i = tid; i < S2PK_GROUP * S2PK_HD; i += blockDim.x)
+        sq[i / S2PK_HD][i % S2PK_HD] =
+            s2pk_b2f(q[((size_t)row * q_heads + qh0 + i / S2PK_HD) * S2PK_HD +
+                       i % S2PK_HD]) *
+            scale;
+
+    /* K tile, coalesced (each thread streams consecutive bf16x2 pairs) */
+    const __nv_bfloat16* kc =
+        k_caches[row] + ((size_t)kvh * max_seq + start) * S2PK_HD;
+    const uint32_t* ksrc = (const uint32_t*)kc;
+    uint32_t* tdst = (uint32_t*)tile;
+    for (int i = tid; i < cnt * S2PK_HD / 2; i += blockDim.x) tdst[i] = ksrc[i];
+    __syncthreads();
+
+    /* scores: thread t handles position t (t < cnt) for each q head */
+    if (tid < cnt) {
+        const __nv_bfloat162* kr =
+            (const __nv_bfloat162*)(tdst + (size_t)tid * (S2PK_HD / 2));
+        for (int g = 0; g < S2PK_GROUP; g++) {
+            float d = 0.f;
+            const float* qv = sq[g];
+            for (int e = 0; e < S2PK_HD / 2; e++) {
+                float2 kf = __bfloat1622float2(kr[e]);
+                d = fmaf(qv[2 * e], kf.x, d);
+                d = fmaf(qv[2 * e + 1], kf.y, d);
+            }
+            sc[g][tid] = d;
+        }
+    }
+    __syncthreads();
+
+    /* per-head max + exp-sum over the tile */
+    for (int g = 0; g < S2PK_GROUP; g++) {
+        float v = (tid < cnt) ? sc[g][tid] : -INFINITY;
+        red[tid] = v;
+        __syncthreads();
+        for (int off = 64; off > 0; off >>= 1) {
+            if (tid < off) red[tid] = fmaxf(red[tid], red[tid + off]);
+            __syncthreads();
+        }
+        const float m = red[0];
+        __syncthreads();
+        float p = (tid < cnt) ? expf(sc[g][tid] - m) : 0.f;
+        if (tid < S2PK_SPLIT) sc[g][tid] = p;
+        red[tid] = p;
+        __syncthreads();
+        for (int off = 64; off > 0; off >>= 1) {
+            if (tid < off) red[tid] += red[tid + off];
+            __syncthreads();
+        }
+        if (tid == 0) {
+            hm[g] = m;
+            hs[g] = red[0];
+        }
+        __syncthreads();
+    }
+
+    /* V tile replaces K in shared memory */
+    const __nv_bfloat16* vc =
+        v_caches[row] + ((size_t)kvh * max_seq + start) * S2PK_HD;
+    const uint32_t* vsrc = (const uint32_t*)vc;
+    __syncthreads();
+    for (int i = tid; i < cnt * S2PK_HD / 2; i += blockDim.x) tdst[i] = vsrc[i];
+    __syncthreads();
+
+    /* weighted V: thread t accumulates output dim t for each head */
+    for (int g = 0; g < S2PK_GROUP; g++) {
+        float acc = 0.f;
+        for (int j = 0; j < cnt; j++) {
+            const __nv_bfloat16* vr =
+                (const __nv_bfloat16*)(tdst + (size_t)j * (S2PK_HD / 2));
+            acc = fmaf(sc[g][j], s2pk_b2f(vr[tid]), acc);
+        }
+        float* ph = pbase + (size_t)g * n_splits * (S2PK_HD + 2);
+        if (tid == 0) {
+            ph[0] = hm[g];
+            ph[1] = hs[g];
+        }
+        ph[2 + tid] = acc;
+    }
+}
+
+/* Merge the per-split partials: out = sum_s exp(m_s - M) * acc_s / l. */
+static __global__ void k_attn_combine(const float* __restrict__ part,
+                                      __nv_bfloat16* __restrict__ out,
+                                      int q_heads, int n_splits) {
+    const int row = blockIdx.x;
+    const int h = blockIdx.y;
+    const int tid = threadIdx.x;              /* 128 threads = head_dim */
+    const float* pb =
+        part + (((size_t)row * q_heads + h) * n_splits) * (S2PK_HD + 2);
+    float M = -INFINITY;
+    for (int s = 0; s < n_splits; s++)
+        M = fmaxf(M, pb[(size_t)s * (S2PK_HD + 2)]);
+    float l = 0.f, acc = 0.f;
+    for (int s = 0; s < n_splits; s++) {
+        const float* ph = pb + (size_t)s * (S2PK_HD + 2);
+        if (ph[1] == 0.f) continue;
+        const float w = expf(ph[0] - M);
+        l = fmaf(ph[1], w, l);
+        acc = fmaf(ph[2 + tid], w, acc);
+    }
+    out[((size_t)row * q_heads + h) * S2PK_HD + tid] = s2pk_f2b(acc / l);
+}
+
+extern "C" cudaError_t s2pk_attention_decode(
+    const __nv_bfloat16* q, const __nv_bfloat16* const* k_caches,
+    const __nv_bfloat16* const* v_caches, __nv_bfloat16* out, int rows,
+    int q_heads, int kv_heads, int head_dim, const int32_t* pos, int max_seq,
+    int max_len, float* part, cudaStream_t st) {
+    if (rows <= 0) return cudaSuccess;
+    if (head_dim != S2PK_HD || q_heads != kv_heads * S2PK_GROUP || !part)
+        return cudaErrorInvalidValue;
+    const int n_splits = (max_len + S2PK_SPLIT - 1) / S2PK_SPLIT;
+    dim3 g1((unsigned)rows, (unsigned)kv_heads, (unsigned)n_splits);
+    k_attn_split<<<g1, 128, 0, st>>>(q, k_caches, v_caches, q_heads, pos,
+                                     max_seq, n_splits, part);
+    cudaError_t ce = cudaGetLastError();
+    if (ce != cudaSuccess) return ce;
+    dim3 g2((unsigned)rows, (unsigned)q_heads);
+    k_attn_combine<<<g2, S2PK_HD, 0, st>>>(part, out, q_heads, n_splits);
+    return cudaGetLastError();
+}
+
 /* ---------------------------------------------------------------- silu_mul */
 
 static __global__ void k_silu_mul(const __nv_bfloat16* gu, __nv_bfloat16* h,

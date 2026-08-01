@@ -89,7 +89,19 @@ typedef struct {
     const int32_t* pos_dev;              /* [rows] */
     __nv_bfloat16* const* kptr;          /* [layers*rows] */
     __nv_bfloat16* const* vptr;
+    int max_len;                         /* max over rows of pos+1 */
 } s2p_batch_refs;
+
+/* S2P_ATTN_LEGACY=1 keeps the single-pass decode attention (A/B against
+ * the split-K flash-decode kernel). */
+static int attn_legacy(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("S2P_ATTN_LEGACY");
+        v = (e && e[0] == '1' && e[1] == '\0') ? 1 : 0;
+    }
+    return v;
+}
 
 static s2p_status run_layer(s2p_model* m, int l, int rows, int pos0,
                             const s2p_session* single,
@@ -120,11 +132,19 @@ static s2p_status run_layer(s2p_model* m, int l, int rows, int pos0,
         S2P_CUDA_TRY(s2pk_kv_append_ptrs(BF(m->sk), BF(m->sv), kp, vp, rows,
                                          S2P_SLOW_KV_HEADS, S2P_HEAD_DIM,
                                          batch->pos_dev, m->ctx_len, st));
-        S2P_CUDA_TRY(s2pk_attention_ptrs(
-            BF(m->sq), (const __nv_bfloat16* const*)kp,
-            (const __nv_bfloat16* const*)vp, BF(m->sattn), rows,
-            S2P_SLOW_Q_HEADS, S2P_SLOW_KV_HEADS, S2P_HEAD_DIM, batch->pos_dev,
-            m->ctx_len, st));
+        if (!attn_legacy())
+            S2P_CUDA_TRY(s2pk_attention_decode(
+                BF(m->sq), (const __nv_bfloat16* const*)kp,
+                (const __nv_bfloat16* const*)vp, BF(m->sattn), rows,
+                S2P_SLOW_Q_HEADS, S2P_SLOW_KV_HEADS, S2P_HEAD_DIM,
+                batch->pos_dev, m->ctx_len, batch->max_len,
+                (float*)m->sattn_part.data, st));
+        else
+            S2P_CUDA_TRY(s2pk_attention_ptrs(
+                BF(m->sq), (const __nv_bfloat16* const*)kp,
+                (const __nv_bfloat16* const*)vp, BF(m->sattn), rows,
+                S2P_SLOW_Q_HEADS, S2P_SLOW_KV_HEADS, S2P_HEAD_DIM,
+                batch->pos_dev, m->ctx_len, st));
     } else {
         __nv_bfloat16* kc = s2p_kv_k(single, l);
         __nv_bfloat16* vc = s2p_kv_v(single, l);
@@ -352,6 +372,9 @@ s2p_status s2p_model_batch_next_frame(s2p_model* m, s2p_session** sess, int n,
         refs.pos_dev = (const int32_t*)(d + m->up.off_pos);
         refs.kptr = (__nv_bfloat16* const*)(d + m->up.off_ptrs);
         refs.vptr = refs.kptr + (size_t)S2P_SLOW_LAYERS * B;
+        refs.max_len = 0;
+        for (int b = 0; b < bd; b++)
+            if (hpos[b] + 1 > refs.max_len) refs.max_len = hpos[b] + 1;
 
         /* embed fed-back token + previous-frame VQ sum, * 1/sqrt(11) */
         S2P_CUDA_TRY(s2pk_embed(BF(m->embed),

@@ -97,6 +97,13 @@ static s2p_status alloc_scratch(s2p_model* m) {
     S2P_TRY(alloc_2d(&m->shidden, ms, S2P_DIM, S2P_DT_BF16));
     S2P_TRY(alloc_2d(&m->slogits, ms, S2P_TEXT_VOCAB, S2P_DT_BF16));
     {
+        /* split-K flash-decode partials: [ms, 32 qh, ctx/64 splits, 130] */
+        int64_t splits = (ctx + 63) / 64;
+        int64_t s1[1] = {ms * S2P_SLOW_Q_HEADS * splits *
+                         (S2P_HEAD_DIM + 2)};
+        S2P_TRY(s2p_tensor_device_alloc(&m->sattn_part, S2P_DT_F32, 1, s1));
+    }
+    {
         int64_t s1[1] = {ctx};
         S2P_TRY(s2p_tensor_device_alloc(&m->sids, S2P_DT_I64, 1, s1));
     }
@@ -276,6 +283,7 @@ void s2p_model_free(s2p_model* m) {
     s2p_tensor_free(&m->sffn);
     s2p_tensor_free(&m->shidden);
     s2p_tensor_free(&m->slogits);
+    s2p_tensor_free(&m->sattn_part);
     s2p_tensor_free(&m->sids);
     s2p_tensor_free(&m->svq);
     if (m->d_up != NULL) cudaFree(m->d_up);
