@@ -24,6 +24,12 @@ for published releases.
 
 ### Added
 
+- `tools/voicegen` (Rust, offline): reference-voice generator on Gemini TTS
+  via Vertex AI — passage authoring across arbitrary language lists, all 30
+  prebuilt voices, exact 147/80 polyphase resampling to 44.1 kHz, and
+  LCS-scored transcript verification (`--verify`). Writes registry-ready
+  `voices/<name>.wav` + `.txt` pairs; credentials come from gcloud at
+  runtime, nothing is stored.
 - Voice registry (`include/s2pro/voices.h`, `src/voice/`): named references
   as `<name>.wav` + `<name>.txt` pairs, DAC-encoded once at startup; three
   multilingual sample voices ship in `voices/` (one Google Gemini TTS take

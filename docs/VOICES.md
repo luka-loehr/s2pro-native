@@ -52,8 +52,12 @@ voices/
   my-voice.txt   the EXACT transcript of the wav (UTF-8, one line)
 ```
 
-The name is the file basename. Convert anything to the required format
-with, e.g.:
+The name is the file basename. The shipped voices were produced with
+[`tools/voicegen`](../tools/voicegen/README.md), which authors a
+multilingual passage, synthesizes any of the 30 Gemini prebuilt voices,
+resamples to 44.1 kHz, and verifies each take against its transcript —
+one command per new voice. For material from other sources, convert to the
+required format with, e.g.:
 
 ```sh
 afconvert -f WAVE -d LEI16@44100 -c 1 input.mp3 voices/my-voice.wav   # macOS
