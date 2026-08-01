@@ -34,6 +34,31 @@ for published releases.
 
 ### Added
 
+- Bit-exact incremental streaming DAC (`src/dac/stream_inc.c`), now the
+  default streaming path: per-layer K/V histories for the post_module and
+  per-conv input histories replace the reference's window/overlap/crossfade
+  scheme entirely. Each pushed frame emits its 2048 samples immediately and
+  the streamed PCM equals the whole-buffer decode BIT FOR BIT (validated at
+  60 and 200 frames, past the 128-frame attention-window eviction point).
+  This removes both reference-side streaming defects (20-frame warmup
+  against a 128-frame receptive field; 512 dropped timeline samples per
+  window) by construction. `S2P_STREAM_REFERENCE=1` restores the reference
+  scheme for A/B.
+- DAC software pipelining in the scheduler: frame N's vocoding runs on the
+  dedicated CUDA stream while frame N+1's backbone step runs on the model
+  stream (`s2p_dac_stream_push_async`/`_collect`). Overlap removes the
+  launch/sync serialization but NOT the DAC's GPU work — both streams share
+  the same SMs — so the engine additionally batches up to eight frames per
+  push (`S2P_STREAM_BATCH`, first push always one frame for TTFA): kernel
+  launches drop 8x and the small early-stage convs get real occupancy.
+  Measured server-side (streamed, INT8, 51 s voice reference): wall RTF
+  2.05 → 1.25 (zero-shot long text: 1.16), TTFA 0.47 s zero-shot / 1.77 s
+  with the reference block.
+- Split-K flash-decode attention (`s2pk_attention_decode`): K/V tiles staged
+  in shared memory coalesced, 4 GQA q-heads served per tile, per-split
+  partials merged log-sum-exp. Long-context decode (51 s reference, 1445
+  prompt tokens) drops 46.9 → 42.7 ms/frame; parity unchanged
+  (`S2P_ATTN_LEGACY=1` keeps the single-pass kernel for decode).
 - `"stream": false` on `POST /v1/tts`: buffers the take server-side and
   responds with exact `Content-Length` and exact RIFF sizes. Streamed WAVs
   necessarily carry saturated size fields (the 44 header bytes are sent

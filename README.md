@@ -28,9 +28,12 @@ Measured on one DGX Spark (GB10, `sm_121`), single stream, 67-token prompt,
 | Weight + runtime memory | ~12 GB | **~8.5 GB** |
 
 INT8 decode is **below the 46.4 ms frame budget**: sustained generation
-after prefill runs at RTF 0.86 before vocoding. The serial DAC pass and
-long-reference attention are what keep end-to-end RTF above 1; the
-[roadmap](#roadmap-to-rtf--1) tracks both.
+after prefill runs at RTF 0.86 before vocoding. End-to-end streamed serving
+(bit-exact incremental DAC, pipelined and batched on its own CUDA stream,
+split-K decode attention) measures wall RTF 1.16–1.25 today — down from
+2.05 — with TTFA 0.47 s zero-shot / 1.77 s behind a 51 s voice reference;
+the [roadmap](#roadmap-to-rtf--1) holds the remaining arithmetic to below
+realtime.
 
 > **Status: functional pre-release.** BF16 and INT8 pass the layer-parity
 > gate against the PyTorch reference; voice cloning, the multilingual voice
@@ -216,16 +219,31 @@ the memory system, not as a viable quality path.
 
 ## Roadmap to RTF < 1
 
-- [ ] per-frame CUDA graph capture (~500 kernel launches/frame today)
-- [ ] device-side sampling (removes a 623 KB D2H copy + host softmax per frame)
-- [ ] DAC on a dedicated stream, overlapped with next-frame decode — with
-      INT8 decode at 39.7 ms/frame this alone brings sustained short-context
-      synthesis below realtime
+- [ ] per-frame CUDA graph capture (~500 kernel launches/frame today,
+      est. −2 to −3 ms/frame)
+- [ ] device-side sampling (removes a 623 KB D2H copy + host softmax per
+      frame, est. −1.5 ms; prerequisite for a full-frame graph)
+- [ ] reference-block KV-prefix cache (constant per voice → prefill only the
+      text; TTFA with a 51 s reference ~1.8 s → under 1 s)
+- [x] bit-exact incremental streaming DAC — streamed PCM equals the
+      whole-buffer decode bit for bit; replaces the reference
+      window/overlap/crossfade scheme
+- [x] DAC pipelined on a dedicated CUDA stream + batched pushes — server
+      wall RTF 2.05 → 1.25 (51 s voice reference), 1.16 zero-shot
+- [x] split-K flash-decode attention — long-context decode 46.9 → 42.7
+      ms/frame
 - [x] INT8 per-channel weight-only GEMV — decode 93.3 → 39.7 ms/frame,
       process memory ~19 → ~8.5 GB, parity **PASS**
 - [x] layer-parity validation against the PyTorch reference — BF16 **PASS**,
       INT8 **PASS**, FP8 **FAIL**
       ([benchmarks/parity](benchmarks/parity/README.md))
+
+The remaining distance to sustained sub-realtime is arithmetic, not hope:
+long-context backbone 42.7 ms + batched DAC ~10 ms GPU per 46.4 ms frame
+today; graphs + device sampling bring the backbone toward its ~35 ms
+bandwidth floor, which lands the sum at ~45 ms (RTF ≈ 0.97) — the two
+streams share SMs, so the DAC's GPU time adds to the frame regardless of
+overlap.
 - [x] voice-cloning encode — active with the full codec artifact
       (`tools/convert_codec_full.py`); reference wav → 21.5 Hz VQ codes →
       prompt injection, exercised end to end
