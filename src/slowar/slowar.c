@@ -63,6 +63,30 @@ s2p_status s2p_session_create(s2p_model* m, const s2p_sampling_cfg* cfg,
         return rc;
     }
     s2ps_sampler_init(&s->sampler, cfg, now_entropy() ^ (uint64_t)(uintptr_t)s);
+
+    /* mirror the sampler into a device-resident state for s2pk_sample */
+    {
+        s2ps_dev_state hst;
+        memset(&hst, 0, sizeof(hst));
+        memcpy(hst.prev, s->sampler.prev, sizeof(hst.prev));
+        hst.count = s->sampler.count;
+        memcpy(hst.rng, s->sampler.rng, sizeof(hst.rng));
+        hst.temperature = s->sampler.temperature;
+        hst.top_p = s->sampler.top_p;
+        hst.rep_penalty = s->sampler.rep_penalty;
+        hst.window = s->sampler.window;
+        hst.seeded = s->sampler.seeded;
+        hst.seed31 = s->sampler.seed31;
+        if (cudaMalloc(&s->dsamp, sizeof(hst)) != cudaSuccess ||
+            cudaMemcpy(s->dsamp, &hst, sizeof(hst), cudaMemcpyHostToDevice) !=
+                cudaSuccess) {
+            if (s->dsamp) cudaFree(s->dsamp);
+            s2p_tensor_free(&s->kv);
+            s2p_tensor_free(&s->pending_hidden);
+            free(s);
+            return S2P_ERR_CUDA;
+        }
+    }
     m->n_sessions++;
     *out = s;
     return S2P_OK;
@@ -76,6 +100,7 @@ void s2p_session_destroy(s2p_session* s) {
     }
     s2p_tensor_free(&s->kv);
     s2p_tensor_free(&s->pending_hidden);
+    if (s->dsamp) cudaFree(s->dsamp);
     free(s);
 }
 
@@ -428,43 +453,37 @@ s2p_status s2p_model_batch_next_frame(s2p_model* m, s2p_session** sess, int n,
         dump_step++;
     }
 
-    /* download the 4097 finite-after-bias candidate logits per row */
-    for (int b = 0; b < nact; b++) {
-        const uint16_t* lrow =
-            (const uint16_t*)m->slogits.data + (size_t)b * S2P_TEXT_VOCAB;
-        S2P_CUDA_TRY(cudaMemcpyAsync(m->h_sem + (size_t)b * S2PS_N_CAND,
-                                     lrow + S2P_TOK_SEMANTIC_START,
-                                     (size_t)S2PS_N_SEM * sizeof(uint16_t),
-                                     cudaMemcpyDeviceToHost, st));
-        S2P_CUDA_TRY(cudaMemcpyAsync(
-            m->h_sem + (size_t)b * S2PS_N_CAND + S2PS_CAND_EOS,
-            lrow + S2P_TOK_EOS, sizeof(uint16_t), cudaMemcpyDeviceToHost, st));
-    }
+    /* device sampling (exact port of the two-softmax sampler): logits ->
+     * token/sem/eos entirely on the GPU, state updated in place */
+    int64_t* d_tok = (int64_t*)m->d_out;
+    int32_t* d_sem = (int32_t*)((char*)m->d_out + m->out_off_sem);
+    int32_t* d_codes = (int32_t*)((char*)m->d_out + m->out_off_codes);
+    uint8_t* d_eos = (uint8_t*)((char*)m->d_out + m->out_off_eos);
+    for (int b = 0; b < nact; b++) m->h_sampptr[b] = act[b]->dsamp;
+    S2P_CUDA_TRY(cudaMemcpyAsync(m->d_sampptr, m->h_sampptr,
+                                 (size_t)nact * sizeof(void*),
+                                 cudaMemcpyHostToDevice, st));
+    S2P_CUDA_TRY(s2pk_sample((const __nv_bfloat16*)m->slogits.data,
+                             S2P_TEXT_VOCAB,
+                             (s2ps_dev_state* const*)m->d_sampptr, nact,
+                             d_tok, d_sem, d_codes, d_eos, st));
+
+    /* fast-AR residual cascade straight off the device sem ids (EOS rows run
+     * with sem 0 and are dropped afterwards, matching the reference) */
+    const int32_t* stage = NULL;
+    S2P_TRY(s2pfa_decode_frame_batch_dev(m->fastar,
+                                         (const __nv_bfloat16*)m->shidden.data,
+                                         d_sem, nact, &stage, st));
+    S2P_CUDA_TRY(s2pk_pack_frame(stage, nact, d_codes, st));
+
+    /* ONE download of the whole result block, then the only sync */
+    S2P_CUDA_TRY(cudaMemcpyAsync(m->h_out, m->d_out, m->out_bytes,
+                                 cudaMemcpyDeviceToHost, st));
     S2P_CUDA_TRY(cudaStreamSynchronize(st));
 
-    /* host sampling (exact two-softmax order) */
-    int64_t toks[S2P_SLOWAR_MAX_BATCH];
-    int eflag[S2P_SLOWAR_MAX_BATCH];
-    for (int b = 0; b < nact; b++) {
-        int32_t sem_id = 0;
-        toks[b] = s2ps_sample(&act[b]->sampler,
-                              m->h_sem + (size_t)b * S2PS_N_CAND,
-                              m->h_sem[(size_t)b * S2PS_N_CAND + S2PS_CAND_EOS],
-                              &sem_id, &eflag[b]);
-        m->h_semid[b] = sem_id; /* 0 when EOS, per reference */
-    }
-
-    /* fast-AR residual cascade for the whole batch (EOS rows run with
-     * sem_id 0 and are dropped afterwards, matching the reference).
-     * fastar.h pins sem_ids/out_codes as HOST pointers — it stages through
-     * its own pinned+device scratch and syncs the stream before returning —
-     * so hand it the pinned host buffers; cb0 (= sem_id) is the caller's to
-     * place and is left untouched by the callee. */
-    for (int b = 0; b < nact; b++)
-        m->h_frame[(size_t)b * S2P_NUM_CODEBOOKS] = m->h_semid[b];
-    S2P_TRY(s2pfa_decode_frame_batch(m->fastar,
-                                     (const __nv_bfloat16*)m->shidden.data,
-                                     m->h_semid, nact, m->h_frame, st));
+    const int64_t* toks = (const int64_t*)m->h_out;
+    const int32_t* codes = (const int32_t*)((char*)m->h_out + m->out_off_codes);
+    const uint8_t* eflag = (const uint8_t*)((char*)m->h_out + m->out_off_eos);
 
     /* harvest */
     for (int b = 0; b < nact; b++) {
@@ -475,7 +494,7 @@ s2p_status s2p_model_batch_next_frame(s2p_model* m, s2p_session** sess, int n,
             eos[i] = 1; /* EOS frame produces no codes */
             continue;
         }
-        const int32_t* frame = m->h_frame + (size_t)b * S2P_NUM_CODEBOOKS;
+        const int32_t* frame = codes + (size_t)b * S2P_NUM_CODEBOOKS;
         memcpy(out_codes + (size_t)i * S2P_NUM_CODEBOOKS, frame,
                S2P_NUM_CODEBOOKS * sizeof(int32_t));
         s->prev_token = toks[b];
