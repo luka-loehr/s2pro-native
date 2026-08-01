@@ -17,19 +17,20 @@ for published releases.
   reproduces, and each deployment wants its own language mix anyway. `voices/`
   ships with only its README; an empty registry serves zero-shot.
 
-### Fixed
+### Changed
 
-- Streaming vocoder fidelity: the reference's 20-frame window overlap is far
-  too little causal warmup for this DAC (post-module attention window is
-  128 frames) — every window after the second decoded audibly differently
-  from the parity-proven whole-buffer path (~5 dB SNR), and the reference
-  crossfade additionally skips 512 samples of timeline per window (an
-  audible click every stride). Overlap now defaults to 160 frames
-  (`S2P_STREAM_OVERLAP` tunes) and the crossfade is timeline-preserving (a
-  deliberate improvement over the reference). Same-codes validation vs the
-  whole-buffer decode: length-exact, SNR 35.9 dB, cos 0.99988 (before:
-  −3 dB, cos 0.02). All HTTP-streamed audio was affected; `s2p-test` gained
-  `S2P_TEST_STREAM_WAV` to diff both DAC paths on identical codes.
+- Streaming vocoder REVERTED to reference-exact behavior (20-frame overlap,
+  reference crossfade). An interim deviation (160-frame overlap plus a
+  timeline-preserving crossfade) measurably narrowed the stream-vs-
+  whole-buffer gap on identical codes (−3 dB → 35.9 dB SNR, length-exact),
+  but the listening gate did not confirm it as the fix for the reported
+  audible noise, so the port returns to bug-for-bug reference fidelity while
+  the noise source is localized upstream. The measured reference-side
+  properties stand documented: 20 frames of causal warmup against a
+  128-frame DAC attention window, and a crossfade that drops 512 samples of
+  timeline per window (verified against
+  `fishaudio_s2_pro/streaming_vocoder.py`). `s2p-test` keeps
+  `S2P_TEST_STREAM_WAV` for two-path diffs on identical codes.
 
 ### Added
 

@@ -22,24 +22,8 @@
 
 #define STREAM_STRIDE      10
 #define STREAM_FOLLOWUP    90
+#define STREAM_OVERLAP     20
 #define STREAM_CROSSFADE   512
-
-/* Reference default was 20 overlap frames — far too little causal warmup
- * for this DAC (post-module attention window is 128 frames), which made
- * every window after the second decode audibly differently from the
- * whole-buffer path (~5 dB SNR). 160 covers attention + conv receptive
- * field; measured >= 33 dB vs whole-buffer. Env S2P_STREAM_OVERLAP tunes. */
-#define STREAM_OVERLAP_DEFAULT 160
-
-static int stream_overlap(void) {
-    static int v = -1;
-    if (v < 0) {
-        const char* e = getenv("S2P_STREAM_OVERLAP");
-        v = e != NULL ? atoi(e) : STREAM_OVERLAP_DEFAULT;
-        if (v < 1) v = STREAM_OVERLAP_DEFAULT;
-    }
-    return v;
-}
 
 struct s2p_dac_stream {
     s2p_dac* d;
@@ -98,7 +82,7 @@ static s2p_status build_chunk(s2p_dac_stream* s, int is_final, float** chunk,
         return S2P_OK;
     }
 
-    int window_start = s->last - stream_overlap();
+    int window_start = s->last - STREAM_OVERLAP;
     if (window_start < s->code_start) window_start = s->code_start;
     int offset = window_start - s->code_start;
     int W = s->count - offset;                  /* = total - window_start */
@@ -124,20 +108,13 @@ static s2p_status build_chunk(s2p_dac_stream* s, int is_final, float** chunk,
         free(audio);
         return S2P_OK;
     }
+    const float* delta = audio + osamp;
+    int64_t dlen = alen - osamp;
 
-    /* Timeline-preserving crossfade (deliberate improvement over the
-     * reference, which blends the held tail against the NEXT 512 samples
-     * and thereby skips 512 samples of timeline per window — an audible
-     * click every stride): start the delta CROSSFADE samples early so the
-     * tail and the delta head cover the SAME timeline, then blend. */
+    /* crossfade with pending tail */
     int64_t cf = STREAM_CROSSFADE;
     if (s->tail_len < cf) cf = s->tail_len;
-    if (osamp < cf) cf = osamp;
-    if (alen - (osamp - cf) < cf) cf = 0; /* degenerate window: no blend */
-
-    const float* delta = audio + (osamp - cf);
-    int64_t dlen = alen - (osamp - cf);
-
+    if (dlen < cf) cf = dlen;
     int64_t mlen = s->tail_len + dlen - cf;
     float* merged = (float*)malloc((size_t)mlen * sizeof(float));
     if (!merged) { free(audio); return S2P_ERR_OOM; }
@@ -173,7 +150,7 @@ static s2p_status build_chunk(s2p_dac_stream* s, int is_final, float** chunk,
 
     s->last = s->total;
     {
-        int keep_from = s->total - stream_overlap();
+        int keep_from = s->total - STREAM_OVERLAP;
         if (keep_from < 0) keep_from = 0;
         trim_codes(s, keep_from);
     }
