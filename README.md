@@ -182,7 +182,9 @@ memory system, not as a viable quality path.
 - [ ] INT8 per-channel weight-only GEMV (now the primary 8-bit candidate — FP8 failed the parity gate)
 - [x] layer-parity validation against the PyTorch reference — BF16 **PASS**,
       FP8 **FAIL** ([benchmarks/parity](benchmarks/parity/README.md))
-- [ ] voice-cloning encode (blocked on encoder tensors in the converted codec, `S2P_GAP`)
+- [x] voice-cloning encode — active with the full codec artifact
+      (`tools/convert_codec_full.py`); reference wav → 21.5 Hz VQ codes →
+      prompt injection, exercised end to end
 
 ## Contributing and security
 

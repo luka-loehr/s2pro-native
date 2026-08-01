@@ -39,6 +39,61 @@ static double now_ms(void) {
         }                                                                      \
     } while (0)
 
+/* Minimal RIFF reader: 16-bit PCM mono 44.1 kHz -> malloc'd float [-1,1]. */
+static float* wav_read_f32(const char* path, int64_t* out_n) {
+    FILE* f = fopen(path, "rb");
+    if (f == NULL) return NULL;
+    uint8_t hdr[12];
+    if (fread(hdr, 1, 12, f) != 12 || memcmp(hdr, "RIFF", 4) != 0 ||
+        memcmp(hdr + 8, "WAVE", 4) != 0) {
+        fclose(f);
+        return NULL;
+    }
+    uint32_t rate = 0;
+    uint16_t ch = 0, bits = 0;
+    float* pcm = NULL;
+    for (;;) {
+        uint8_t ck[8];
+        if (fread(ck, 1, 8, f) != 8) break;
+        uint32_t sz = (uint32_t)ck[4] | ((uint32_t)ck[5] << 8) |
+                      ((uint32_t)ck[6] << 16) | ((uint32_t)ck[7] << 24);
+        if (memcmp(ck, "fmt ", 4) == 0) {
+            uint8_t fmt[16];
+            if (sz < 16 || fread(fmt, 1, 16, f) != 16) break;
+            ch = (uint16_t)(fmt[2] | (fmt[3] << 8));
+            rate = (uint32_t)fmt[4] | ((uint32_t)fmt[5] << 8) |
+                   ((uint32_t)fmt[6] << 16) | ((uint32_t)fmt[7] << 24);
+            bits = (uint16_t)(fmt[14] | (fmt[15] << 8));
+            if (sz > 16) fseek(f, (long)(sz - 16), SEEK_CUR);
+        } else if (memcmp(ck, "data", 4) == 0) {
+            if (ch != 1 || bits != 16 || rate != 44100) {
+                fprintf(stderr,
+                        "[test] ref wav must be 44100 Hz mono s16 "
+                        "(got %u Hz %u ch %u bit)\n", rate, ch, bits);
+                break;
+            }
+            int64_t n = sz / 2;
+            int16_t* s = malloc((size_t)sz);
+            pcm = malloc((size_t)n * sizeof(float));
+            if (s == NULL || pcm == NULL ||
+                fread(s, 1, sz, f) != sz) {
+                free(s);
+                free(pcm);
+                pcm = NULL;
+                break;
+            }
+            for (int64_t i = 0; i < n; i++) pcm[i] = (float)s[i] / 32768.0f;
+            free(s);
+            *out_n = n;
+            break;
+        } else {
+            fseek(f, (long)(sz + (sz & 1)), SEEK_CUR);
+        }
+    }
+    fclose(f);
+    return pcm;
+}
+
 int main(int argc, char** argv) {
     if (argc < 3) {
         fprintf(stderr, "usage: %s MODEL_DIR CODEC_DIR [TEXT]\n", argv[0]);
@@ -78,10 +133,36 @@ int main(int argc, char** argv) {
     s2p_tok* tok = NULL;
     CHECK(s2p_tok_load(model_dir, &tok), "tokenizer load");
 
-    /* Prompt */
+    /* Prompt (optional voice-cloning reference: S2P_TEST_REF wav +
+     * S2P_TEST_REF_TEXT transcript; needs the full codec artifact). */
     s2p_request_text req;
     memset(&req, 0, sizeof(req));
     req.text = text;
+    s2p_vq_part refpart;
+    int32_t* ref_codes = NULL;
+    const char* refwav = getenv("S2P_TEST_REF");
+    if (refwav != NULL) {
+        int64_t rn = 0;
+        float* rpcm = wav_read_f32(refwav, &rn);
+        if (rpcm == NULL) {
+            fprintf(stderr, "FAIL: cannot read ref wav %s\n", refwav);
+            return 1;
+        }
+        int refT = 0;
+        double tr = now_ms();
+        CHECK(s2p_dac_encode(dac, rpcm, rn, &ref_codes, &refT, 0),
+              "dac encode (reference)");
+        fprintf(stderr,
+                "[test] reference: %s  %.2f s -> %d frames (%.0f ms)\n",
+                refwav, (double)rn / S2P_SAMPLE_RATE, refT, now_ms() - tr);
+        free(rpcm);
+        refpart.codes = ref_codes;
+        refpart.T = refT;
+        req.refs = &refpart;
+        req.n_refs = 1;
+        req.ref_text = getenv("S2P_TEST_REF_TEXT");
+        if (req.ref_text == NULL) req.ref_text = "";
+    }
     int64_t*     ids = NULL;
     uint8_t*     vq_mask = NULL;
     s2p_vq_part* parts = NULL;
