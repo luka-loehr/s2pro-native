@@ -152,6 +152,7 @@ s2p_status s2p_dac_decode_latent(s2p_dac* d, const float* latent, int Tlat,
  * crossfade, no re-decode. Output equals s2p_dac_decode of the full code
  * sequence bit for bit (validated by S2P_TEST_STREAM_WAV). */
 typedef struct s2pd_inc s2pd_inc;
+s2p_status s2pd_rope_ensure(s2p_dac* d, int rows_needed);
 s2p_status s2pd_inc_create(s2p_dac* d, s2pd_inc** out);
 void       s2pd_inc_destroy(s2pd_inc* s);
 /* Decode ONE frame; writes 2048 samples to pcm_host. */
@@ -200,10 +201,6 @@ cudaError_t s2pdk_sdpa_inc(const float* q, int q_stride, const float* kv_k,
                            const float* kv_v, int kv_stride, int hl, int tn,
                            int heads, int hd, int window, float* out,
                            int out_stride, cudaStream_t st);
-cudaError_t s2pdk_tconv1d_tail(const float* in, int cin, int tin,
-                               const float* w, const float* b, int cout,
-                               int k, int stride, float* out, int t_skip,
-                               int t_keep, cudaStream_t st);
 cudaError_t s2pdk_silu_mul_ip(float* a, const float* b, int64_t n,
                               cudaStream_t st);
 cudaError_t s2pdk_gelu_ip(float* x, int64_t n, cudaStream_t st);

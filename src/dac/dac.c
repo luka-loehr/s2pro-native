@@ -107,6 +107,11 @@ static s2p_status ws_ensure(s2p_dac* d, size_t floats) {
     return S2P_OK;
 }
 
+/* module-visible wrapper (stream_inc.c grows the table per absolute frame) */
+s2p_status s2pd_rope_ensure(s2p_dac* d, int rows_needed) {
+    return rope_ensure(d, rows_needed);
+}
+
 static s2p_status codes_ensure(s2p_dac* d, int frames) {
     if (frames <= d->codes_cap) return S2P_OK;
     int cap = d->codes_cap > 0 ? d->codes_cap : 512;

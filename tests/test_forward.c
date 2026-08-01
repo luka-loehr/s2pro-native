@@ -297,6 +297,24 @@ int main(int argc, char** argv) {
         }
         free(ch);
         s2p_dac_stream_destroy(ds);
+        /* bit-exactness gate vs the whole-buffer decode above */
+        {
+            int64_t ncmp = sn < n_samples ? sn : n_samples;
+            double maxd = 0.0;
+            int64_t ndiff = 0;
+            for (int64_t i = 0; i < ncmp; i++) {
+                double dd = sp[i] - pcm[i];
+                if (dd < 0) dd = -dd;
+                if (dd > 0) ndiff++;
+                if (dd > maxd) maxd = dd;
+            }
+            fprintf(stderr,
+                    "[test] stream vs whole-buffer: len %lld/%lld, "
+                    "differing samples %lld, max|diff| %.3g%s\n",
+                    (long long)sn, (long long)n_samples, (long long)ndiff,
+                    maxd,
+                    (sn == n_samples && ndiff == 0) ? "  BIT-EXACT" : "");
+        }
         int16_t* s16 = (int16_t*)malloc((size_t)sn * sizeof(int16_t));
         if (s16 != NULL) {
             s2p_f32_to_s16(sp, s16, sn);
