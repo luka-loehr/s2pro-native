@@ -56,6 +56,23 @@ cudaError_t s2pk_attention_ptrs(const __nv_bfloat16* q,
                                 int kv_heads, int head_dim, const int32_t* pos,
                                 int max_seq, cudaStream_t st);
 
+/* Split-K flash-decode variant of s2pk_attention_ptrs for small `rows`:
+ * grid (rows, kv_heads, seq-splits of 64), each block loads its K/V tile
+ * into shared memory COALESCED once and scores all q_heads/kv_heads queries
+ * of the group against it; a combine kernel merges the per-split partials
+ * (log-sum-exp). Same f32 accumulation from bf16 as the single-pass kernel,
+ * different summation order (parity-gated, like the INT8 GEMMs).
+ * Requirements: head_dim == 128, q_heads/kv_heads == 4.
+ * `max_len` = max over rows of pos[r]+1 (host-known); `part` is device
+ * scratch of at least rows*q_heads*ceil(max_len/64)*(head_dim+2) floats. */
+cudaError_t s2pk_attention_decode(const __nv_bfloat16* q,
+                                  const __nv_bfloat16* const* k_caches,
+                                  const __nv_bfloat16* const* v_caches,
+                                  __nv_bfloat16* out, int rows, int q_heads,
+                                  int kv_heads, int head_dim,
+                                  const int32_t* pos, int max_seq,
+                                  int max_len, float* part, cudaStream_t st);
+
 /* In-place x[i] = bf16(f32(x[i]) / divisor). Replicates the reference prefill
  * VQ scale `x / sqrt(num_codebooks+1)` (a DIVISION — decode uses a multiply;
  * the two round differently in bf16, so both forms exist). */
