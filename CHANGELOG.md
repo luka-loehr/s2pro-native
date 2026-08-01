@@ -34,6 +34,17 @@ for published releases.
 
 ### Added
 
+- Device-side semantic sampling: the exact two-softmax sampler (RAS detect,
+  repetition penalty, torch-order top-30, seeded hash-Gumbel / xoshiro
+  draw) runs as a kernel against per-session device state; the fast-AR
+  consumes the sampled id device-side and one small download per frame
+  replaces the 623 KB logits round-trip. Greedy is bit-identical to the
+  host sampler.
+- CUDA-graph capture of the steady decode tick (batch <= 4, lazy per batch
+  size): one cudaGraphLaunch replays the ~1100-kernel frame; per-frame
+  variation flows through pinned-buffer contents. Graph vs eager at the
+  same seed: byte-identical audio. Long-context decode 42.4 -> 39.6
+  ms/frame; S2P_NO_GRAPHS=1 for A/B.
 - Bit-exact incremental streaming DAC (`src/dac/stream_inc.c`), now the
   default streaming path: per-layer K/V histories for the post_module and
   per-conv input histories replace the reference's window/overlap/crossfade
@@ -51,9 +62,10 @@ for published releases.
   the same SMs — so the engine additionally batches up to eight frames per
   push (`S2P_STREAM_BATCH`, first push always one frame for TTFA): kernel
   launches drop 8x and the small early-stage convs get real occupancy.
-  Measured server-side (streamed, INT8, 51 s voice reference): wall RTF
-  2.05 → 1.25 (zero-shot long text: 1.16), TTFA 0.47 s zero-shot / 1.77 s
-  with the reference block.
+  Measured server-side after the full pass (streamed, INT8, graphs +
+  device sampling + batched DAC + flash attention): wall RTF 2.05 → 1.19
+  with a 51 s voice reference (zero-shot long text: 1.10), TTFA 0.48 s
+  zero-shot / 1.77 s with the reference block.
 - Split-K flash-decode attention (`s2pk_attention_decode`): K/V tiles staged
   in shared memory coalesced, 4 GQA q-heads served per tile, per-split
   partials merged log-sum-exp. Long-context decode (51 s reference, 1445

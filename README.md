@@ -30,9 +30,10 @@ Measured on one DGX Spark (GB10, `sm_121`), single stream, 67-token prompt,
 INT8 decode is **below the 46.4 ms frame budget**: sustained generation
 after prefill runs at RTF 0.86 before vocoding. End-to-end streamed serving
 (bit-exact incremental DAC, pipelined and batched on its own CUDA stream,
-split-K decode attention) measures wall RTF 1.16–1.25 today — down from
-2.05 — with TTFA 0.47 s zero-shot / 1.77 s behind a 51 s voice reference;
-the [roadmap](#roadmap-to-rtf--1) holds the remaining arithmetic to below
+split-K decode attention, device-side sampling, CUDA-graph replay of the
+whole decode tick) measures wall RTF 1.10–1.19 today — down from 2.05 —
+with TTFA 0.48 s zero-shot / 1.77 s behind a 51 s voice reference; the
+[roadmap](#roadmap-to-rtf--1) holds the remaining arithmetic to below
 realtime.
 
 > **Status: functional pre-release.** BF16 and INT8 pass the layer-parity
@@ -219,12 +220,16 @@ the memory system, not as a viable quality path.
 
 ## Roadmap to RTF < 1
 
-- [ ] per-frame CUDA graph capture (~500 kernel launches/frame today,
-      est. −2 to −3 ms/frame)
-- [ ] device-side sampling (removes a 623 KB D2H copy + host softmax per
-      frame, est. −1.5 ms; prerequisite for a full-frame graph)
+- [ ] shared-memory-tiled DAC conv kernels (the correctness-first convs
+      re-read inputs k-fold from global; identical per-output accumulation
+      order keeps bit-exactness; est. −5 ms/frame of DAC GPU time — the
+      step that crosses RTF 1)
 - [ ] reference-block KV-prefix cache (constant per voice → prefill only the
       text; TTFA with a 51 s reference ~1.8 s → under 1 s)
+- [x] CUDA-graph replay of the steady decode tick — one launch instead of
+      ~1100; graph vs eager byte-identical; decode 42.4 → 39.6 ms/frame
+- [x] device-side sampling — exact two-softmax port, per-session device
+      state, one small download per frame
 - [x] bit-exact incremental streaming DAC — streamed PCM equals the
       whole-buffer decode bit for bit; replaces the reference
       window/overlap/crossfade scheme
@@ -239,11 +244,12 @@ the memory system, not as a viable quality path.
       ([benchmarks/parity](benchmarks/parity/README.md))
 
 The remaining distance to sustained sub-realtime is arithmetic, not hope:
-long-context backbone 42.7 ms + batched DAC ~10 ms GPU per 46.4 ms frame
-today; graphs + device sampling bring the backbone toward its ~35 ms
-bandwidth floor, which lands the sum at ~45 ms (RTF ≈ 0.97) — the two
-streams share SMs, so the DAC's GPU time adds to the frame regardless of
-overlap.
+long-context backbone 39.6 ms + batched DAC ~10 ms GPU per 46.4 ms frame
+today (the two streams share SMs, so DAC GPU time adds to the frame
+regardless of overlap). Tiling the DAC convs is the step that crosses 1:
+~5 ms of their GPU time is k-fold re-reads the shared-memory tile removes
+without touching the accumulation order — landing the sum at ~45 ms
+(RTF ≈ 0.96), with fast-AR kernel fusion as the reserve beyond that.
 - [x] voice-cloning encode — active with the full codec artifact
       (`tools/convert_codec_full.py`); reference wav → 21.5 Hz VQ codes →
       prompt injection, exercised end to end
