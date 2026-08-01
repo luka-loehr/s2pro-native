@@ -110,7 +110,9 @@ int main(int argc, char** argv) {
     CHECK(s2p_gemm_init(S2P_CTX_LEN_DEFAULT), "gemm init");
     s2p_gemm_mode mode = s2p_gemm_mode_from_env();
     fprintf(stderr, "[test] gemm mode: %s\n",
-            mode == S2P_GEMM_FP8 ? "FP8" : "BF16");
+            mode == S2P_GEMM_INT8  ? "INT8"
+            : mode == S2P_GEMM_FP8 ? "FP8"
+                                   : "BF16");
 
     s2p_config* cfg = NULL;
     CHECK(s2p_config_load(model_dir, &cfg), "config load");

@@ -1,5 +1,6 @@
 /* s2pro-native — linear layers: cuBLAS BF16 default, fish-scales-ops FP8
- * opt-in (S2P_FP8=1). Implements include/s2pro/gemm.h.
+ * opt-in (S2P_FP8=1), per-out-channel weight-only INT8 opt-in (S2P_INT8=1).
+ * Implements include/s2pro/gemm.h.
  *
  * Convention (row-major): x [M, in], w [out, in], y [M, out] => y = x * w^T.
  * The cuBLAS call is the exact one proven in ~/fso-sm121-test/harness3.cu:
@@ -9,7 +10,11 @@
  * activations are quantized per call from a process-global scratch that grows
  * on demand. Any shape the FP8 path cannot serve (K % 512 != 0) falls back
  * to BF16 with a logged warning — never an error.
- */
+ * INT8 weights are quantized ONCE at load (s2p_linear_prepare_int8), which
+ * then FREES the BF16 copy — that is the sub-9-GB RAM lever. Decode M<=8
+ * runs the int8 GEMV; larger M (prefill) dequantizes the layer into a shared
+ * scratch and reuses the proven cuBLAS BF16 call, trading one-time prefill
+ * bandwidth for the per-frame halving that decides RTF. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -45,7 +50,9 @@ static struct {
     /* FP8 activation scratch (device), grown on demand: */
     void*  act_fp8;    size_t act_fp8_bytes;
     void*  act_scales; size_t act_scales_bytes;
-} g = { 0, NULL, PTHREAD_MUTEX_INITIALIZER, 0, NULL, 0, NULL, 0 };
+    /* INT8 prefill dequant scratch (device), grown on demand: */
+    void*  deq;        size_t deq_bytes;
+} g = { 0, NULL, PTHREAD_MUTEX_INITIALIZER, 0, NULL, 0, NULL, 0, NULL, 0 };
 
 s2p_status s2p_gemm_init(int max_m) {
     pthread_mutex_lock(&g.mu);
@@ -70,9 +77,11 @@ void s2p_gemm_shutdown(void) {
     if (g.inited) {
         if (g.act_fp8) cudaFree(g.act_fp8);
         if (g.act_scales) cudaFree(g.act_scales);
+        if (g.deq) cudaFree(g.deq);
         g.act_fp8 = NULL;
         g.act_scales = NULL;
-        g.act_fp8_bytes = g.act_scales_bytes = 0;
+        g.deq = NULL;
+        g.act_fp8_bytes = g.act_scales_bytes = g.deq_bytes = 0;
         cublasDestroy(g.handle);
         g.handle = NULL;
         g.inited = 0;
@@ -81,6 +90,8 @@ void s2p_gemm_shutdown(void) {
 }
 
 s2p_gemm_mode s2p_gemm_mode_from_env(void) {
+    const char* i8 = getenv("S2P_INT8");
+    if (i8 && i8[0] == '1' && i8[1] == '\0') return S2P_GEMM_INT8;
     const char* v = getenv("S2P_FP8");
     if (v && v[0] == '1' && v[1] == '\0') {
         if (!s2p_fso_available()) {
@@ -99,26 +110,33 @@ int s2p_fso_available(void) {
     return s2p_fso_arch_ok();
 }
 
-/* y[M,N] = x[M,K] * w[N,K]^T, BF16 in/out, FP32 accumulate. */
-s2p_status s2p_gemm_bf16(const void* x, const void* w, void* y, int M, int N,
-                         int K, cudaStream_t stream) {
-    if (!x || !w || !y || M <= 0 || N <= 0 || K <= 0) return S2P_ERR_INVALID;
-    if (!g.inited) return S2P_ERR_STATE;
+/* The cublas call itself; caller holds g.mu. */
+static s2p_status gemm_bf16_locked(const void* x, const void* w, void* y,
+                                   int M, int N, int K, cudaStream_t stream) {
     float alpha = 1.0f, beta = 0.0f;
-    pthread_mutex_lock(&g.mu);
     cublasStatus_t cs = cublasSetStream(g.handle, stream);
     if (cs == CUBLAS_STATUS_SUCCESS)
         cs = cublasGemmEx(g.handle, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K, &alpha,
                           w, CUDA_R_16BF, K, x, CUDA_R_16BF, K, &beta, y,
                           CUDA_R_16BF, N, CUBLAS_COMPUTE_32F,
                           CUBLAS_GEMM_DEFAULT);
-    pthread_mutex_unlock(&g.mu);
     if (cs != CUBLAS_STATUS_SUCCESS) {
         fprintf(stderr, "[s2pro] cublasGemmEx(M=%d,N=%d,K=%d) failed: %d\n",
                 M, N, K, (int)cs);
         return S2P_ERR_CUDA;
     }
     return S2P_OK;
+}
+
+/* y[M,N] = x[M,K] * w[N,K]^T, BF16 in/out, FP32 accumulate. */
+s2p_status s2p_gemm_bf16(const void* x, const void* w, void* y, int M, int N,
+                         int K, cudaStream_t stream) {
+    if (!x || !w || !y || M <= 0 || N <= 0 || K <= 0) return S2P_ERR_INVALID;
+    if (!g.inited) return S2P_ERR_STATE;
+    pthread_mutex_lock(&g.mu);
+    s2p_status rc = gemm_bf16_locked(x, w, y, M, N, K, stream);
+    pthread_mutex_unlock(&g.mu);
+    return rc;
 }
 
 s2p_status s2p_linear_from_st(s2p_linear* lin, s2p_st* st, const char* name,
@@ -192,6 +210,60 @@ s2p_status s2p_linear_prepare_fp8(s2p_linear* lin, cudaStream_t stream) {
     return S2P_OK;
 }
 
+static int int8_keep_bf16(void) {
+    const char* v = getenv("S2P_INT8_KEEP_BF16");
+    return v && v[0] == '1' && v[1] == '\0';
+}
+
+s2p_status s2p_linear_prepare_int8(s2p_linear* lin, cudaStream_t stream) {
+    if (!lin || !lin->w_bf16.data) return S2P_ERR_INVALID;
+    if (lin->int8_ready) return S2P_OK;
+    int N = lin->out_features, K = lin->in_features;
+    if (K % 512 != 0) {
+        /* GEMV tile requirement; no such layer exists in S2-Pro. */
+        fprintf(stderr, "[s2pro] int8 prepare [%d,%d]: K %% 512 != 0, layer "
+                        "stays BF16\n", N, K);
+        return S2P_OK;
+    }
+
+    int64_t qshape[2] = { (int64_t)N, (int64_t)K };
+    S2P_TRY(s2p_tensor_device_alloc(&lin->w_int8, S2P_DT_I8, 2, qshape));
+    int64_t sshape[1] = { (int64_t)N };
+    s2p_status rc = s2p_tensor_device_alloc(&lin->w_iscale, S2P_DT_F32, 1,
+                                            sshape);
+    if (rc == S2P_OK)
+        rc = s2p_int8_quant(lin->w_int8.data, (float*)lin->w_iscale.data,
+                            lin->w_bf16.data, N, K, stream);
+    if (rc == S2P_OK) {
+        /* the BF16 source is freed (or reused by the caller) next */
+        cudaError_t ce = cudaStreamSynchronize(stream);
+        if (ce != cudaSuccess) {
+            fprintf(stderr, "[s2pro] int8 prepare sync: %s\n",
+                    cudaGetErrorString(ce));
+            rc = S2P_ERR_CUDA;
+        }
+    }
+    if (rc != S2P_OK) {
+        s2p_tensor_free(&lin->w_int8);
+        s2p_tensor_free(&lin->w_iscale);
+        return rc;
+    }
+    lin->int8_ready = 1;
+    if (!int8_keep_bf16()) s2p_tensor_free(&lin->w_bf16);
+    return S2P_OK;
+}
+
+/* Ensure the dequant scratch covers one [N,K] BF16 layer. g.mu held. */
+static s2p_status deq_scratch_reserve(size_t bytes, cudaStream_t stream) {
+    if (bytes <= g.deq_bytes) return S2P_OK;
+    S2P_CUDA_TRY(cudaStreamSynchronize(stream));
+    if (g.deq) { cudaFree(g.deq); g.deq = NULL; g.deq_bytes = 0; }
+    cudaError_t ce = cudaMalloc(&g.deq, bytes);
+    if (ce != cudaSuccess) return S2P_ERR_OOM;
+    g.deq_bytes = bytes;
+    return S2P_OK;
+}
+
 /* Ensure the global activation scratch covers (M, K). Called with g.mu held.
  * Growth syncs the stream first so in-flight work never loses its buffer. */
 static s2p_status act_scratch_reserve(int M, int K, cudaStream_t stream) {
@@ -236,7 +308,28 @@ s2p_status s2p_linear_forward(const s2p_linear* lin, const void* x_bf16,
         pthread_mutex_unlock(&g.mu);
         return rc;
     }
-    /* BF16 default; also the silent fallback for FP8-unready layers. */
+    if (mode == S2P_GEMM_INT8 && lin->int8_ready) {
+        if (M <= S2P_INT8_GEMV_MAX_M)
+            return s2p_int8_gemv(y_bf16, x_bf16, lin->w_int8.data,
+                                 (const float*)lin->w_iscale.data, M, N, K,
+                                 stream);
+        /* prefill / oversize batch: dequant into the shared scratch, then
+         * the proven cuBLAS call. Lock held across both so a concurrent
+         * reserve can never free the scratch under the GEMM. */
+        pthread_mutex_lock(&g.mu);
+        s2p_status rc = deq_scratch_reserve(
+            (size_t)N * K * sizeof(uint16_t), stream);
+        if (rc == S2P_OK)
+            rc = s2p_int8_dequant(g.deq, lin->w_int8.data,
+                                  (const float*)lin->w_iscale.data, N, K,
+                                  stream);
+        if (rc == S2P_OK)
+            rc = gemm_bf16_locked(x_bf16, g.deq, y_bf16, M, N, K, stream);
+        pthread_mutex_unlock(&g.mu);
+        return rc;
+    }
+    /* BF16 default; also the silent fallback for FP8/INT8-unready layers. */
+    if (!lin->w_bf16.data) return S2P_ERR_STATE; /* dropped by prepare_int8 */
     return s2p_gemm_bf16(x_bf16, lin->w_bf16.data, y_bf16, M, N, K, stream);
 }
 
@@ -245,5 +338,8 @@ void s2p_linear_free(s2p_linear* lin) {
     s2p_tensor_free(&lin->w_bf16);
     s2p_tensor_free(&lin->w_fp8);
     s2p_tensor_free(&lin->w_scales);
+    s2p_tensor_free(&lin->w_int8);
+    s2p_tensor_free(&lin->w_iscale);
     lin->fp8_ready = 0;
+    lin->int8_ready = 0;
 }

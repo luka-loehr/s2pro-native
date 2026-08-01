@@ -33,6 +33,18 @@ for published releases.
 
 ### Added
 
+- INT8 per-channel weight-only GEMM path (`S2P_INT8=1` / `--int8`): every
+  linear is quantized per output channel at load (absmax/127,
+  round-to-nearest) and the BF16 copy is freed; decode-M GEMMs run a fused
+  int8×bf16 GEMV kernel (`src/sched/int8_gemv.cu`, one warp per output row,
+  FP32 accumulate), prefill dequantizes layer-by-layer into a shared scratch
+  and reuses the proven cuBLAS BF16 call, and the tied lm-head reads an int8
+  sidecar of the embedding table. Passes the layer-parity gate (backbone cos
+  ≥ 0.99989, prefill/step-1 argmax identical —
+  `benchmarks/parity/results/parity-int8-oracle-fox-2026-08-01.json`).
+  Measured on the GB10: decode 93.3 → 39.7 ms/frame (below the 46.4 ms frame
+  budget; sustained short-context RTF 0.86 before vocoding), end-to-end RTF
+  2.41 → 1.27, process peak memory ~12 → ~8.5 GB.
 - `tools/voicegen` (Rust, offline): reference-voice generator on Gemini TTS
   via Vertex AI — passage authoring across arbitrary language lists, all 30
   prebuilt voices, exact 147/80 polyphase resampling to 44.1 kHz (with a

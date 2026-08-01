@@ -17,24 +17,27 @@ not part of the runtime.
 
 ## At a glance
 
-Measured on one DGX Spark (GB10, `sm_121`), single stream, 41-token prompt,
-60 frames, greedy sampling (details in [Performance](#performance)):
+Measured on one DGX Spark (GB10, `sm_121`), single stream, 67-token prompt,
+60 frames, sampled (temp 0.8, seed 3; details in
+[Performance](#performance)):
 
-|  | BF16 cuBLAS (default) | FP8 fish-scales-ops (`S2P_FP8=1`) |
+|  | BF16 cuBLAS (default) | INT8 weight-only (`S2P_INT8=1`) |
 | --- | ---: | ---: |
-| Decode per frame (46.4 ms of audio) | 92.6 ms | **49.4 ms** |
-| RTF (compute ÷ audio, lower is better) | 2.38 | **1.39** |
+| Decode per frame (46.4 ms of audio) | 93.3 ms | **39.7 ms** |
+| RTF (compute ÷ audio, lower is better) | 2.41 | **1.27** |
+| Weight + runtime memory | ~12 GB | **~8.5 GB** |
 
-The 8-bit weight path's bandwidth floor on this hardware is ~35 ms/frame
-(RTF ~0.75); the [roadmap](#roadmap-to-rtf--1) tracks closing the remaining
-gap to below-realtime synthesis.
+INT8 decode is **below the 46.4 ms frame budget**: sustained generation
+after prefill runs at RTF 0.86 before vocoding. The serial DAC pass and
+long-reference attention are what keep end-to-end RTF above 1; the
+[roadmap](#roadmap-to-rtf--1) tracks both.
 
-> **Status: functional pre-release.** BF16 passes the layer-parity gate
-> against the PyTorch reference; voice cloning, the multilingual voice
+> **Status: functional pre-release.** BF16 and INT8 pass the layer-parity
+> gate against the PyTorch reference; voice cloning, the multilingual voice
 > registry, and the HTTP streaming server are exercised end to end on real
 > hardware (TTFA ~1.1 s zero-shot / ~2.5 s with a 50 s reference block).
-> Single-stream synthesis is not yet below realtime. There is no published
-> release line yet; deploy from a reviewed, pinned `main` commit.
+> End-to-end single-stream synthesis is not yet below realtime. There is no
+> published release line yet; deploy from a reviewed, pinned `main` commit.
 
 ## What this project provides
 
@@ -166,36 +169,56 @@ Review [SECURITY.md](SECURITY.md) before exposing the service.
 
 ## Performance
 
-Single stream, 41-token prompt, 60 frames, greedy sampling, container on an
-otherwise idle GB10:
+Single stream, 67-token prompt, 60 frames, sampled (temp 0.8, top-p 0.8,
+seed 3), container on an otherwise idle GB10:
 
 | GEMM path | Prefill | Decode per frame | DAC per frame | RTF |
 | --- | ---: | ---: | ---: | ---: |
-| BF16 cuBLAS (default) | 307.7 ms | 92.6 ms | ~13 ms | 2.38 |
-| FP8 fish-scales-ops | 40.4 ms | 49.4 ms | ~14 ms | 1.39 |
+| BF16 cuBLAS (default) | 306.6 ms | 93.3 ms | ~14 ms | 2.41 |
+| INT8 weight-only (`S2P_INT8=1`) | 353.4 ms | **39.7 ms** | ~14 ms | **1.27** |
+
+With a realistic serving prompt (51 s voice reference → 1445 prompt tokens,
+400 frames), INT8 decode rises to 47.5 ms/frame — the extra ~8 ms is
+attention over the longer KV — with prefill at 1.88 s and end-to-end RTF
+1.52. FP8 (fish-scales-ops) measured 49.4 ms/frame under the earlier greedy
+protocol but FAILED the parity gate and is not a quality path.
 
 RTF is compute ÷ audio; below 1.0 means synthesis is faster than playback.
 At batch 1 every frame reads ~7.75 B weight parameters (backbone, tied LM
 head, and nine sequential fast-AR passes), so 16-bit weights are
 bandwidth-bound above realtime on this memory system by construction — the
-8-bit floor is ~35 ms/frame.
+8-bit floor is ~35 ms/frame, and the INT8 GEMV runs within ~13 % of it.
+
+The INT8 path quantizes every linear per output channel at load
+(absmax/127, round-to-nearest), frees the BF16 copies, and serves decode-M
+GEMMs from a fused int8×bf16 GEMV kernel; prefill dequantizes layer-by-layer
+into a shared scratch and reuses the proven cuBLAS call. The tied lm-head
+gets an int8 sidecar of the embedding table (the bf16 table stays for
+embedding lookups). Process peak memory drops from ~12 GB to ~8.5 GB
+(delta of system used memory across the run, single session, ctx 4096).
 
 Numeric fidelity is gated by the layer-parity protocol
 ([benchmarks/parity](benchmarks/parity/README.md)): the BF16 path matches
 the PyTorch reference at every stage (backbone cos ≥ 0.99996, identical
 first-frame argmax except one exact bf16 tie, native DAC at SNR 65.9 dB on
-reference frames). The FP8 path FAILS the same gate (backbone cos collapses
-to 0.33 over 36 layers) — its timings above remain as measurements of the
-memory system, not as a viable quality path.
+reference frames), and the INT8 path holds the same class (backbone cos
+≥ 0.99989, prefill/step-1 logits argmax identical, the same single
+codebook-8 near-tie flip). The FP8 path FAILS the same gate (backbone cos
+collapses to 0.33 over 36 layers) — its timings remain as measurements of
+the memory system, not as a viable quality path.
 
 ## Roadmap to RTF < 1
 
 - [ ] per-frame CUDA graph capture (~500 kernel launches/frame today)
 - [ ] device-side sampling (removes a 623 KB D2H copy + host softmax per frame)
-- [ ] DAC on a dedicated stream, overlapped with next-frame decode
-- [ ] INT8 per-channel weight-only GEMV (now the primary 8-bit candidate — FP8 failed the parity gate)
+- [ ] DAC on a dedicated stream, overlapped with next-frame decode — with
+      INT8 decode at 39.7 ms/frame this alone brings sustained short-context
+      synthesis below realtime
+- [x] INT8 per-channel weight-only GEMV — decode 93.3 → 39.7 ms/frame,
+      process memory ~19 → ~8.5 GB, parity **PASS**
 - [x] layer-parity validation against the PyTorch reference — BF16 **PASS**,
-      FP8 **FAIL** ([benchmarks/parity](benchmarks/parity/README.md))
+      INT8 **PASS**, FP8 **FAIL**
+      ([benchmarks/parity](benchmarks/parity/README.md))
 - [x] voice-cloning encode — active with the full codec artifact
       (`tools/convert_codec_full.py`); reference wav → 21.5 Hz VQ codes →
       prompt injection, exercised end to end

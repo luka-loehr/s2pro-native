@@ -61,8 +61,10 @@ docker run --rm --gpus all -v "$PWD":/work -w /work \
 ```
 
 Prints per-stage timings, the first frames' codes, and writes
-`/tmp/s2p_smoke.wav`. `S2P_FP8=1` switches the decode GEMMs to the
-fish-scales-ops FP8 path.
+`/tmp/s2p_smoke.wav`. `S2P_INT8=1` switches the GEMMs to the per-channel
+weight-only INT8 path (parity-proven, halves decode time and weight RAM);
+`S2P_FP8=1` selects the fish-scales-ops FP8 path (parity-FAILED, kept for
+measurement only).
 
 ## 5. Server
 

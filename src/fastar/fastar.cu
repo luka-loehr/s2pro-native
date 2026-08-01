@@ -253,6 +253,16 @@ s2p_status s2pfa_load(s2pfa** out, s2p_st* st, s2p_gemm_mode mode,
         }
         if (rc == S2P_OK) rc = s2p_linear_prepare_fp8(&f->output, stream);
     }
+    if (rc == S2P_OK && mode == S2P_GEMM_INT8) {
+        for (int l = 0; l < FA_LAYERS && rc == S2P_OK; l++) {
+            s2pfa_layer* L = &f->layers[l];
+            rc = s2p_linear_prepare_int8(&L->wqkv, stream);
+            if (rc == S2P_OK) rc = s2p_linear_prepare_int8(&L->wo, stream);
+            if (rc == S2P_OK) rc = s2p_linear_prepare_int8(&L->w13, stream);
+            if (rc == S2P_OK) rc = s2p_linear_prepare_int8(&L->w2, stream);
+        }
+        if (rc == S2P_OK) rc = s2p_linear_prepare_int8(&f->output, stream);
+    }
 
     /* decode workspace */
     if (rc == S2P_OK) {

@@ -21,7 +21,15 @@ extern "C" {
 typedef enum {
     S2P_GEMM_BF16 = 0,   /* cuBLAS BF16, FP32 accumulate (default) */
     S2P_GEMM_FP8  = 1,   /* fish-scales-ops block-scaled FP8 (S2P_FP8=1) */
+    S2P_GEMM_INT8 = 2,   /* per-out-channel weight-only INT8 (S2P_INT8=1):
+                          * decode-M GEMV reads int8 weights + f32 row scales,
+                          * activations stay BF16, FP32 accumulate; larger M
+                          * dequantizes into a shared scratch and uses cuBLAS */
 } s2p_gemm_mode;
+
+/* Largest M served by the INT8 GEMV kernel; beyond this the INT8 path
+ * dequantizes to BF16 scratch + cuBLAS (prefill / big lockstep batches). */
+#define S2P_INT8_GEMV_MAX_M 8
 
 /* Global gemm context (cublas handle + fp8 scratch). One per process. */
 s2p_status    s2p_gemm_init(int max_m);
@@ -32,17 +40,25 @@ int           s2p_fso_available(void);      /* 1 if FP8 kernels linked+arch ok *
 typedef struct {
     int        in_features;
     int        out_features;
-    s2p_tensor w_bf16;        /* [out, in] device BF16, always present */
+    s2p_tensor w_bf16;        /* [out, in] device BF16 (freed by prepare_int8
+                               * unless S2P_INT8_KEEP_BF16=1) */
     /* FP8 sidecar (present when fp8_ready): */
     s2p_tensor w_fp8;         /* [out, in] e4m3 */
     s2p_tensor w_scales;      /* int32-packed UE8M0 sfb, sm_120/121 layout */
     int        fp8_ready;
+    /* INT8 sidecar (present when int8_ready): */
+    s2p_tensor w_int8;        /* [out, in] int8, round-to-nearest */
+    s2p_tensor w_iscale;      /* [out] f32 per-out-channel absmax/127 */
+    int        int8_ready;
 } s2p_linear;
 
 s2p_status s2p_linear_from_st(s2p_linear* lin, s2p_st* st, const char* name,
                               int in_features, int out_features,
                               cudaStream_t stream);
 s2p_status s2p_linear_prepare_fp8(s2p_linear* lin, cudaStream_t stream);
+/* Quantize w_bf16 -> INT8 sidecar, then FREE w_bf16 (that is the RAM win;
+ * env S2P_INT8_KEEP_BF16=1 keeps it for A/B). Synchronizes `stream`. */
+s2p_status s2p_linear_prepare_int8(s2p_linear* lin, cudaStream_t stream);
 s2p_status s2p_linear_forward(const s2p_linear* lin, const void* x_bf16,
                               void* y_bf16, int M, s2p_gemm_mode mode,
                               cudaStream_t stream);
@@ -52,6 +68,21 @@ void       s2p_linear_free(s2p_linear* lin);
  * y[M,N] = x[M,K] * w[N,K]^T via cuBLAS, FP32 accumulate. */
 s2p_status s2p_gemm_bf16(const void* x, const void* w, void* y, int M, int N,
                          int K, cudaStream_t stream);
+
+/* Raw INT8 primitives (src/sched/int8_gemv.cu), exposed for the tied lm-head
+ * which quantizes the embedding table outside any s2p_linear. */
+s2p_status s2p_int8_quant(void* w_i8, float* scales, const void* w_bf16,
+                          int N, int K, cudaStream_t stream);
+/* y[M,N] bf16 = x[M,K] bf16 * (w_i8[N,K] * scales[N])^T; M <= 8 and
+ * K % 512 == 0 (one warp per row, int8x16 vector tiles). Every model K
+ * (2560 / 4096 / 9728) satisfies this; other shapes take the dequant path. */
+s2p_status s2p_int8_gemv(void* y_bf16, const void* x_bf16, const void* w_i8,
+                         const float* scales, int M, int N, int K,
+                         cudaStream_t stream);
+/* w_bf16[N,K] = w_i8[N,K] * scales[N] (prefill fallback dequant). */
+s2p_status s2p_int8_dequant(void* w_bf16, const void* w_i8,
+                            const float* scales, int N, int K,
+                            cudaStream_t stream);
 
 #ifdef __cplusplus
 }

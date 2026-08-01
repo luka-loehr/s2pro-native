@@ -1,12 +1,13 @@
 /* s2pro-native — server entry point.
  *
  *   s2pro-server --model-dir DIR [--codec-dir DIR] [--port N] [--bind ADDR]
- *                [--token TOK] [--fp8] [--ctx N]
+ *                [--token TOK] [--int8] [--fp8] [--ctx N]
  *
  * Init order: gemm -> config -> model -> dac -> tokenizer -> scheduler ->
  * server. s2p_server_run blocks until SIGINT/SIGTERM, then everything is
- * torn down in reverse. FP8 GEMM is opt-in via --fp8 or S2P_FP8=1
- * (docs/SPARK.md: BF16 is the validated default).
+ * torn down in reverse. INT8 weight-only GEMM is opt-in via --int8 or
+ * S2P_INT8=1; FP8 via --fp8 or S2P_FP8=1 (docs/SPARK.md: BF16 is the
+ * validated default).
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -31,6 +32,8 @@ static void usage(const char* argv0) {
             "  --bind ADDR       bind address (default 127.0.0.1)\n"
             "  --token TOK       require 'Authorization: Bearer TOK'\n"
             "  --voices-dir DIR  named-voice registry (default: ./voices)\n"
+            "  --int8            per-channel weight-only INT8 GEMM (halves\n"
+            "                    weight RAM + decode bandwidth)\n"
             "  --fp8             use the fish-scales-ops FP8 GEMM path\n"
             "  --ctx N           context length (default %d)\n",
             argv0, S2P_CTX_LEN_DEFAULT);
@@ -44,6 +47,7 @@ int main(int argc, char** argv) {
     const char* voices_dir = "voices";
     int port = 0;
     int fp8 = 0;
+    int int8 = 0;
     int ctx = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -63,6 +67,8 @@ int main(int argc, char** argv) {
             voices_dir = argv[++i];
         } else if (strcmp(a, "--fp8") == 0) {
             fp8 = 1;
+        } else if (strcmp(a, "--int8") == 0) {
+            int8 = 1;
         } else if (strcmp(a, "--ctx") == 0 && has_next) {
             ctx = atoi(argv[++i]);
         } else if (strcmp(a, "--help") == 0 || strcmp(a, "-h") == 0) {
@@ -96,13 +102,17 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[s2pro] gemm init failed: %d\n", (int)rc);
         return 1;
     }
-    s2p_gemm_mode mode = fp8 ? S2P_GEMM_FP8 : s2p_gemm_mode_from_env();
+    s2p_gemm_mode mode = int8 ? S2P_GEMM_INT8
+                        : fp8 ? S2P_GEMM_FP8
+                              : s2p_gemm_mode_from_env();
     if (mode == S2P_GEMM_FP8 && !s2p_fso_available()) {
         fprintf(stderr, "[s2pro] FP8 requested but unavailable; using BF16\n");
         mode = S2P_GEMM_BF16;
     }
     fprintf(stderr, "[s2pro] gemm mode: %s\n",
-            mode == S2P_GEMM_FP8 ? "FP8 (fish-scales-ops)" : "BF16 (cuBLAS)");
+            mode == S2P_GEMM_INT8  ? "INT8 (weight-only GEMV)"
+            : mode == S2P_GEMM_FP8 ? "FP8 (fish-scales-ops)"
+                                   : "BF16 (cuBLAS)");
 
     /* 2. config */
     rc = s2p_config_load(model_dir, &cfg);

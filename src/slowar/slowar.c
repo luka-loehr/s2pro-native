@@ -382,9 +382,18 @@ s2p_status s2p_model_batch_next_frame(s2p_model* m, s2p_session** sess, int n,
                                      (size_t)S2P_DIM * sizeof(uint16_t),
                                      cudaMemcpyDeviceToDevice, st));
 
-    /* tied lm-head: logits[b] = hidden[b] @ embed^T (always BF16 cuBLAS) */
-    S2P_TRY(s2p_gemm_bf16(m->shidden.data, m->embed.data, m->slogits.data,
-                          nact, S2P_TEXT_VOCAB, S2P_DIM, st));
+    /* tied lm-head: logits[b] = hidden[b] @ embed^T. INT8 mode reads the
+     * per-row-quantized sidecar (halves the 0.8 GB head stream); batches
+     * beyond the GEMV width use the kept bf16 table. */
+    if (m->mode == S2P_GEMM_INT8 && m->embed_i8.data != NULL &&
+        nact <= S2P_INT8_GEMV_MAX_M)
+        S2P_TRY(s2p_int8_gemv(m->slogits.data, m->shidden.data,
+                              m->embed_i8.data,
+                              (const float*)m->embed_scale.data, nact,
+                              S2P_TEXT_VOCAB, S2P_DIM, st));
+    else
+        S2P_TRY(s2p_gemm_bf16(m->shidden.data, m->embed.data, m->slogits.data,
+                              nact, S2P_TEXT_VOCAB, S2P_DIM, st));
     if (s2psl_dump_dir() != NULL && nact == 1) {
         /* parity: full logits row of the first two sampling steps (fixture
          * names prefill_logits / step1_logits); single-session runs only */

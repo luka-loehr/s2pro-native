@@ -125,7 +125,10 @@ int main(int argc, char** argv) {
     CHECK(s2p_gemm_init(S2P_CTX_LEN_DEFAULT), "gemm init");
     s2p_gemm_mode mode = s2p_gemm_mode_from_env();
     fprintf(stderr, "[parity] gemm mode: %s, prompt %d ids, %d steps\n",
-            mode == S2P_GEMM_FP8 ? "FP8" : "BF16", n_ids, steps);
+            mode == S2P_GEMM_INT8  ? "INT8"
+            : mode == S2P_GEMM_FP8 ? "FP8"
+                                   : "BF16",
+            n_ids, steps);
 
     s2p_model_opts mopts;
     memset(&mopts, 0, sizeof(mopts));
