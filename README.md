@@ -153,8 +153,8 @@ curl -X POST localhost:8010/v1/tts -d '{"text":"Hello.","format":"wav"}' -o hell
 | `POST /v1/tts` | Chunked streaming synthesis (WAV or raw PCM). |
 
 `POST /v1/tts` accepts `{"text": "…", "format": "wav"|"pcm", "temperature",
-"top_p", "seed", "voice", "reference_audio_b64", "reference_text"}` and,
-when the server is started with `--token`, requires
+"top_p", "seed", "stream", "voice", "reference_audio_b64",
+"reference_text"}` and, when the server is started with `--token`, requires
 `Authorization: Bearer <token>`. `voice` selects a pre-encoded registry
 voice; `reference_audio_b64` + `reference_text` clone a per-request wav
 (max 15 s) on the fly; neither selects zero-shot. Mixed-language text is
@@ -162,6 +162,13 @@ ONE generation — voices are multilingual by construction
 ([docs/VOICES.md](docs/VOICES.md)). `wav` streams a header followed by
 S16LE frames as they are generated; a client can start playback while
 generation is still running.
+
+A streamed WAV necessarily advertises saturated RIFF sizes — the header is
+on the wire before the first frame is sampled, and chunked transfer cannot
+rewrite bytes already sent. Tolerant players handle that; strict ones
+(Apple's, notably) refuse it. `"stream": false` buffers the take
+server-side and responds with exact `Content-Length` and exact RIFF sizes —
+a well-formed file at the cost of time-to-first-audio.
 
 The server binds loopback by default and does not terminate TLS. Public
 deployments must place it behind an authenticated, rate-limited proxy.
