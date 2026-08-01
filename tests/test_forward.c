@@ -258,6 +258,54 @@ int main(int argc, char** argv) {
     int64_t n_samples = 0;
     CHECK(s2p_dac_decode(dac, codes, T, &pcm, &n_samples, 0), "dac decode");
     double dac_ms = now_ms() - t0;
+
+    /* Diagnostic: S2P_TEST_STREAM_WAV=path additionally decodes the SAME
+     * frames through the streaming vocoder (window + crossfade) so the two
+     * DAC paths can be diffed on identical codes. */
+    const char* stream_out = getenv("S2P_TEST_STREAM_WAV");
+    if (stream_out != NULL) {
+        s2p_dac_stream* ds = NULL;
+        CHECK(s2p_dac_stream_create(dac, &ds), "dac stream create");
+        float*  sp = NULL;
+        int64_t sn = 0, cap = 0;
+        for (int t = 0; t < T; t++) {
+            int32_t frame[S2P_NUM_CODEBOOKS];
+            for (int cb = 0; cb < S2P_NUM_CODEBOOKS; cb++)
+                frame[cb] = codes[cb * T + t];
+            float*  ch = NULL;
+            int64_t cn = 0;
+            CHECK(s2p_dac_stream_push(ds, frame, &ch, &cn, 0), "stream push");
+            if (cn > 0) {
+                if (sn + cn > cap) {
+                    cap = (sn + cn) * 2;
+                    sp = (float*)realloc(sp, (size_t)cap * sizeof(float));
+                }
+                memcpy(sp + sn, ch, (size_t)cn * sizeof(float));
+                sn += cn;
+            }
+            free(ch);
+        }
+        float*  ch = NULL;
+        int64_t cn = 0;
+        CHECK(s2p_dac_stream_finish(ds, &ch, &cn, 0), "stream finish");
+        if (cn > 0) {
+            sp = (float*)realloc(sp, (size_t)(sn + cn) * sizeof(float));
+            memcpy(sp + sn, ch, (size_t)cn * sizeof(float));
+            sn += cn;
+        }
+        free(ch);
+        s2p_dac_stream_destroy(ds);
+        int16_t* s16 = (int16_t*)malloc((size_t)sn * sizeof(int16_t));
+        if (s16 != NULL) {
+            s2p_f32_to_s16(sp, s16, sn);
+            CHECK(s2p_wav_write_file(stream_out, s16, sn, S2P_SAMPLE_RATE),
+                  "stream wav write");
+            fprintf(stderr, "[test] stream decode: %lld samples -> %s\n",
+                    (long long)sn, stream_out);
+        }
+        free(s16);
+        free(sp);
+    }
     free(codes);
 
     int16_t* pcm16 = (int16_t*)malloc((size_t)n_samples * sizeof(int16_t));
