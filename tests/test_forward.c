@@ -21,7 +21,7 @@
 #include "s2pro/tokenizer.h"
 #include "s2pro/wav.h"
 
-#define MAX_FRAMES 60
+#define MAX_FRAMES 512 /* default cap 60; override via S2P_TEST_FRAMES */
 #define OUT_WAV "/tmp/s2p_smoke.wav"
 
 static double now_ms(void) {
@@ -91,9 +91,25 @@ int main(int argc, char** argv) {
           "prompt build");
     fprintf(stderr, "[test] prompt: %d tokens, %d vq parts\n", n_ids, n_parts);
 
-    /* Greedy session: temperature 0 -> greedy (model.h contract). */
+    /* Deterministic greedy by default; the reference sampler is opt-in for
+     * listening runs: S2P_TEST_TEMP (e.g. 0.8), S2P_TEST_SEED,
+     * S2P_TEST_FRAMES (cap, <= 512). */
     s2p_sampling_cfg sampling = s2p_sampling_defaults();
     sampling.temperature = 0.0f;
+    const char* env;
+    if ((env = getenv("S2P_TEST_TEMP")) != NULL)
+        sampling.temperature = (float)atof(env);
+    if ((env = getenv("S2P_TEST_SEED")) != NULL)
+        sampling.seed = (uint64_t)strtoull(env, NULL, 10);
+    int frame_cap = 60;
+    if ((env = getenv("S2P_TEST_FRAMES")) != NULL) {
+        frame_cap = atoi(env);
+        if (frame_cap < 1) frame_cap = 1;
+        if (frame_cap > MAX_FRAMES) frame_cap = MAX_FRAMES;
+    }
+    fprintf(stderr, "[test] sampling: temp %.2f top_p %.2f seed %llu cap %d\n",
+            sampling.temperature, sampling.top_p,
+            (unsigned long long)sampling.seed, frame_cap);
     s2p_session* sess = NULL;
     CHECK(s2p_session_create(model, &sampling, &sess), "session create");
 
@@ -109,7 +125,7 @@ int main(int argc, char** argv) {
     int32_t frames[MAX_FRAMES][S2P_NUM_CODEBOOKS];
     int T = 0, hit_eos = 0;
     t0 = now_ms();
-    for (int f = 0; f < MAX_FRAMES; f++) {
+    for (int f = 0; f < frame_cap; f++) {
         int is_eos = 0;
         CHECK(s2p_session_next_frame(sess, frames[T], &is_eos), "next frame");
         if (is_eos) { /* the EOS frame carries no codes */
