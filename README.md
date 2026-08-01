@@ -51,13 +51,16 @@ gap to below-realtime synthesis.
   with VQ-part injection.
 - One shared engine with lockstep-batched sessions, first-frame priority,
   cancellation, and graceful shutdown.
+- A multilingual named-voice registry (drop `<name>.wav` + `<name>.txt`
+  into `voices/`) plus per-request cloning over HTTP
+  ([docs/VOICES.md](docs/VOICES.md)).
 - Frozen module contracts (`include/s2pro/`) that let independent
   contributors build against stable interfaces ([CONTRACT.md](CONTRACT.md)).
 
 The project intentionally targets **S2-Pro only**. It does not include
 S2.1-Pro (API-only, no public weights), S1, or any model framework in the
-runtime. Voice-cloning encode is scaffolded but disabled until the codec
-converter retains encoder tensors.
+runtime. Voice cloning (encode + prompt injection) is active with the full
+codec artifact and drives the named-voice registry.
 
 ## Supported languages and audio
 
