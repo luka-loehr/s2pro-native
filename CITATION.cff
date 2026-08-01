@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: >-
+  If you use this software, please cite it using the metadata below.
+title: s2pro-native
+type: software
+authors:
+  - family-names: Löhr
+    given-names: Luka
+license: Apache-2.0
+repository-code: https://github.com/luka-loehr/s2pro-native
+abstract: >-
+  A native C and CUDA streaming runtime for Fish Audio S2-Pro text-to-speech
+  on NVIDIA DGX Spark, with a Dual-AR transformer implementation, RVQ
+  vocoder, FP8 block-scale GEMM integration, and a dependency-free HTTP
+  streaming service.
+keywords:
+  - text-to-speech
+  - Fish Audio S2-Pro
+  - C
+  - CUDA
+  - streaming inference
+  - FP8
+  - NVIDIA DGX Spark
