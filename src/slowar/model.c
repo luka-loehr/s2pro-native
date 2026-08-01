@@ -41,6 +41,7 @@ static s2p_status load_linear(s2p_st* st, const char* fmt, int layer, int in_f,
     snprintf(name, sizeof(name), fmt, layer);
     S2P_TRY(s2p_linear_from_st(lin, st, name, in_f, out_f, stream));
     if (mode == S2P_GEMM_FP8) S2P_TRY(s2p_linear_prepare_fp8(lin, stream));
+    if (mode == S2P_GEMM_INT8) S2P_TRY(s2p_linear_prepare_int8(lin, stream));
     return S2P_OK;
 }
 
@@ -71,6 +72,7 @@ static s2p_status load_gate_up(s2p_st* st, int layer, s2p_gemm_mode mode,
     S2P_CUDA_TRY(cudaMemcpyAsync((char*)lin->w_bf16.data + half, w3.data, half,
                                  cudaMemcpyHostToDevice, stream));
     if (mode == S2P_GEMM_FP8) S2P_TRY(s2p_linear_prepare_fp8(lin, stream));
+    if (mode == S2P_GEMM_INT8) S2P_TRY(s2p_linear_prepare_int8(lin, stream));
     return S2P_OK;
 }
 
@@ -169,6 +171,20 @@ s2p_status s2p_model_load(const char* model_dir, const s2p_model_opts* opts,
                                 S2P_DT_BF16, 2, eshape, &m->embed, m->stream);
         if (rc != S2P_OK) goto fail;
     }
+    if (m->mode == S2P_GEMM_INT8) {
+        /* tied-head sidecar; the bf16 table stays for embedding lookups */
+        int64_t qshape[2] = {S2P_TEXT_VOCAB, S2P_DIM};
+        int64_t sshape[1] = {S2P_TEXT_VOCAB};
+        rc = s2p_tensor_device_alloc(&m->embed_i8, S2P_DT_I8, 2, qshape);
+        if (rc == S2P_OK)
+            rc = s2p_tensor_device_alloc(&m->embed_scale, S2P_DT_F32, 1,
+                                         sshape);
+        if (rc == S2P_OK)
+            rc = s2p_int8_quant(m->embed_i8.data,
+                                (float*)m->embed_scale.data, m->embed.data,
+                                S2P_TEXT_VOCAB, S2P_DIM, m->stream);
+        if (rc != S2P_OK) goto fail;
+    }
     for (int l = 0; l < S2P_SLOW_LAYERS; l++) {
         s2p_slow_layer* ly = &m->layers[l];
         rc = load_linear(st, "text_model.model.layers.%d.attention.wqkv.weight",
@@ -234,6 +250,8 @@ void s2p_model_free(s2p_model* m) {
     if (m->stream != NULL) cudaStreamSynchronize(m->stream);
     if (m->fastar != NULL) s2pfa_free(m->fastar);
     s2p_tensor_free(&m->embed);
+    s2p_tensor_free(&m->embed_i8);
+    s2p_tensor_free(&m->embed_scale);
     for (int l = 0; l < S2P_SLOW_LAYERS; l++) {
         s2p_slow_layer* ly = &m->layers[l];
         s2p_linear_free(&ly->wqkv);

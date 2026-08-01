@@ -41,6 +41,25 @@ numeric agreement and first-frame argmax agreement are.
 
 Evidence: [`results/parity-bf16-oracle-fox-2026-08-01.json`](results/parity-bf16-oracle-fox-2026-08-01.json)
 
+### INT8 per-channel weight-only (`S2P_INT8=1`): PASS
+
+| Stage | Result |
+| --- | --- |
+| Backbone hiddens (36 layers + final norm) | cos ≥ 0.999862, median 0.999954 |
+| Prefill logits (155776 row) | cos 0.999666, argmax identical |
+| Step-1 logits (int8 GEMV + int8 tied head) | cos 0.999088, argmax identical |
+| Fast-AR first-frame residual steps | 8 of 9 argmax identical, cos ≥ 0.998242 |
+| Native DAC on the oracle's frames vs reference PCM | cos 1.000000, SNR 65.85 dB |
+
+Same class as BF16 at every stage — the added per-channel quantization
+noise costs ~1 nine of cosine but flips no argmax. The single fast-AR
+mismatch is the SAME codebook-8 near-tie documented for BF16 above; the
+trajectory-divergence caveat applies identically. Prefill exercises the
+dequant+cuBLAS fallback (M = 26), the decode steps exercise the int8 GEMV
+(M = 1), so both serving paths are covered by this run.
+
+Evidence: [`results/parity-int8-oracle-fox-2026-08-01.json`](results/parity-int8-oracle-fox-2026-08-01.json)
+
 ### FP8 (fish-scales-ops block-scale, `S2P_FP8=1`): FAIL
 
 | Stage | Result |
@@ -54,8 +73,8 @@ kernel-level qualification) compounds across ~144 sequential GEMMs into a
 corrupted residual stream. This is inherent to the 1×128/128×128 UE8M0
 quantization at this network depth, not an integration bug. The FP8 path
 stays opt-in and is REJECTED as the production decode path; the INT8
-per-channel weight-only alternative is the roadmap candidate and must pass
-this same gate.
+per-channel weight-only alternative has since passed this same gate (see
+above) and is the 8-bit serving path.
 
 Evidence: [`results/parity-fp8-oracle-fox-2026-08-01.json`](results/parity-fp8-oracle-fox-2026-08-01.json)
 
