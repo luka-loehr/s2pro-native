@@ -1,5 +1,12 @@
 # s2pro-native — built inside nvidia/cuda:13.0.3-devel-ubuntu24.04 (aarch64).
 # See docs/SPARK.md. Finalized by the serve builder + integration.
+#
+# Targets:
+#   all / nvcc-build   server + smoke-test binary (link needs the prebuilt
+#                      fish-scales-ops objects, mounted at /fso on the box)
+#   syntax             compile-only pass over every TU (no link, no GPU)
+#   selftest           build + run the host-side selftests (json, tokenizer)
+#   clean
 
 ARCH        ?= 121a
 BUILD       ?= build
@@ -28,9 +35,19 @@ C_OBJS      := $(patsubst src/%.c,$(BUILD)/%.o,$(C_SRCS))
 CU_OBJS     := $(patsubst src/%.cu,$(BUILD)/%.cu.o,$(CU_SRCS))
 CPP_OBJS    := $(BUILD)/fso/fso_wrap.o
 
+# Everything except the server entry point, for test/selftest links.
+LIB_OBJS    := $(filter-out $(BUILD)/main.o,$(C_OBJS)) $(CU_OBJS) $(CPP_OBJS)
+
 all: $(BUILD)/s2pro-server $(BUILD)/s2p-test
 
+# docs/SPARK.md invokes `make -j nvcc-build`.
+nvcc-build: all
+
 $(BUILD)/%.o: src/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/tests/%.o: tests/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
@@ -38,21 +55,52 @@ $(BUILD)/%.cu.o: src/%.cu
 	@mkdir -p $(dir $@)
 	$(NVCC) $(NVCCFLAGS) -c $< -o $@
 
-$(BUILD)/fso/fso_wrap.o: src/fso/fso_wrap.cpp
+$(BUILD)/fso/fso_wrap.o: src/fso/fso_wrap.cpp src/fso/fso.h
 	@mkdir -p $(dir $@)
-	$(NVCC) $(NVCCFLAGS) $(FSO_INC) -c $< -o $@
+	$(NVCC) $(NVCCFLAGS) $(FSO_INC) -Isrc/fso -c $< -o $@
 
 $(BUILD)/s2pro-server: $(C_OBJS) $(CU_OBJS) $(CPP_OBJS)
 	$(NVCC) $(GENCODE) $^ $(FSO_OBJS) -o $@ $(LIBS)
 
-# test binary: everything except main.c plus tests/test_forward.c
-$(BUILD)/s2p-test: $(filter-out $(BUILD)/main.o,$(C_OBJS)) $(CU_OBJS) $(CPP_OBJS) tests/test_forward.c
-	@mkdir -p $(BUILD)
-	$(CC) $(CFLAGS) -c tests/test_forward.c -o $(BUILD)/test_forward.o
-	$(NVCC) $(GENCODE) $(filter-out $(BUILD)/main.o,$(C_OBJS)) $(CU_OBJS) $(CPP_OBJS) \
-	    $(BUILD)/test_forward.o $(FSO_OBJS) -o $@ $(LIBS)
+$(BUILD)/s2p-test: $(LIB_OBJS) $(BUILD)/tests/test_forward.o
+	$(NVCC) $(GENCODE) $^ $(FSO_OBJS) -o $@ $(LIBS)
+
+# ---- host-side selftests (json parser, tokenizer + prompt builder) --------
+
+$(BUILD)/selftest_json: $(LIB_OBJS) $(BUILD)/tests/selftest_json.o
+	$(NVCC) $(GENCODE) $^ $(FSO_OBJS) -o $@ $(LIBS)
+
+$(BUILD)/selftest_tok: $(LIB_OBJS) $(BUILD)/tests/selftest_tok.o
+	$(NVCC) $(GENCODE) $^ $(FSO_OBJS) -o $@ $(LIBS)
+
+# selftest_tok needs a tokenizer.json; the repo model/ dir carries one.
+SELFTEST_MODEL_DIR ?= model
+
+selftest: $(BUILD)/selftest_json $(BUILD)/selftest_tok
+	$(BUILD)/selftest_json
+	$(BUILD)/selftest_tok $(SELFTEST_MODEL_DIR)
+
+# ---- compile-only syntax pass (no link; .cu/.cpp still need nvcc+device) --
+
+SYNTAX_C  := $(C_SRCS) $(wildcard tests/*.c)
+SYNTAX_CU := $(patsubst src/%.cu,$(BUILD)/syntax/%.cu.o,$(CU_SRCS))
+
+syntax: $(SYNTAX_CU) $(BUILD)/syntax/fso_wrap.o
+	@for f in $(SYNTAX_C); do \
+	    echo "$(CC) -fsyntax-only $$f"; \
+	    $(CC) $(CFLAGS) -fsyntax-only $$f || exit 1; \
+	done
+	@echo "syntax: OK"
+
+$(BUILD)/syntax/%.cu.o: src/%.cu
+	@mkdir -p $(dir $@)
+	$(NVCC) $(NVCCFLAGS) -c $< -o $@
+
+$(BUILD)/syntax/fso_wrap.o: src/fso/fso_wrap.cpp src/fso/fso.h
+	@mkdir -p $(dir $@)
+	$(NVCC) $(NVCCFLAGS) $(FSO_INC) -Isrc/fso -c $< -o $@
 
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all clean
+.PHONY: all nvcc-build syntax selftest clean
