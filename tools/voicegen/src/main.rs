@@ -38,6 +38,9 @@ VOICES
 
 OUTPUT
   --out-dir <PATH>       Default './voices'.
+  --passage-out <PATH>   Also write the resolved passage here. Lets you author
+                         once, read it over, then reuse it verbatim via
+                         --text-file so every voice shares one transcript.
   --overwrite            Replace existing <voice>.wav / <voice>.txt pairs.
   --style <STRING>       Delivery instruction sent with each take (not spoken).
   --concurrency <N>      Parallel TTS requests, default 4.
@@ -68,6 +71,7 @@ struct Args {
     topic: Option<String>,
     voices: Option<Vec<String>>,
     out_dir: PathBuf,
+    passage_out: Option<PathBuf>,
     style: String,
     concurrency: usize,
     overwrite: bool,
@@ -85,6 +89,7 @@ impl Default for Args {
             topic: None,
             voices: None,
             out_dir: PathBuf::from("voices"),
+            passage_out: None,
             style: DEFAULT_STYLE.to_owned(),
             concurrency: 4,
             overwrite: false,
@@ -119,7 +124,12 @@ fn parse_args() -> Result<Option<Args>> {
             "--list-voices" => {
                 println!("{} Gemini TTS prebuilt voices:\n", roster::VOICES.len());
                 for (id, characteristic) in roster::VOICES {
-                    println!("  {:<16} {:<15} -> {}.wav", id, characteristic, roster::basename(id));
+                    println!(
+                        "  {:<16} {:<15} -> {}.wav",
+                        id,
+                        characteristic,
+                        roster::basename(id)
+                    );
                 }
                 return Ok(None);
             }
@@ -129,6 +139,7 @@ fn parse_args() -> Result<Option<Args>> {
             "--topic" => args.topic = Some(value(&flag)?),
             "--voice" | "--voices" => args.voices = Some(split_list(&value(&flag)?)),
             "--out-dir" => args.out_dir = PathBuf::from(value(&flag)?),
+            "--passage-out" => args.passage_out = Some(PathBuf::from(value(&flag)?)),
             "--style" => args.style = value(&flag)?,
             "--seconds" => {
                 let raw = value(&flag)?;
@@ -267,7 +278,9 @@ async fn main() {
 }
 
 async fn run() -> Result<()> {
-    let Some(args) = parse_args()? else { return Ok(()) };
+    let Some(args) = parse_args()? else {
+        return Ok(());
+    };
     let voices = resolve_voices(&args.voices)?;
 
     // The passage is authored/read once and shared by every voice: one identity
@@ -281,7 +294,11 @@ async fn run() -> Result<()> {
 
     let passage = if let Some(languages) = &args.languages {
         let names: Vec<String> = languages.iter().map(|l| language_name(l)).collect();
-        eprintln!("Authoring a ~{} s passage in: {}", args.seconds, names.join(", "));
+        eprintln!(
+            "Authoring a ~{} s passage in: {}",
+            args.seconds,
+            names.join(", ")
+        );
         let vertex = vertex.as_ref().expect("--languages implies an API client");
         vertex
             .write_passage(&names, args.seconds, args.topic.as_deref())
@@ -315,6 +332,12 @@ async fn run() -> Result<()> {
         passage.split_whitespace().count()
     );
 
+    if let Some(path) = &args.passage_out {
+        std::fs::write(path, format!("{passage}\n"))
+            .with_context(|| format!("writing {}", path.display()))?;
+        eprintln!("Passage written to {}\n", path.display());
+    }
+
     std::fs::create_dir_all(&args.out_dir)
         .with_context(|| format!("creating {}", args.out_dir.display()))?;
 
@@ -322,9 +345,14 @@ async fn run() -> Result<()> {
     // after a partial failure only fills the gaps.
     let mut pending = Vec::new();
     for voice in voices {
-        let wav_path = args.out_dir.join(format!("{}.wav", roster::basename(voice)));
+        let wav_path = args
+            .out_dir
+            .join(format!("{}.wav", roster::basename(voice)));
         if wav_path.exists() && !args.overwrite {
-            eprintln!("skip  {voice}: {} exists (--overwrite to replace)", wav_path.display());
+            eprintln!(
+                "skip  {voice}: {} exists (--overwrite to replace)",
+                wav_path.display()
+            );
             continue;
         }
         pending.push(voice);
@@ -335,10 +363,17 @@ async fn run() -> Result<()> {
     }
 
     if args.dry_run {
-        eprintln!("Would write {} pair(s) to {}:", pending.len(), args.out_dir.display());
+        eprintln!(
+            "Would write {} pair(s) to {}:",
+            pending.len(),
+            args.out_dir.display()
+        );
         for voice in &pending {
             let base = roster::basename(voice);
-            eprintln!("  {base}.wav + {base}.txt  ({voice}, {})", roster::characteristic(voice));
+            eprintln!(
+                "  {base}.wav + {base}.txt  ({voice}, {})",
+                roster::characteristic(voice)
+            );
         }
         return Ok(());
     }
@@ -364,8 +399,7 @@ async fn run() -> Result<()> {
             let out_dir = args.out_dir.clone();
             let verify = args.verify;
             set.spawn(async move {
-                let result =
-                    generate_one(&vertex, voice, &style, &passage, &out_dir, verify).await;
+                let result = generate_one(&vertex, voice, &style, &passage, &out_dir, verify).await;
                 (voice, result)
             });
         }
@@ -399,9 +433,13 @@ async fn run() -> Result<()> {
     }
 
     eprintln!("\n{} generated, {} failed.", outcomes.len(), failures.len());
-    if let Some(shortest) = outcomes.iter().map(|o| o.seconds).fold(None, |acc: Option<f32>, s| {
-        Some(acc.map_or(s, |a| a.min(s)))
-    }) {
+    if let Some(shortest) = outcomes
+        .iter()
+        .map(|o| o.seconds)
+        .fold(None, |acc: Option<f32>, s| {
+            Some(acc.map_or(s, |a| a.min(s)))
+        })
+    {
         let longest = outcomes.iter().map(|o| o.seconds).fold(0.0f32, f32::max);
         eprintln!("Duration {shortest:.1}-{longest:.1} s (docs/VOICES.md wants 30-90 s).");
         if shortest < 30.0 {
@@ -414,8 +452,13 @@ async fn run() -> Result<()> {
         .count();
     if flagged > 0 {
         eprintln!(
-            "Warning: {flagged} take(s) diverge from the transcript. The .txt is part of \
-             the prompt, not metadata — regenerate those voices before shipping them."
+            "Warning: {flagged} take(s) scored under {:.0}% against the transcript. \
+             Listen before regenerating: on multi-script passages the transcriber, not \
+             the take, is usually at fault — it romanizes Cyrillic or blends adjacent \
+             related languages. A real defect shows up as MISSING words (the transcript \
+             comes back materially shorter); a transcription artifact keeps the word \
+             count and only changes spelling.",
+            VERIFY_WARN_BELOW * 100.0
         );
     }
     if !failures.is_empty() {
@@ -448,8 +491,7 @@ async fn generate_one(
     std::fs::write(&txt_path, format!("{passage}\n"))
         .with_context(|| format!("writing {}", txt_path.display()))?;
     let wav_path = out_dir.join(format!("{base}.wav"));
-    std::fs::write(&wav_path, &bytes)
-        .with_context(|| format!("writing {}", wav_path.display()))?;
+    std::fs::write(&wav_path, &bytes).with_context(|| format!("writing {}", wav_path.display()))?;
 
     let match_ratio = if verify {
         let transcript = vertex.transcribe(&bytes).await?;

@@ -8,6 +8,15 @@ for published releases.
 
 ## [Unreleased]
 
+### Removed
+
+- The committed sample voices (`neutral-female`, `young-male`,
+  `deeper-male`). Reference audio is generated per deployment with
+  `tools/voicegen` and is now gitignored (`voices/*.wav`, `voices/*.txt`):
+  ~5.4 MB per voice is not worth carrying in git for output one command
+  reproduces, and each deployment wants its own language mix anyway. `voices/`
+  ships with only its README; an empty registry serves zero-shot.
+
 ### Fixed
 
 - Streaming vocoder fidelity: the reference's 20-frame window overlap is far
@@ -26,14 +35,15 @@ for published releases.
 
 - `tools/voicegen` (Rust, offline): reference-voice generator on Gemini TTS
   via Vertex AI — passage authoring across arbitrary language lists, all 30
-  prebuilt voices, exact 147/80 polyphase resampling to 44.1 kHz, and
+  prebuilt voices, exact 147/80 polyphase resampling to 44.1 kHz (with a
+  headroom guard — band-limited interpolation overshoots a 0 dBFS source, so
+  takes are scaled rather than clipped), and
   LCS-scored transcript verification (`--verify`). Writes registry-ready
   `voices/<name>.wav` + `.txt` pairs; credentials come from gcloud at
   runtime, nothing is stored.
 - Voice registry (`include/s2pro/voices.h`, `src/voice/`): named references
-  as `<name>.wav` + `<name>.txt` pairs, DAC-encoded once at startup; three
-  multilingual sample voices ship in `voices/` (one Google Gemini TTS take
-  each cycling DE/EN/FR/ES/RU/UK/TR — docs/VOICES.md documents why
+  as `<name>.wav` + `<name>.txt` pairs, DAC-encoded once at startup. An empty
+  or missing directory serves zero-shot only (docs/VOICES.md documents why
   references must come from an accent-free multilingual source).
 - HTTP API: `GET /v1/voices`, `"voice"` selection on `POST /v1/tts`, and
   per-request cloning via `"reference_audio_b64"` + `"reference_text"`

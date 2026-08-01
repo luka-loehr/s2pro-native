@@ -52,7 +52,7 @@ voices/
   my-voice.txt   the EXACT transcript of the wav (UTF-8, one line)
 ```
 
-The name is the file basename. The shipped voices were produced with
+The name is the file basename. The supported way to produce a pair is
 [`tools/voicegen`](../tools/voicegen/README.md), which authors a
 multilingual passage, synthesizes any of the 30 Gemini prebuilt voices,
 resamples to 44.1 kHz, and verifies each take against its transcript —
@@ -73,13 +73,25 @@ Rules of thumb:
 - Every voice is DAC-encoded once at server start and cached; voice
   selection costs nothing per request.
 
-The three shipped sample voices (`neutral-female`, `young-male`,
-`deeper-male`) were generated exactly this way: one Google Gemini TTS
-(`gemini-3.1-flash-tts-preview`) take each, cycling German, English,
-French, Spanish, Russian, Ukrainian, and Turkish, with the shared
-transcript in the matching `.txt`. Note the 24 kHz source rate: the
-references carry no energy above 12 kHz, which the model faithfully
-imitates — export at 44.1 kHz where the provider offers it.
+**`voices/` ships empty; you generate the references you need.** Audio is not
+committed — ~5.4 MB per voice, reproducible from one command — so the
+repository carries the generator instead of the output, and `voices/*.wav` /
+`voices/*.txt` are gitignored. An empty directory is not an error: the server
+logs it and serves zero-shot only.
+
+[`tools/voicegen`](../tools/voicegen/README.md) is the reference
+implementation of everything above. It authors a passage cycling the languages
+you name, synthesizes any or all 30 `gemini-3.1-flash-tts-preview` prebuilt
+voices from that one shared passage, resamples to 44.1 kHz, and verifies each
+take against its transcript. Generate several voices from a single passage and
+they differ only in speaker identity. Name them after the producing voice
+(`sulafat`, `charon`, ...) and `GET /v1/voices` lists whatever you generated.
+
+Note Gemini's 24 kHz source rate: those references carry no energy above
+12 kHz, which the model faithfully imitates. `voicegen` resamples to the
+codec's native 44.1 kHz (required — the loader rejects other rates), but
+resampling cannot invent the missing top octave; export at 44.1 kHz natively
+where a provider offers it.
 
 ## Using voices over the API
 
@@ -90,7 +102,7 @@ curl -s localhost:8010/v1/voices
 # speak with a named voice (mixed-language text in ONE call)
 curl -s -X POST localhost:8010/v1/tts \
   -d '{"text":"Das französische Wort bibliothèque bedeutet Bücherei.",
-       "voice":"neutral-female","format":"wav"}' -o out.wav
+       "voice":"sulafat","format":"wav"}' -o out.wav
 
 # on-the-fly clone: attach a wav (<= 15 s, 44.1k mono s16) per request
 curl -s -X POST localhost:8010/v1/tts \
