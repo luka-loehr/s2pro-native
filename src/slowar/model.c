@@ -302,6 +302,8 @@ void s2p_model_free(s2p_model* m) {
     if (m->h_sem != NULL) cudaFreeHost(m->h_sem);
     if (m->h_frame != NULL) cudaFreeHost(m->h_frame);
     if (m->h_semid != NULL) cudaFreeHost(m->h_semid);
+    for (int b = 1; b <= 4; b++)
+        if (m->gready[b]) cudaGraphExecDestroy(m->gexec[b]);
     if (m->d_out != NULL) cudaFree(m->d_out);
     if (m->h_out != NULL) cudaFreeHost(m->h_out);
     if (m->d_sampptr != NULL) cudaFree(m->d_sampptr);

@@ -51,6 +51,10 @@ void s2pfa_free(s2pfa* f);
  * the CALLER's responsibility (PORTING §4). */
 s2p_status s2pfa_vq_embed_add(s2pfa* f, const int32_t* codes, int T,
                               __nv_bfloat16* rows, cudaStream_t stream);
+/* Same, but codes already on DEVICE: pure kernel launch, no staging or lazy
+ * allocation — safe inside CUDA-graph capture. */
+s2p_status s2pfa_vq_embed_add_dev(s2pfa* f, const int32_t* codes_dev, int T,
+                                  __nv_bfloat16* rows, cudaStream_t stream);
 
 /* One frame for B sessions: hidden [B,2560] device bf16 = the slow-AR
  * FINAL-NORMED hidden state (post backbone norm — PORTING pitfall 5);
