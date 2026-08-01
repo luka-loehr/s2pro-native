@@ -371,6 +371,16 @@ s2p_status s2pfa_vq_embed_add(s2pfa* f, const int32_t* codes, int T,
     return S2P_OK;
 }
 
+s2p_status s2pfa_vq_embed_add_dev(s2pfa* f, const int32_t* codes_dev, int T,
+                                  __nv_bfloat16* rows, cudaStream_t stream) {
+    if (!f || !codes_dev || !rows || T < 0) return S2P_ERR_INVALID;
+    if (T == 0) return S2P_OK;
+    k_vq_embed_add<<<T, 256, 0, stream>>>(
+        (const __nv_bfloat16*)f->cb_emb.data, codes_dev, T, rows);
+    S2P_CUDA_TRY(cudaGetLastError());
+    return S2P_OK;
+}
+
 /* ------------------------------------------------------------ decode loop */
 
 static inline __nv_bfloat16* fa_kcache(s2pfa* f, int l, int b) {
