@@ -113,7 +113,10 @@ mod tests {
         let mut transcript = reference.clone();
         transcript[73] = "mangled".to_owned();
         let score = similarity(&reference.join(" "), &transcript.join(" "));
-        assert!(score > 0.99, "one typo in 140 words dropped the score to {score}");
+        assert!(
+            score > 0.99,
+            "one typo in 140 words dropped the score to {score}"
+        );
     }
 
     #[test]
