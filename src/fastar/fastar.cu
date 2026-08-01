@@ -433,11 +433,13 @@ static s2p_status fa_run_layers(s2pfa* f, int B, int cb_idx,
     return S2P_OK;
 }
 
-s2p_status s2pfa_decode_frame_batch(s2pfa* f, const __nv_bfloat16* hidden,
-                                    const int32_t* sem_ids, int B,
-                                    int32_t* out_codes, cudaStream_t stream) {
-    if (!f || !hidden || !sem_ids || !out_codes) return S2P_ERR_INVALID;
+s2p_status s2pfa_decode_frame_batch_dev(s2pfa* f, const __nv_bfloat16* hidden,
+                                        const int32_t* sem_dev, int B,
+                                        const int32_t** stage_dev,
+                                        cudaStream_t stream) {
+    if (!f || !hidden || !sem_dev || !stage_dev) return S2P_ERR_INVALID;
     if (B < 1 || B > f->max_b) return S2P_ERR_INVALID;
+    *stage_dev = f->stage;
 
     /* reset_caches(): the reference zeroes the KV cache EVERY frame. */
     S2P_CUDA_TRY(cudaMemsetAsync(f->kv_slab, 0, f->kv_slab_bytes, stream));
@@ -452,13 +454,9 @@ s2p_status s2pfa_decode_frame_batch(s2pfa* f, const __nv_bfloat16* hidden,
 
     /* Seed step 1 with embeddings(sem_id) — the 4096-row table, NOT
      * codebook_embeddings (PORTING pitfall 7). */
-    memcpy(f->sem_host, sem_ids, (size_t)B * sizeof(int32_t));
-    S2P_CUDA_TRY(cudaMemcpyAsync(f->sem_dev, f->sem_host,
-                                 (size_t)B * sizeof(int32_t),
-                                 cudaMemcpyHostToDevice, stream));
     {
         int blocks = (B + 63) / 64;
-        k_widen_ids<<<blocks, 64, 0, stream>>>(f->sem_dev, f->ids64, B);
+        k_widen_ids<<<blocks, 64, 0, stream>>>(sem_dev, f->ids64, B);
         S2P_CUDA_TRY(cudaGetLastError());
     }
     S2P_CUDA_TRY(s2pk_embed((const __nv_bfloat16*)f->emb.data, f->ids64, f->x,
@@ -493,7 +491,24 @@ s2p_status s2pfa_decode_frame_batch(s2pfa* f, const __nv_bfloat16* hidden,
         }
     }
 
-    S2P_CUDA_TRY(cudaMemcpyAsync(f->stage_host, f->stage,
+    return S2P_OK;
+}
+
+s2p_status s2pfa_decode_frame_batch(s2pfa* f, const __nv_bfloat16* hidden,
+                                    const int32_t* sem_ids, int B,
+                                    int32_t* out_codes, cudaStream_t stream) {
+    if (!f || !hidden || !sem_ids || !out_codes) return S2P_ERR_INVALID;
+    if (B < 1 || B > f->max_b) return S2P_ERR_INVALID;
+
+    memcpy(f->sem_host, sem_ids, (size_t)B * sizeof(int32_t));
+    S2P_CUDA_TRY(cudaMemcpyAsync(f->sem_dev, f->sem_host,
+                                 (size_t)B * sizeof(int32_t),
+                                 cudaMemcpyHostToDevice, stream));
+    const int32_t* stage = NULL;
+    S2P_TRY(s2pfa_decode_frame_batch_dev(f, hidden, f->sem_dev, B, &stage,
+                                         stream));
+
+    S2P_CUDA_TRY(cudaMemcpyAsync(f->stage_host, stage,
                                  (size_t)(FA_NCB - 1) * B * sizeof(int32_t),
                                  cudaMemcpyDeviceToHost, stream));
     S2P_CUDA_TRY(cudaStreamSynchronize(stream));

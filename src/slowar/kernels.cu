@@ -507,6 +507,259 @@ extern "C" cudaError_t s2pk_attention_decode(
     return cudaGetLastError();
 }
 
+/* ------------------------------------------------- device semantic sampler */
+/* Exact port of s2ps_sample (sampling.c): candidate gather, RAS detect,
+ * repetition penalty, top-30, top-p over the un-temperatured softmax, second
+ * softmax with temperature, seeded hash-Gumbel or xoshiro inverse-CDF draw,
+ * in-place history/state update. Constants mirror slowar_internal.h. */
+#define SMP_N_SEM 4096
+#define SMP_N_CAND 4097
+#define SMP_CAND_EOS 4096
+#define SMP_TOP_K 30
+#define SMP_RAS_TEMP 1.0f
+#define SMP_RAS_TOP_P 0.9f
+#define SMP_SEM_START 151678
+#define SMP_SEM_END 155773
+#define SMP_EOS 151645
+
+static __device__ uint64_t smp_rotl64(uint64_t x, int k) {
+    return (x << k) | (x >> (64 - k));
+}
+
+static __device__ uint64_t smp_xoshiro_next(uint64_t s[4]) {
+    const uint64_t result = smp_rotl64(s[1] * 5, 7) * 9;
+    const uint64_t t = s[1] << 17;
+    s[2] ^= s[0];
+    s[3] ^= s[1];
+    s[1] ^= s[2];
+    s[0] ^= s[3];
+    s[2] ^= t;
+    s[3] = smp_rotl64(s[3], 45);
+    return result;
+}
+
+static __global__ void k_sample(const __nv_bfloat16* __restrict__ logits,
+                                int64_t vocab_stride,
+                                s2ps_dev_state* const* __restrict__ states,
+                                int64_t* __restrict__ out_tok,
+                                int32_t* __restrict__ out_sem,
+                                int32_t* __restrict__ out_codes,
+                                uint8_t* __restrict__ out_eos) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    s2ps_dev_state* sp = states[row];
+    const __nv_bfloat16* lrow = logits + (size_t)row * vocab_stride;
+
+    __shared__ float cand[SMP_N_CAND];
+    __shared__ float rv[128];
+    __shared__ int ri[128];
+    __shared__ float tv[SMP_TOP_K];
+    __shared__ int ti[SMP_TOP_K];
+
+    for (int i = tid; i < SMP_N_SEM; i += blockDim.x)
+        cand[i] = s2pk_b2f(lrow[SMP_SEM_START + i]);
+    if (tid == 0) cand[SMP_CAND_EOS] = s2pk_b2f(lrow[SMP_EOS]);
+    __syncthreads();
+
+    const int greedy = sp->temperature == 0.0f;
+    const int capped = sp->count < (uint64_t)sp->window ? (int)sp->count
+                                                        : sp->window;
+    __shared__ float sh_temp, sh_topp;
+    if (tid == 0) {
+        /* RAS detect: duplicate among the clamped last 4 of the window */
+        int use_ras = 0;
+        if (!greedy && capped >= 4) {
+            int64_t last4[4];
+            for (int r = 0; r < 4; r++) {
+                int idx = capped - (4 - r);
+                if (idx < 0) idx = 0;
+                last4[r] = sp->prev[idx];
+            }
+            for (int a = 0; a < 3; a++)
+                for (int b = a + 1; b < 4; b++)
+                    if (last4[b] < last4[a]) {
+                        int64_t t = last4[a];
+                        last4[a] = last4[b];
+                        last4[b] = t;
+                    }
+            for (int a = 0; a < 3; a++)
+                if (last4[a] == last4[a + 1]) use_ras = 1;
+        }
+        sh_temp = use_ras ? SMP_RAS_TEMP : sp->temperature;
+        sh_topp = use_ras ? SMP_RAS_TOP_P : sp->top_p;
+
+        /* repetition penalty: gather originals, then scatter */
+        if (capped > 0) {
+            int ridx[64];
+            float rval[64];
+            int rn = 0;
+            for (int j = 0; j < capped; j++) {
+                const int64_t tok = sp->prev[j];
+                int ci;
+                if (tok >= SMP_SEM_START && tok <= SMP_SEM_END)
+                    ci = (int)(tok - SMP_SEM_START);
+                else if (tok == SMP_EOS)
+                    ci = SMP_CAND_EOS;
+                else
+                    continue;
+                const float v = cand[ci];
+                ridx[rn] = ci;
+                rval[rn] = v < 0.f ? v * sp->rep_penalty
+                                   : v / sp->rep_penalty;
+                rn++;
+            }
+            for (int j = 0; j < rn; j++) cand[ridx[j]] = rval[j];
+        }
+    }
+    __syncthreads();
+
+    /* top-30 by iterative argmax (ties -> lowest index, matching torch.topk
+     * descending-value / ascending-index order) */
+    for (int k = 0; k < SMP_TOP_K; k++) {
+        float bv = -INFINITY;
+        int bi = SMP_N_CAND;
+        for (int i = tid; i < SMP_N_CAND; i += blockDim.x) {
+            const float v = cand[i];
+            if (v > bv || (v == bv && i < bi)) {
+                bv = v;
+                bi = i;
+            }
+        }
+        rv[tid] = bv;
+        ri[tid] = bi;
+        __syncthreads();
+        for (int off = 64; off > 0; off >>= 1) {
+            if (tid < off) {
+                if (rv[tid + off] > rv[tid] ||
+                    (rv[tid + off] == rv[tid] && ri[tid + off] < ri[tid])) {
+                    rv[tid] = rv[tid + off];
+                    ri[tid] = ri[tid + off];
+                }
+            }
+            __syncthreads();
+        }
+        if (tid == 0) {
+            tv[k] = rv[0];
+            ti[k] = ri[0];
+            cand[ri[0]] = -INFINITY;
+        }
+        __syncthreads();
+    }
+
+    if (tid != 0) return;
+
+    /* ---- serial tail on thread 0 (30 elements) ---- */
+    int choice = 0;
+    if (!greedy) {
+        float e[SMP_TOP_K], sum = 0.f;
+        const float m = tv[0];
+        for (int j = 0; j < SMP_TOP_K; j++) {
+            e[j] = expf(tv[j] - m);
+            sum += e[j];
+        }
+        int masked[SMP_TOP_K] = {0};
+        float cum = 0.f;
+        for (int j = 0; j < SMP_TOP_K; j++) {
+            cum += e[j] / sum;
+            if (j > 0 && cum > sh_topp) masked[j] = 1;
+        }
+        const float t = sh_temp < 1e-5f ? 1e-5f : sh_temp;
+        float p2[SMP_TOP_K], s2 = 0.f;
+        const float m2 = tv[0] / t;
+        for (int j = 0; j < SMP_TOP_K; j++) {
+            p2[j] = masked[j] ? 0.f : expf(tv[j] / t - m2);
+            s2 += p2[j];
+        }
+        for (int j = 0; j < SMP_TOP_K; j++) p2[j] /= s2;
+
+        if (sp->seeded) {
+            const uint64_t step_seed = ((uint64_t)sp->seed31 * 19349663ULL) ^
+                                       (sp->count * 73856093ULL);
+            float best = -INFINITY;
+            for (int j = 0; j < SMP_TOP_K; j++) {
+                const uint64_t hashed = (step_seed * 8589934591ULL) ^
+                                        ((uint64_t)j * 479001599ULL);
+                float u =
+                    (float)(uint32_t)(hashed & 0xFFFFFFULL) / 16777216.0f;
+                if (u < 1e-10f) u = 1e-10f;
+                const float g = -logf(-logf(u));
+                const float pert = logf(p2[j] + 1e-10f) + g;
+                if (pert > best) {
+                    best = pert;
+                    choice = j;
+                }
+            }
+        } else {
+            const double r =
+                (double)(smp_xoshiro_next(sp->rng) >> 11) * 0x1.0p-53;
+            double cum2 = 0.0;
+            int lastnz = 0;
+            choice = -1;
+            for (int j = 0; j < SMP_TOP_K; j++) {
+                if (p2[j] <= 0.f) continue;
+                lastnz = j;
+                cum2 += (double)p2[j];
+                if (r < cum2) {
+                    choice = j;
+                    break;
+                }
+            }
+            if (choice < 0) choice = lastnz;
+        }
+    }
+
+    const int ci = ti[choice];
+    const int64_t tok = ci == SMP_CAND_EOS ? (int64_t)SMP_EOS
+                                           : (int64_t)(SMP_SEM_START + ci);
+    if (tok == SMP_EOS) {
+        out_tok[row] = tok;
+        out_sem[row] = 0;
+        out_codes[(size_t)row * 10] = 0;
+        out_eos[row] = 1;
+        return;
+    }
+    out_tok[row] = tok;
+    out_sem[row] = ci;
+    out_codes[(size_t)row * 10] = ci;
+    out_eos[row] = 0;
+    if (sp->count < (uint64_t)sp->window) {
+        sp->prev[sp->count] = tok;
+    } else {
+        for (int j = 0; j < sp->window - 1; j++) sp->prev[j] = sp->prev[j + 1];
+        sp->prev[sp->window - 1] = tok;
+    }
+    sp->count++;
+}
+
+extern "C" cudaError_t s2pk_sample(const __nv_bfloat16* logits,
+                                   int64_t vocab_stride,
+                                   s2ps_dev_state* const* states, int rows,
+                                   int64_t* out_tok, int32_t* out_sem,
+                                   int32_t* out_codes, uint8_t* out_eos,
+                                   cudaStream_t st) {
+    if (rows <= 0) return cudaSuccess;
+    k_sample<<<rows, 128, 0, st>>>(logits, vocab_stride, states, out_tok,
+                                   out_sem, out_codes, out_eos);
+    return cudaGetLastError();
+}
+
+static __global__ void k_pack_frame(const int32_t* __restrict__ stage,
+                                    int rows, int32_t* __restrict__ codes) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * 9) return;
+    int cb = i / rows;          /* 0..8 -> codebook cb+1 */
+    int b = i % rows;
+    codes[(size_t)b * 10 + cb + 1] = stage[(size_t)cb * rows + b];
+}
+
+extern "C" cudaError_t s2pk_pack_frame(const int32_t* stage, int rows,
+                                       int32_t* codes, cudaStream_t st) {
+    if (rows <= 0) return cudaSuccess;
+    int n = rows * 9;
+    k_pack_frame<<<(n + 127) / 128, 128, 0, st>>>(stage, rows, codes);
+    return cudaGetLastError();
+}
+
 /* ---------------------------------------------------------------- silu_mul */
 
 static __global__ void k_silu_mul(const __nv_bfloat16* gu, __nv_bfloat16* h,

@@ -128,6 +128,17 @@ static s2p_status alloc_scratch(s2p_model* m) {
     S2P_CUDA_TRY(cudaMallocHost((void**)&m->h_frame,
                                 B * S2P_NUM_CODEBOOKS * sizeof(int32_t)));
     S2P_CUDA_TRY(cudaMallocHost((void**)&m->h_semid, B * sizeof(int32_t)));
+    /* device-sampling output block:
+     * i64 tok[B] | i32 sem[B] | i32 codes[10B] | u8 eos[B] */
+    m->out_off_sem = B * sizeof(int64_t);
+    m->out_off_codes = m->out_off_sem + B * sizeof(int32_t);
+    m->out_off_eos =
+        m->out_off_codes + (size_t)B * S2P_NUM_CODEBOOKS * sizeof(int32_t);
+    m->out_bytes = (m->out_off_eos + B + 7) & ~(size_t)7;
+    S2P_CUDA_TRY(cudaMalloc(&m->d_out, m->out_bytes));
+    S2P_CUDA_TRY(cudaMallocHost(&m->h_out, m->out_bytes));
+    S2P_CUDA_TRY(cudaMalloc((void**)&m->d_sampptr, B * sizeof(void*)));
+    S2P_CUDA_TRY(cudaMallocHost((void**)&m->h_sampptr, B * sizeof(void*)));
     return S2P_OK;
 }
 
@@ -291,6 +302,10 @@ void s2p_model_free(s2p_model* m) {
     if (m->h_sem != NULL) cudaFreeHost(m->h_sem);
     if (m->h_frame != NULL) cudaFreeHost(m->h_frame);
     if (m->h_semid != NULL) cudaFreeHost(m->h_semid);
+    if (m->d_out != NULL) cudaFree(m->d_out);
+    if (m->h_out != NULL) cudaFreeHost(m->h_out);
+    if (m->d_sampptr != NULL) cudaFree(m->d_sampptr);
+    if (m->h_sampptr != NULL) cudaFreeHost(m->h_sampptr);
     if (m->stream != NULL) cudaStreamDestroy(m->stream);
     /* s2p_gemm_shutdown is process-scoped and may be shared with the serve
      * layer; the owner of process teardown calls it. */

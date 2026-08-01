@@ -127,6 +127,14 @@ struct s2p_model {
     s2p_tensor slogits; /* [max_sessions, 155776] bf16 */
     s2p_tensor sattn_part; /* [max_sessions, 32, ctx/64, 130] f32 split-K
                             * flash-decode partials (s2pk_attention_decode) */
+    /* device sampling: per-frame output block (fixed layout by max_sessions:
+     * i64 tok[B] | i32 codes[B*10] | u8 eos[B]) + state-pointer table */
+    void*   d_out;
+    void*   h_out;         /* pinned mirror, ONE D2H per frame */
+    size_t  out_bytes;
+    size_t  out_off_sem, out_off_codes, out_off_eos;
+    void**  d_sampptr;     /* [B] device: per-row s2ps_dev_state* */
+    void**  h_sampptr;     /* pinned mirror */
     s2p_tensor sids;    /* [ctx] i64 prefill ids */
     s2p_tensor svq;     /* [10*ctx] i32 prefill VQ codes staging */
 
@@ -156,6 +164,7 @@ struct s2p_session {
     s2p_tensor pending_hidden; /* [2560] final-normed prefill hidden */
     int64_t prev_token;    /* raw sampled vocab id fed back next frame */
     int32_t prev_codes[S2P_NUM_CODEBOOKS]; /* [sem_id, resid1..9] */
+    void*   dsamp;         /* device s2ps_dev_state (kernels.cu sampler) */
     s2ps_sampler sampler;
 };
 
