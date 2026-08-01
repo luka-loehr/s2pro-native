@@ -32,6 +32,12 @@ typedef struct {
     const char*        ref_text;  /* optional: transcript of reference audio */
     const s2p_vq_part* refs;      /* optional: encoded reference clips */
     int                n_refs;
+    /* On-the-fly cloning (additive, 2026-08-01): raw 44.1 kHz mono float
+     * PCM to be DAC-encoded by the SCHEDULER on its worker thread (keeps
+     * all GPU work single-threaded). Used only when refs is empty; the
+     * prompt builder itself ignores these fields. */
+    const float*       ref_pcm;
+    int64_t            ref_pcm_n;
 } s2p_request_text;
 
 /* Build the full prompt: token ids, a mask marking VQ-injected positions

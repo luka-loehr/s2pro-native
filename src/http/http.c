@@ -1,11 +1,17 @@
 /* s2pro-native — dependency-free HTTP/1.1 server. Implements
  * include/s2pro/server.h.
  *
- * POSIX sockets + poll(). Two routes:
- *   GET  /healthz  -> 200 JSON scheduler stats (no auth)
- *   POST /v1/tts   -> chunked Transfer-Encoding audio stream
+ * POSIX sockets + poll(). Routes:
+ *   GET  /healthz    -> 200 JSON scheduler stats (no auth)
+ *   GET  /v1/voices  -> 200 JSON list of the named-voice registry
+ *   POST /v1/tts     -> chunked Transfer-Encoding audio stream
  *                     body: {"text": "...", "format": "wav"|"pcm",
- *                            "temperature"?, "top_p"?, "seed"?}
+ *                            "temperature"?, "top_p"?, "seed"?,
+ *                            "voice"?: "<registry name>",
+ *                            "reference_audio_b64"?: "<wav, 44.1k mono s16,
+ *                             max 15 s>", "reference_text"?: "<transcript>"}
+ *                     reference_audio_b64 (on-the-fly clone) wins over
+ *                     voice; neither -> zero-shot (unpinned voice).
  *                     Authorization: Bearer <token> when configured.
  *
  * Streaming model: the poll loop (main thread) parses requests and submits
@@ -43,7 +49,8 @@
 #include "s2pro/server.h"
 
 #define HTTP_MAX_HEAD   (16 * 1024)
-#define HTTP_MAX_BODY   (1024 * 1024)
+#define HTTP_MAX_BODY   (4 * 1024 * 1024) /* fits a 15 s wav as base64 JSON */
+#define HTTP_CLONE_MAX_SAMPLES (15 * 44100) /* inline-clone cap: 15 s */
 #define HTTP_IDLE_SECS  30
 #define HTTP_SEND_SECS  30    /* SO_SNDTIMEO: stalled client => cb error */
 
@@ -70,12 +77,59 @@ typedef struct {
 } conn;
 
 typedef struct {
-    s2p_sched*  sched;
-    const char* auth_token;
-    int         listen_fd;
-    conn*       conns;
-    int         max_conns;
+    s2p_sched*        sched;
+    const char*       auth_token;
+    const s2p_voices* voices; /* may be NULL / empty */
+    int               listen_fd;
+    conn*             conns;
+    int               max_conns;
 } http_srv;
+
+/* Strict base64 decoder (padding required, whitespace tolerated). Returns
+ * malloc'd buffer or NULL. */
+static uint8_t* b64_decode(const char* s, size_t len, size_t* out_len) {
+    static const int8_t T[256] = {
+        ['A'] = 1,  ['B'] = 2,  ['C'] = 3,  ['D'] = 4,  ['E'] = 5,
+        ['F'] = 6,  ['G'] = 7,  ['H'] = 8,  ['I'] = 9,  ['J'] = 10,
+        ['K'] = 11, ['L'] = 12, ['M'] = 13, ['N'] = 14, ['O'] = 15,
+        ['P'] = 16, ['Q'] = 17, ['R'] = 18, ['S'] = 19, ['T'] = 20,
+        ['U'] = 21, ['V'] = 22, ['W'] = 23, ['X'] = 24, ['Y'] = 25,
+        ['Z'] = 26, ['a'] = 27, ['b'] = 28, ['c'] = 29, ['d'] = 30,
+        ['e'] = 31, ['f'] = 32, ['g'] = 33, ['h'] = 34, ['i'] = 35,
+        ['j'] = 36, ['k'] = 37, ['l'] = 38, ['m'] = 39, ['n'] = 40,
+        ['o'] = 41, ['p'] = 42, ['q'] = 43, ['r'] = 44, ['s'] = 45,
+        ['t'] = 46, ['u'] = 47, ['v'] = 48, ['w'] = 49, ['x'] = 50,
+        ['y'] = 51, ['z'] = 52, ['0'] = 53, ['1'] = 54, ['2'] = 55,
+        ['3'] = 56, ['4'] = 57, ['5'] = 58, ['6'] = 59, ['7'] = 60,
+        ['8'] = 61, ['9'] = 62, ['+'] = 63, ['/'] = 64,
+    };
+    uint8_t* out = (uint8_t*)malloc(len / 4 * 3 + 3);
+    if (!out) return NULL;
+    size_t o = 0;
+    uint32_t acc = 0;
+    int nbits = 0, pad = 0;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char ch = (unsigned char)s[i];
+        if (ch == '\n' || ch == '\r' || ch == ' ' || ch == '\t') continue;
+        if (ch == '=') {
+            pad++;
+            continue;
+        }
+        int v = T[ch] - 1;
+        if (v < 0 || pad > 0) {
+            free(out);
+            return NULL;
+        }
+        acc = (acc << 6) | (uint32_t)v;
+        nbits += 6;
+        if (nbits >= 8) {
+            nbits -= 8;
+            out[o++] = (uint8_t)(acc >> nbits);
+        }
+    }
+    *out_len = o;
+    return out;
+}
 
 static volatile sig_atomic_t g_http_stop = 0;
 
@@ -249,6 +303,23 @@ static void route_healthz(http_srv* s, conn* c) {
     conn_reset(c);
 }
 
+static void route_voices(http_srv* s, conn* c) {
+    char body[4096];
+    size_t o = 0;
+    o += (size_t)snprintf(body + o, sizeof(body) - o, "{\"voices\":[");
+    int n = s2p_voices_count(s->voices);
+    for (int i = 0; i < n && o < sizeof(body) - 128; i++) {
+        const s2p_voice* v = s2p_voices_at(s->voices, i);
+        o += (size_t)snprintf(body + o, sizeof(body) - o,
+                              "%s{\"name\":\"%s\",\"duration_s\":%.1f,"
+                              "\"reference_frames\":%d}",
+                              i ? "," : "", v->name, v->duration_s, v->part.T);
+    }
+    snprintf(body + o, sizeof(body) - o, "]}");
+    send_simple(c->fd, 200, "OK", "application/json", body);
+    conn_reset(c);
+}
+
 static void route_tts(http_srv* s, conn* c) {
     if (!auth_ok(s, c)) {
         send_simple(c->fd, 401, "Unauthorized", "application/json",
@@ -314,11 +385,78 @@ static void route_tts(http_srv* s, conn* c) {
         sampling.top_p = (float)s2p_jnum(v);
     if ((v = s2p_jobj_get(root, "seed")) != NULL && !s2p_jis_null(v))
         sampling.seed = (uint64_t)s2p_jint(v);
+
+    /* voice selection / on-the-fly cloning (all errors here are pre-header,
+     * so clients still get proper JSON error responses) */
+    const s2p_voice* named = NULL;
+    float*           clone_pcm = NULL;
+    int64_t          clone_n = 0;
+    char*            clone_text_c = NULL;
+#define TTS_FAIL(msg)                                                          \
+    do {                                                                       \
+        free(text_c);                                                          \
+        free(clone_pcm);                                                       \
+        free(clone_text_c);                                                    \
+        s2p_json_free(j);                                                      \
+        send_simple(c->fd, 400, "Bad Request", "application/json", (msg));    \
+        conn_reset(c);                                                         \
+        return;                                                                \
+    } while (0)
+
+    if ((v = s2p_jobj_get(root, "reference_audio_b64")) != NULL &&
+        !s2p_jis_null(v)) {
+        if (!s2p_jis_str(v)) TTS_FAIL("{\"error\":\"reference_audio_b64 must "
+                                      "be a base64 string\"}");
+        size_t b64l = 0;
+        const char* b64 = s2p_jstr(v, &b64l);
+        size_t   wl = 0;
+        uint8_t* wbuf = b64_decode(b64, b64l, &wl);
+        if (!wbuf) TTS_FAIL("{\"error\":\"invalid base64\"}");
+        s2p_status prc = s2p_wav_parse_f32(wbuf, wl, &clone_pcm, &clone_n);
+        free(wbuf);
+        if (prc != S2P_OK)
+            TTS_FAIL("{\"error\":\"reference audio must be a RIFF wav, "
+                     "16-bit PCM mono 44100 Hz\"}");
+        if (clone_n > HTTP_CLONE_MAX_SAMPLES)
+            TTS_FAIL("{\"error\":\"reference audio longer than 15 s\"}");
+        const s2p_jval* jt = s2p_jobj_get(root, "reference_text");
+        if (!jt || !s2p_jis_str(jt))
+            TTS_FAIL("{\"error\":\"reference_text (exact transcript) is "
+                     "required with reference_audio_b64\"}");
+        size_t rl = 0;
+        const char* rt = s2p_jstr(jt, &rl);
+        clone_text_c = (char*)malloc(rl + 1);
+        if (!clone_text_c) TTS_FAIL("{\"error\":\"oom\"}");
+        memcpy(clone_text_c, rt, rl);
+        clone_text_c[rl] = '\0';
+    } else if ((v = s2p_jobj_get(root, "voice")) != NULL && !s2p_jis_null(v)) {
+        if (!s2p_jis_str(v))
+            TTS_FAIL("{\"error\":\"voice must be a string\"}");
+        size_t nl = 0;
+        const char* nm = s2p_jstr(v, &nl);
+        char name[128];
+        if (nl >= sizeof(name)) TTS_FAIL("{\"error\":\"unknown voice\"}");
+        memcpy(name, nm, nl);
+        name[nl] = '\0';
+        named = s2p_voices_find(s->voices, name);
+        if (!named)
+            TTS_FAIL("{\"error\":\"unknown voice (see GET /v1/voices)\"}");
+    }
+#undef TTS_FAIL
     s2p_json_free(j);
 
     s2p_request_text req;
     memset(&req, 0, sizeof(req));
     req.text = text_c;
+    if (clone_pcm != NULL) {
+        req.ref_pcm = clone_pcm;
+        req.ref_pcm_n = clone_n;
+        req.ref_text = clone_text_c;
+    } else if (named != NULL) {
+        req.refs = &named->part;
+        req.n_refs = 1;
+        req.ref_text = named->transcript;
+    }
 
     c->wav = wav;
     c->sent_wav_hdr = 0;
@@ -343,7 +481,9 @@ static void route_tts(http_srv* s, conn* c) {
     uint64_t req_id = 0;
     s2p_status rc = s2p_sched_submit(s->sched, &req, &sampling, tts_audio_cb,
                                      c, &req_id);
-    free(text_c); /* scheduler deep-copies */
+    free(text_c); /* scheduler deep-copies everything */
+    free(clone_pcm);
+    free(clone_text_c);
     if (rc != S2P_OK) {
         /* Headers already went out; end the stream with zero audio. */
         fprintf(stderr, "[s2pro] http: submit failed (%d)\n", (int)rc);
@@ -368,9 +508,12 @@ static void dispatch(http_srv* s, conn* c) {
 
     if (strcmp(method, "GET") == 0 && strcmp(path, "/healthz") == 0) {
         route_healthz(s, c);
+    } else if (strcmp(method, "GET") == 0 && strcmp(path, "/v1/voices") == 0) {
+        route_voices(s, c);
     } else if (strcmp(method, "POST") == 0 && strcmp(path, "/v1/tts") == 0) {
         route_tts(s, c);
-    } else if (strcmp(path, "/healthz") == 0 || strcmp(path, "/v1/tts") == 0) {
+    } else if (strcmp(path, "/healthz") == 0 || strcmp(path, "/v1/tts") == 0 ||
+               strcmp(path, "/v1/voices") == 0) {
         send_simple(c->fd, 405, "Method Not Allowed", "text/plain",
                     "method not allowed\n");
         conn_reset(c);
@@ -432,6 +575,7 @@ s2p_status s2p_server_run(s2p_sched* sched, const s2p_server_opts* opts) {
     http_srv srv;
     memset(&srv, 0, sizeof(srv));
     srv.sched = sched;
+    srv.voices = opts ? opts->voices : NULL;
     srv.auth_token = opts ? opts->auth_token : NULL;
     srv.max_conns = max_conns;
     srv.conns = (conn*)calloc((size_t)max_conns, sizeof(conn));

@@ -29,11 +29,12 @@ The 8-bit weight path's bandwidth floor on this hardware is ~35 ms/frame
 (RTF ~0.75); the [roadmap](#roadmap-to-rtf--1) tracks closing the remaining
 gap to below-realtime synthesis.
 
-> **Status: functional pre-release.** The full pipeline runs end to end on
-> the real 9.1 GB checkpoint and produces deterministic, speech-shaped
-> audio. Layer parity against the PyTorch reference is not yet validated,
-> and single-stream synthesis is not yet below realtime. There is no
-> published release line yet; deploy from a reviewed, pinned `main` commit.
+> **Status: functional pre-release.** BF16 passes the layer-parity gate
+> against the PyTorch reference; voice cloning, the multilingual voice
+> registry, and the HTTP streaming server are exercised end to end on real
+> hardware (TTFA ~1.1 s zero-shot / ~2.5 s with a 50 s reference block).
+> Single-stream synthesis is not yet below realtime. There is no published
+> release line yet; deploy from a reviewed, pinned `main` commit.
 
 ## What this project provides
 
@@ -100,6 +101,7 @@ lockstep scheduler (sessions, first-frame priority, backpressure)
 | `src/text` | Byte-level BPE tokenizer and ChatML prompt builder. |
 | `src/dac` | RVQ `from_indices`, causal/dilated conv stacks, snake activations, streaming crossfade. |
 | `src/sched`, `src/http` | Scheduler and dependency-free HTTP/1.1 server. |
+| `src/voice` | Named-voice registry: `<name>.wav` + `<name>.txt` pairs, DAC-encoded once at startup ([docs/VOICES.md](docs/VOICES.md)). |
 | `src/fso` | The single C++ TU: extern-C shim over the fish-scales-ops FP8 GEMM. |
 | `docs` | Porting spec (`PORTING.md`), Spark build guide (`SPARK.md`). |
 | `scripts` | Checkpoint fetch, fish-scales-ops object build. |
@@ -138,13 +140,19 @@ curl -X POST localhost:8010/v1/tts -d '{"text":"Hello.","format":"wav"}' -o hell
 | Method and path | Purpose |
 | --- | --- |
 | `GET /healthz` | Engine and scheduler statistics. |
+| `GET /v1/voices` | Named-voice registry listing. |
 | `POST /v1/tts` | Chunked streaming synthesis (WAV or raw PCM). |
 
 `POST /v1/tts` accepts `{"text": "…", "format": "wav"|"pcm", "temperature",
-"top_p", "seed"}` and, when the server is started with `--token`, requires
-`Authorization: Bearer <token>`. `wav` streams a header followed by S16LE
-frames as they are generated; a client can start playback while generation
-is still running.
+"top_p", "seed", "voice", "reference_audio_b64", "reference_text"}` and,
+when the server is started with `--token`, requires
+`Authorization: Bearer <token>`. `voice` selects a pre-encoded registry
+voice; `reference_audio_b64` + `reference_text` clone a per-request wav
+(max 15 s) on the fly; neither selects zero-shot. Mixed-language text is
+ONE generation — voices are multilingual by construction
+([docs/VOICES.md](docs/VOICES.md)). `wav` streams a header followed by
+S16LE frames as they are generated; a client can start playback while
+generation is still running.
 
 The server binds loopback by default and does not terminate TLS. Public
 deployments must place it behind an authenticated, rate-limited proxy.

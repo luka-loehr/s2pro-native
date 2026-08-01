@@ -20,6 +20,7 @@
 #include "s2pro/tokenizer.h"
 #include "s2pro/scheduler.h"
 #include "s2pro/server.h"
+#include "s2pro/voices.h"
 
 static void usage(const char* argv0) {
     fprintf(stderr,
@@ -29,6 +30,7 @@ static void usage(const char* argv0) {
             "  --port N          listen port (default 8010)\n"
             "  --bind ADDR       bind address (default 127.0.0.1)\n"
             "  --token TOK       require 'Authorization: Bearer TOK'\n"
+            "  --voices-dir DIR  named-voice registry (default: ./voices)\n"
             "  --fp8             use the fish-scales-ops FP8 GEMM path\n"
             "  --ctx N           context length (default %d)\n",
             argv0, S2P_CTX_LEN_DEFAULT);
@@ -39,6 +41,7 @@ int main(int argc, char** argv) {
     const char* codec_dir = NULL;
     const char* bind_addr = NULL;
     const char* token = NULL;
+    const char* voices_dir = "voices";
     int port = 0;
     int fp8 = 0;
     int ctx = 0;
@@ -56,6 +59,8 @@ int main(int argc, char** argv) {
             bind_addr = argv[++i];
         } else if (strcmp(a, "--token") == 0 && has_next) {
             token = argv[++i];
+        } else if (strcmp(a, "--voices-dir") == 0 && has_next) {
+            voices_dir = argv[++i];
         } else if (strcmp(a, "--fp8") == 0) {
             fp8 = 1;
         } else if (strcmp(a, "--ctx") == 0 && has_next) {
@@ -82,6 +87,7 @@ int main(int argc, char** argv) {
     s2p_dac* dac = NULL;
     s2p_tok* tok = NULL;
     s2p_sched* sched = NULL;
+    s2p_voices* voices = NULL;
     int exit_code = 1;
 
     /* 1. GEMM context (cuBLAS handle + FP8 scratch sized for prefill). */
@@ -127,6 +133,15 @@ int main(int argc, char** argv) {
         goto out;
     }
 
+    /* 4b. named-voice registry (each reference encoded ONCE, cached) */
+    rc = s2p_voices_load(voices_dir, dac, &voices);
+    if (rc != S2P_OK) {
+        fprintf(stderr, "[s2pro] voices load failed: %d\n", (int)rc);
+        goto out;
+    }
+    fprintf(stderr, "[s2pro] voices: %d registered\n",
+            s2p_voices_count(voices));
+
     /* 5. tokenizer */
     rc = s2p_tok_load(model_dir, &tok);
     if (rc != S2P_OK) {
@@ -154,11 +169,13 @@ int main(int argc, char** argv) {
     srvopts.port = port;
     srvopts.bind_addr = bind_addr;
     srvopts.auth_token = token;
+    srvopts.voices = voices;
     rc = s2p_server_run(sched, &srvopts);
     exit_code = (rc == S2P_OK) ? 0 : 1;
 
 out:
     if (sched) s2p_sched_destroy(sched); /* stops + joins the worker */
+    if (voices) s2p_voices_free(voices);
     if (tok) s2p_tok_free(tok);
     if (dac) s2p_dac_free(dac);
     if (model) s2p_model_free(model);

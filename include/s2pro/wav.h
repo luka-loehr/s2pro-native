@@ -28,6 +28,14 @@ size_t s2p_wav_header(uint8_t out[44], uint32_t data_bytes_or_max,
 /* Clamp [-1,1] (NaN -> 0), scale by 32767, round half away from zero. */
 void s2p_f32_to_s16(const float* in, int16_t* out, int64_t n);
 
+/* --- readers (additive extension for the voices/cloning subsystem) ---
+ * Strict input contract: RIFF/WAVE, 16-bit PCM, mono, 44100 Hz (the codec's
+ * native rate — resample offline, docs/VOICES.md has the one-liner).
+ * Output: malloc'd float PCM in [-1,1]; caller frees. */
+s2p_status s2p_wav_parse_f32(const void* buf, size_t len, float** pcm,
+                             int64_t* n_samples);
+s2p_status s2p_wav_read_f32(const char* path, float** pcm, int64_t* n_samples);
+
 #ifdef __cplusplus
 }
 #endif
