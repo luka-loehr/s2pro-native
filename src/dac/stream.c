@@ -40,9 +40,9 @@ static int stream_use_reference(void) {
     return v;
 }
 
-#define STREAM_BATCH_MAX 4
+#define STREAM_BATCH_MAX 8
 
-/* S2P_STREAM_BATCH (1..4, default 4): frames per incremental-engine push.
+/* S2P_STREAM_BATCH (1..8, default 8): frames per incremental-engine push.
  * Bigger pushes amortize kernel launches; the FIRST push always flushes at
  * one frame so TTFA is unaffected. */
 static int stream_batch(void) {

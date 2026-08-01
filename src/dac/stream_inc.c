@@ -42,9 +42,9 @@
  * bigger pushes amortize kernel-launch overhead and raise occupancy of the
  * small early-stage convs). Scratch sizing follows the largest ext buffer,
  * the block-2 RU dil-9 input [192, 54 + 1024*tn]; one size covers all five
- * rotating buffers at tn = 4. */
-#define INC_MAX_TN 4
-#define INC_BUF_FLOATS 802816
+ * rotating buffers at tn = 8 (~32 MB scratch per stream). */
+#define INC_MAX_TN 8
+#define INC_BUF_FLOATS 1593344
 
 /* decoder block dims (mirror dac.c) */
 static const int IDEC_CIN[4] = { 1536, 768, 384, 192 };
