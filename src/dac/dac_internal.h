@@ -144,6 +144,21 @@ s2p_status s2p_dac_decode_latent(s2p_dac* d, const float* latent, int Tlat,
                                  float** pcm_out, int64_t* n_samples,
                                  cudaStream_t stream);
 
+/* ---------------- incremental streaming decode (stream_inc.c) ------------ */
+/* Bit-exact per-frame decode: every stateful op keeps a device history of
+ * its own input (histories replace the causal zero left-pad exactly), the
+ * post_module keeps a 127-row K/V tail per layer (attention window 128).
+ * One pushed frame emits its 2048 samples immediately — no windows, no
+ * crossfade, no re-decode. Output equals s2p_dac_decode of the full code
+ * sequence bit for bit (validated by S2P_TEST_STREAM_WAV). */
+typedef struct s2pd_inc s2pd_inc;
+s2p_status s2pd_inc_create(s2p_dac* d, s2pd_inc** out);
+void       s2pd_inc_destroy(s2pd_inc* s);
+/* Decode ONE frame; writes 2048 samples to pcm_host. */
+s2p_status s2pd_inc_push(s2pd_inc* s,
+                         const int32_t frame_codes[S2P_NUM_CODEBOOKS],
+                         float* pcm_host, cudaStream_t stream);
+
 /* ---------------- CUDA kernel launchers ---------------------------------- */
 /* All launchers enqueue on `st` and return cudaPeekAtLastError().           */
 
@@ -175,9 +190,20 @@ cudaError_t s2pdk_matmul(const float* a, int m, int k,
                          float* out, cudaStream_t st);
 cudaError_t s2pdk_rope_ip(float* x, int t, int heads, int hd, int row_stride,
                           const float* tab, cudaStream_t st);
+cudaError_t s2pdk_rope_ip_off(float* x, int t0, int t, int heads, int hd,
+                              int row_stride, const float* tab,
+                              cudaStream_t st);
 cudaError_t s2pdk_sdpa(const float* q, const float* k, const float* v,
                        int qkv_stride, int t, int heads, int hd, int window,
                        float* out, int out_stride, cudaStream_t st);
+cudaError_t s2pdk_sdpa_inc(const float* q, int q_stride, const float* kv_k,
+                           const float* kv_v, int kv_stride, int hl, int tn,
+                           int heads, int hd, int window, float* out,
+                           int out_stride, cudaStream_t st);
+cudaError_t s2pdk_tconv1d_tail(const float* in, int cin, int tin,
+                               const float* w, const float* b, int cout,
+                               int k, int stride, float* out, int t_skip,
+                               int t_keep, cudaStream_t st);
 cudaError_t s2pdk_silu_mul_ip(float* a, const float* b, int64_t n,
                               cudaStream_t st);
 cudaError_t s2pdk_gelu_ip(float* x, int64_t n, cudaStream_t st);

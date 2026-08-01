@@ -346,9 +346,12 @@ extern "C" cudaError_t s2pdk_matmul(const float* a, int m, int k,
 /* ------------------------------ RoPE ------------------------------------- */
 
 /* Interleaved (gpt-fast) RoPE, adjacent pairs (2i,2i+1), NOT rotate-half.
- * tab [maxT, hd/2, 2] f32 holds bf16-rounded (cos,sin); butterfly in f32. */
-__global__ void k_rope_ip(float* __restrict__ x, int t, int heads, int hd,
-                          int row_stride, const float* __restrict__ tab) {
+ * tab [maxT, hd/2, 2] f32 holds bf16-rounded (cos,sin); butterfly in f32.
+ * t0 offsets the table row (absolute position of x row 0) so incremental
+ * chunks rotate exactly like their whole-buffer positions. */
+__global__ void k_rope_ip(float* __restrict__ x, int t0, int t, int heads,
+                          int hd, int row_stride,
+                          const float* __restrict__ tab) {
     int pairs = hd / 2;
     int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     int64_t n = (int64_t)t * heads * pairs;
@@ -357,8 +360,8 @@ __global__ void k_rope_ip(float* __restrict__ x, int t, int heads, int hd,
     int h = (int)((i / pairs) % heads);
     int tt = (int)(i / ((int64_t)pairs * heads));
     float* xp = x + (size_t)tt * row_stride + (size_t)h * hd + 2 * p;
-    float c = tab[((size_t)tt * pairs + p) * 2 + 0];
-    float s = tab[((size_t)tt * pairs + p) * 2 + 1];
+    float c = tab[((size_t)(t0 + tt) * pairs + p) * 2 + 0];
+    float s = tab[((size_t)(t0 + tt) * pairs + p) * 2 + 1];
     float x0 = xp[0], x1 = xp[1];
     xp[0] = x0 * c - x1 * s;
     xp[1] = x1 * c + x0 * s;
@@ -367,7 +370,15 @@ extern "C" cudaError_t s2pdk_rope_ip(float* x, int t, int heads, int hd,
                                      int row_stride, const float* tab,
                                      cudaStream_t st) {
     int64_t n = (int64_t)t * heads * (hd / 2);
-    k_rope_ip<<<(unsigned)((n + 255) / 256), 256, 0, st>>>(x, t, heads, hd,
+    k_rope_ip<<<(unsigned)((n + 255) / 256), 256, 0, st>>>(x, 0, t, heads, hd,
+                                                           row_stride, tab);
+    return cudaPeekAtLastError();
+}
+extern "C" cudaError_t s2pdk_rope_ip_off(float* x, int t0, int t, int heads,
+                                         int hd, int row_stride,
+                                         const float* tab, cudaStream_t st) {
+    int64_t n = (int64_t)t * heads * (hd / 2);
+    k_rope_ip<<<(unsigned)((n + 255) / 256), 256, 0, st>>>(x, t0, t, heads, hd,
                                                            row_stride, tab);
     return cudaPeekAtLastError();
 }
@@ -452,5 +463,126 @@ extern "C" cudaError_t s2pdk_sdpa(const float* q, const float* k,
     size_t shm = (size_t)(window + threads) * sizeof(float);
     k_sdpa<<<grid, threads, shm, st>>>(q, k, v, qkv_stride, t, hd, window, out,
                                        out_stride);
+    return cudaPeekAtLastError();
+}
+
+/* Incremental windowed SDPA: tn new queries (strided rows), keys/values in a
+ * contiguous [hl+tn, heads*hd] buffer whose first hl rows are the retained
+ * history. Query j sits at absolute-relative kv row hl+j and attends the
+ * causal window ending there — the SAME key set, dot order, and reduction
+ * pattern as k_sdpa over the full sequence, hence bit-identical. */
+__global__ void k_sdpa_inc(const float* __restrict__ q, int q_stride,
+                           const float* __restrict__ kv_k,
+                           const float* __restrict__ kv_v, int kv_stride,
+                           int hl, int hd, int window,
+                           float* __restrict__ out, int out_stride) {
+    int j = blockIdx.x;                  /* new-query index */
+    int h = blockIdx.y;
+    int tq = hl + j;                     /* kv row of this query */
+    int ks = tq - window + 1;
+    if (ks < 0) ks = 0;
+    int cnt = tq - ks + 1;
+
+    extern __shared__ float sh[];
+    float* scores = sh;
+    float* red = sh + window;
+
+    const float* qp = q + (size_t)j * q_stride + (size_t)h * hd;
+    const float scale = rsqrtf((float)hd);
+
+    for (int i = threadIdx.x; i < cnt; i += blockDim.x) {
+        const float* kp = kv_k + (size_t)(ks + i) * kv_stride + (size_t)h * hd;
+        float dot = 0.f;
+        for (int d = 0; d < hd; d++) dot += qp[d] * kp[d];
+        scores[i] = dot * scale;
+    }
+    __syncthreads();
+
+    float m = -INFINITY;
+    for (int i = threadIdx.x; i < cnt; i += blockDim.x)
+        m = fmaxf(m, scores[i]);
+    red[threadIdx.x] = m;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if (threadIdx.x < o)
+            red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + o]);
+        __syncthreads();
+    }
+    m = red[0];
+    __syncthreads();
+
+    float s = 0.f;
+    for (int i = threadIdx.x; i < cnt; i += blockDim.x) {
+        float e = expf(scores[i] - m);
+        scores[i] = e;
+        s += e;
+    }
+    red[threadIdx.x] = s;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if (threadIdx.x < o) red[threadIdx.x] += red[threadIdx.x + o];
+        __syncthreads();
+    }
+    float inv = 1.0f / red[0];
+    __syncthreads();
+
+    for (int d = threadIdx.x; d < hd; d += blockDim.x) {
+        float acc = 0.f;
+        const float* vp = kv_v + (size_t)ks * kv_stride + (size_t)h * hd + d;
+        for (int i = 0; i < cnt; i++)
+            acc += scores[i] * vp[(size_t)i * kv_stride];
+        out[(size_t)j * out_stride + (size_t)h * hd + d] = acc * inv;
+    }
+}
+extern "C" cudaError_t s2pdk_sdpa_inc(const float* q, int q_stride,
+                                      const float* kv_k, const float* kv_v,
+                                      int kv_stride, int hl, int tn, int heads,
+                                      int hd, int window, float* out,
+                                      int out_stride, cudaStream_t st) {
+    if (window <= 0 || window > S2PDK_MAX_ATTN_WINDOW)
+        return cudaErrorInvalidValue;
+    dim3 grid(tn, heads);
+    int threads = 128;
+    size_t shm = (size_t)(window + threads) * sizeof(float);
+    k_sdpa_inc<<<grid, threads, shm, st>>>(q, q_stride, kv_k, kv_v, kv_stride,
+                                           hl, hd, window, out, out_stride);
+    return cudaPeekAtLastError();
+}
+
+/* Transposed conv computing only raw output columns [t_skip, t_skip+t_keep),
+ * written compacted to out [cout, t_keep]. Accumulation order per column is
+ * identical to k_tconv1d; the skipped head belongs to the history column an
+ * incremental caller prepended for context. */
+__global__ void k_tconv1d_tail(const float* __restrict__ in, int cin, int tin,
+                               const float* __restrict__ w,
+                               const float* __restrict__ b, int cout,
+                               int k, int stride, float* __restrict__ out,
+                               int t_skip, int t_keep) {
+    int tl = blockIdx.x * blockDim.x + threadIdx.x;
+    int co = blockIdx.y;
+    if (tl >= t_keep || co >= cout) return;
+    int to = t_skip + tl;
+    float acc = b ? b[co] : 0.f;
+    for (int kk = 0; kk < k; kk++) {
+        int num = to - kk;
+        if (num < 0) break;
+        if (num % stride) continue;
+        int ti = num / stride;
+        if (ti >= tin) continue;
+        const float* inp = in + ti;
+        const float* wp = w + (size_t)co * k + kk;
+        for (int ci = 0; ci < cin; ci++)
+            acc += wp[(size_t)ci * cout * k] * inp[(size_t)ci * tin];
+    }
+    out[(size_t)co * t_keep + tl] = acc;
+}
+extern "C" cudaError_t s2pdk_tconv1d_tail(const float* in, int cin, int tin,
+                                          const float* w, const float* b,
+                                          int cout, int k, int stride,
+                                          float* out, int t_skip, int t_keep,
+                                          cudaStream_t st) {
+    dim3 grid((t_keep + 255) / 256, cout);
+    k_tconv1d_tail<<<grid, 256, 0, st>>>(in, cin, tin, w, b, cout, k, stride,
+                                         out, t_skip, t_keep);
     return cudaPeekAtLastError();
 }
