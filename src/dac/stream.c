@@ -1,8 +1,14 @@
-/* s2pro-native — streaming vocoder: overlapping windows + crossfade.
+/* s2pro-native — streaming vocoder front end.
  *
- * Exact port of fishaudio_s2_pro/streaming_vocoder.py
- * (build_stream_vocoder_chunk / flush_stream_vocoder_chunk /
- *  _apply_stream_crossfade / trim_retained_stream_codes):
+ * Default path: the bit-exact incremental engine (stream_inc.c) — every
+ * pushed frame emits its 2048 samples immediately, and the streamed PCM
+ * equals s2p_dac_decode of the full sequence bit for bit. No windows, no
+ * overlap re-decode, no crossfade, no held tail.
+ *
+ * S2P_STREAM_REFERENCE=1 selects the ported reference scheme instead
+ * (fishaudio_s2_pro/streaming_vocoder.py: build_stream_vocoder_chunk /
+ * flush_stream_vocoder_chunk / _apply_stream_crossfade /
+ * trim_retained_stream_codes):
  *   stream_stride           = 10  frames  (first decode threshold)
  *   stream_followup_stride  = 90  frames  (subsequent thresholds: total+90)
  *   stream_overlap_tokens   = 20  frames  (re-decoded for causal context)
@@ -25,8 +31,18 @@
 #define STREAM_OVERLAP     20
 #define STREAM_CROSSFADE   512
 
+static int stream_use_reference(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("S2P_STREAM_REFERENCE");
+        v = (e && e[0] == '1' && e[1] == '\0') ? 1 : 0;
+    }
+    return v;
+}
+
 struct s2p_dac_stream {
     s2p_dac* d;
+    s2pd_inc* inc;        /* non-NULL => incremental path */
     int32_t* frames;      /* frame-major [count][10] */
     int      cap, count;
     int      code_start;  /* absolute frame index of frames[0] */
@@ -43,12 +59,20 @@ s2p_status s2p_dac_stream_create(s2p_dac* d, s2p_dac_stream** out) {
     s2p_dac_stream* s = (s2p_dac_stream*)calloc(1, sizeof(*s));
     if (!s) return S2P_ERR_OOM;
     s->d = d;
+    if (!stream_use_reference()) {
+        s2p_status rc = s2pd_inc_create(d, &s->inc);
+        if (rc != S2P_OK) {
+            free(s);
+            return rc;
+        }
+    }
     *out = s;
     return S2P_OK;
 }
 
 void s2p_dac_stream_destroy(s2p_dac_stream* s) {
     if (!s) return;
+    s2pd_inc_destroy(s->inc);
     free(s->frames);
     free(s->tail);
     free(s);
@@ -173,6 +197,19 @@ s2p_status s2p_dac_stream_push(s2p_dac_stream* s,
     *n_out = 0;
     if (s->finished) return S2P_ERR_STATE;
 
+    if (s->inc) {                       /* incremental: frame in, frame out */
+        float* pcm = (float*)malloc(S2P_FRAME_SAMPLES * sizeof(float));
+        if (!pcm) return S2P_ERR_OOM;
+        s2p_status rc = s2pd_inc_push(s->inc, frame_codes, pcm, stream);
+        if (rc != S2P_OK) {
+            free(pcm);
+            return rc;
+        }
+        *pcm_chunk = pcm;
+        *n_out = S2P_FRAME_SAMPLES;
+        return S2P_OK;
+    }
+
     if (s->count == s->cap) {
         int cap = s->cap ? s->cap * 2 : 256;
         int32_t* nf = (int32_t*)realloc(
@@ -203,6 +240,8 @@ s2p_status s2p_dac_stream_finish(s2p_dac_stream* s, float** pcm_chunk,
     *n_out = 0;
     if (s->finished) return S2P_ERR_STATE;
     s->finished = 1;
+
+    if (s->inc) return S2P_OK;          /* nothing withheld: already emitted */
 
     int has_codes = s->count > 0;
     int has_tail = s->tail_len > 0;
