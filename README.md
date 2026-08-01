@@ -164,18 +164,24 @@ RTF is compute ÷ audio; below 1.0 means synthesis is faster than playback.
 At batch 1 every frame reads ~7.75 B weight parameters (backbone, tied LM
 head, and nine sequential fast-AR passes), so 16-bit weights are
 bandwidth-bound above realtime on this memory system by construction — the
-8-bit floor is ~35 ms/frame. These are smoke-level measurements: generation
-is deterministic and audio is speech-shaped, but output quality is not yet
-parity-validated against the PyTorch reference, and FP8 audio quality in
-particular is unvalidated.
+8-bit floor is ~35 ms/frame.
+
+Numeric fidelity is gated by the layer-parity protocol
+([benchmarks/parity](benchmarks/parity/README.md)): the BF16 path matches
+the PyTorch reference at every stage (backbone cos ≥ 0.99996, identical
+first-frame argmax except one exact bf16 tie, native DAC at SNR 65.9 dB on
+reference frames). The FP8 path FAILS the same gate (backbone cos collapses
+to 0.33 over 36 layers) — its timings above remain as measurements of the
+memory system, not as a viable quality path.
 
 ## Roadmap to RTF < 1
 
 - [ ] per-frame CUDA graph capture (~500 kernel launches/frame today)
 - [ ] device-side sampling (removes a 623 KB D2H copy + host softmax per frame)
 - [ ] DAC on a dedicated stream, overlapped with next-frame decode
-- [ ] INT8 per-channel GEMV alternative for batch 1 (crossover vs FP8 measured at M≈4–5)
-- [ ] layer-parity validation against the PyTorch reference
+- [ ] INT8 per-channel weight-only GEMV (now the primary 8-bit candidate — FP8 failed the parity gate)
+- [x] layer-parity validation against the PyTorch reference — BF16 **PASS**,
+      FP8 **FAIL** ([benchmarks/parity](benchmarks/parity/README.md))
 - [ ] voice-cloning encode (blocked on encoder tensors in the converted codec, `S2P_GAP`)
 
 ## Contributing and security
