@@ -37,7 +37,7 @@ pub fn encode(pcm: &[i16], sample_rate: u32) -> Result<Vec<u8>> {
 /// Reinterpret raw little-endian S16 bytes (Gemini's `audio/l16` payload) as
 /// samples. A trailing odd byte would mean a truncated stream.
 pub fn pcm_from_le_bytes(bytes: &[u8]) -> Result<Vec<i16>> {
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         bail!("l16 payload has an odd byte count ({})", bytes.len());
     }
     Ok(bytes
