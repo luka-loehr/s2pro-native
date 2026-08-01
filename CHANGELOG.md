@@ -33,6 +33,12 @@ for published releases.
 
 ### Added
 
+- `"stream": false` on `POST /v1/tts`: buffers the take server-side and
+  responds with exact `Content-Length` and exact RIFF sizes. Streamed WAVs
+  necessarily carry saturated size fields (the 44 header bytes are sent
+  before the first frame exists; chunked transfer cannot rewrite them),
+  which strict players such as Apple's reject — buffered mode produces a
+  well-formed downloadable file at the cost of time-to-first-audio.
 - INT8 per-channel weight-only GEMM path (`S2P_INT8=1` / `--int8`): every
   linear is quantized per output channel at load (absmax/127,
   round-to-nearest) and the BF16 copy is freed; decode-M GEMMs run a fused
