@@ -102,7 +102,12 @@ struct s2p_model {
     cudaStream_t stream;
 
     /* weights */
-    s2p_tensor embed; /* [155776, 2560] bf16, tied lm_head */
+    s2p_tensor embed; /* [155776, 2560] bf16, tied lm_head; ALWAYS kept —
+                       * embedding lookups and the M>8 head fallback read it */
+    /* INT8 sidecar of the tied head (mode == S2P_GEMM_INT8 only): the head
+     * is 0.8 GB of bf16 traffic per frame, ~1/5 of the whole decode read. */
+    s2p_tensor embed_i8;    /* [155776, 2560] int8 */
+    s2p_tensor embed_scale; /* [155776] f32 per-row */
     s2p_slow_layer layers[S2P_SLOW_LAYERS];
     s2p_tensor final_norm; /* [2560] */
     s2pfa* fastar;
