@@ -28,7 +28,8 @@ target language with native pronunciation — in ONE continuous recording
 that actually cycles through all of them.**
 
 In practice that means generating the reference with an AI voice built for
-accent-free multilinguality (e.g. ElevenLabs Multilingual, or comparable
+accent-free multilinguality (e.g. Google Gemini TTS
+(`gemini-3.1-flash-tts-preview`), ElevenLabs Multilingual, or comparable
 systems). One take, one identity, every language spoken natively — the
 model then hears "this speaker is native in all of these" and switches
 pronunciation per language instead of dragging an accent along. Note that
@@ -69,9 +70,12 @@ Rules of thumb:
   selection costs nothing per request.
 
 The three shipped sample voices (`neutral-female`, `young-male`,
-`deeper-male`) were generated exactly this way: one ElevenLabs-Multilingual
-take each, cycling German, English, French, Spanish, Russian, Ukrainian,
-and Turkish, with the shared transcript in the matching `.txt`.
+`deeper-male`) were generated exactly this way: one Google Gemini TTS
+(`gemini-3.1-flash-tts-preview`) take each, cycling German, English,
+French, Spanish, Russian, Ukrainian, and Turkish, with the shared
+transcript in the matching `.txt`. Note the 24 kHz source rate: the
+references carry no energy above 12 kHz, which the model faithfully
+imitates — export at 44.1 kHz where the provider offers it.
 
 ## Using voices over the API
 
