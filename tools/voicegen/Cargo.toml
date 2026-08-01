@@ -1,0 +1,22 @@
+[package]
+name = "voicegen"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Generate s2pro-native reference voices with Gemini TTS on Vertex AI"
+
+# Offline asset generator: never linked into the C/CUDA runtime, never invoked by
+# the Makefile. Run it by hand to (re)produce the voices/ registry.
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+# rustls-no-provider (not rustls) keeps aws-lc-sys and its C/asm build out of the
+# tree; the pure-Rust `ring` provider is installed once at startup instead.
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider", "http2"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+serde_json = "1.0"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[profile.release]
+opt-level = 2
