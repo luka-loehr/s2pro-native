@@ -7,6 +7,7 @@
  *   POST /v1/tts     -> chunked Transfer-Encoding audio stream
  *                     body: {"text": "...", "format": "wav"|"pcm",
  *                            "temperature"?, "top_p"?, "seed"?,
+ *                            "stream"?: true|false (default true),
  *                            "voice"?: "<registry name>",
  *                            "reference_audio_b64"?: "<wav, 44.1k mono s16,
  *                             max 15 s>", "reference_text"?: "<transcript>"}
@@ -22,6 +23,13 @@
  * ever closes fds, and only after s2p_sched_cancel() guarantees the worker
  * is out of the callback — this makes fd reuse races impossible.
  * Every response is Connection: close (no keep-alive).
+ *
+ * "stream": false buffers the whole take instead and answers with exact
+ * Content-Length and exact RIFF sizes. A chunked stream cannot carry a
+ * correct WAV length — the 44 header bytes are on the wire before frame 1
+ * is even sampled — so streamed WAVs advertise saturated sizes, which
+ * strict players (Apple's, notably) refuse to seek/finish. Buffered mode
+ * trades time-to-first-audio for a well-formed downloadable file.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -74,6 +82,11 @@ typedef struct {
     int         wav;          /* 1 wav framing, 0 raw pcm */
     int         sent_wav_hdr;
     atomic_int  finished;     /* set by the scheduler cb on final chunk */
+    /* buffered mode ("stream": false): PCM accumulates here (scheduler
+     * thread only) and one exact-length response goes out on final. */
+    int         buffered;
+    char*       acc;
+    size_t      acc_len, acc_cap;
 } conn;
 
 typedef struct {
@@ -183,6 +196,49 @@ static void send_simple(int fd, int code, const char* reason,
  * Nonzero return => cancel (client gone / write failed / timed out). */
 static int tts_audio_cb(void* user, const int16_t* pcm, int64_t n, int final) {
     conn* c = (conn*)user;
+    if (c->buffered) {
+        if (n > 0 && pcm) {
+            size_t add = (size_t)n * sizeof(int16_t);
+            if (c->acc_len + add > c->acc_cap) {
+                size_t nc = c->acc_cap ? c->acc_cap * 2 : (1u << 20);
+                while (nc < c->acc_len + add) nc *= 2;
+                char* nb = (char*)realloc(c->acc, nc);
+                if (!nb) {
+                    send_simple(c->fd, 500, "Internal Server Error",
+                                "application/json", "{\"error\":\"oom\"}");
+                    atomic_store(&c->finished, 1); /* poll loop reaps */
+                    return 1;
+                }
+                c->acc = nb;
+                c->acc_cap = nc;
+            }
+            memcpy(c->acc + c->acc_len, pcm, add);
+            c->acc_len += add;
+        }
+        if (final) {
+            char head[256];
+            size_t body = c->acc_len + (c->wav ? 44u : 0u);
+            int hn = snprintf(head, sizeof(head),
+                              "HTTP/1.1 200 OK\r\n"
+                              "Content-Type: %s\r\n"
+                              "Content-Length: %zu\r\n"
+                              "Cache-Control: no-store\r\n"
+                              "Connection: close\r\n\r\n",
+                              c->wav ? "audio/wav" : "application/octet-stream",
+                              body);
+            int ok = hn > 0 && send_all(c->fd, head, (size_t)hn) == 0;
+            if (ok && c->wav) {
+                uint8_t hdr[44];
+                size_t wn = s2p_wav_header(hdr, (uint32_t)c->acc_len,
+                                           S2P_SAMPLE_RATE);
+                ok = send_all(c->fd, hdr, wn) == 0;
+            }
+            if (ok && c->acc_len > 0)
+                (void)send_all(c->fd, c->acc, c->acc_len);
+            atomic_store(&c->finished, 1); /* LAST touch of c by this thread */
+        }
+        return 0;
+    }
     if (c->wav && !c->sent_wav_hdr) {
         /* WAV header with unknown length: pass the max so players stream. */
         uint8_t hdr[44];
@@ -206,6 +262,7 @@ static int tts_audio_cb(void* user, const int16_t* pcm, int64_t n, int final) {
 static void conn_reset(conn* c) {
     if (c->fd >= 0) close(c->fd);
     free(c->buf);
+    free(c->acc);
     memset(c, 0, sizeof(*c));
     c->fd = -1;
     c->st = C_FREE;
@@ -386,6 +443,10 @@ static void route_tts(http_srv* s, conn* c) {
     if ((v = s2p_jobj_get(root, "seed")) != NULL && !s2p_jis_null(v))
         sampling.seed = (uint64_t)s2p_jint(v);
 
+    int buffered = 0;
+    if ((v = s2p_jobj_get(root, "stream")) != NULL && !s2p_jis_null(v))
+        buffered = !s2p_jbool(v);
+
     /* voice selection / on-the-fly cloning (all errors here are pre-header,
      * so clients still get proper JSON error responses) */
     const s2p_voice* named = NULL;
@@ -460,23 +521,28 @@ static void route_tts(http_srv* s, conn* c) {
 
     c->wav = wav;
     c->sent_wav_hdr = 0;
+    c->buffered = buffered;
     atomic_store(&c->finished, 0);
 
-    /* Response headers BEFORE submit so the cb can stream immediately. If
-     * generation later fails, the chunked stream just ends early. */
-    char head[256];
-    int hn = snprintf(head, sizeof(head),
-                      "HTTP/1.1 200 OK\r\n"
-                      "Content-Type: %s\r\n"
-                      "Transfer-Encoding: chunked\r\n"
-                      "Cache-Control: no-store\r\n"
-                      "Connection: close\r\n\r\n",
-                      wav ? "audio/wav" : "application/octet-stream");
-    if (hn <= 0 || send_all(c->fd, head, (size_t)hn) != 0) {
-        free(text_c);
-        conn_reset(c);
-        return;
-    }
+    if (!buffered) {
+        /* Response headers BEFORE submit so the cb can stream immediately.
+         * If generation later fails, the chunked stream just ends early. */
+        char head[256];
+        int hn = snprintf(head, sizeof(head),
+                          "HTTP/1.1 200 OK\r\n"
+                          "Content-Type: %s\r\n"
+                          "Transfer-Encoding: chunked\r\n"
+                          "Cache-Control: no-store\r\n"
+                          "Connection: close\r\n\r\n",
+                          wav ? "audio/wav" : "application/octet-stream");
+        if (hn <= 0 || send_all(c->fd, head, (size_t)hn) != 0) {
+            free(text_c);
+            free(clone_pcm);
+            free(clone_text_c);
+            conn_reset(c);
+            return;
+        }
+    } /* buffered: nothing on the wire until the final callback */
 
     uint64_t req_id = 0;
     s2p_status rc = s2p_sched_submit(s->sched, &req, &sampling, tts_audio_cb,
@@ -485,9 +551,12 @@ static void route_tts(http_srv* s, conn* c) {
     free(clone_pcm);
     free(clone_text_c);
     if (rc != S2P_OK) {
-        /* Headers already went out; end the stream with zero audio. */
         fprintf(stderr, "[s2pro] http: submit failed (%d)\n", (int)rc);
-        (void)send_all(c->fd, "0\r\n\r\n", 5);
+        if (buffered)
+            send_simple(c->fd, 503, "Service Unavailable", "application/json",
+                        "{\"error\":\"submit failed\"}");
+        else /* headers already went out; end the stream with zero audio */
+            (void)send_all(c->fd, "0\r\n\r\n", 5);
         conn_reset(c);
         return;
     }
