@@ -1,7 +1,5 @@
 ![s2pro-native banner](docs/assets/banner.svg)
 
-# s2pro-native
-
 [![Language](https://img.shields.io/badge/C-C11-00599C?style=flat&logo=c&logoColor=white)](https://en.cppreference.com/w/c/11)
 [![CUDA](https://img.shields.io/badge/CUDA-13.0-76B900?style=flat&logo=nvidia&logoColor=white)](https://developer.nvidia.com/cuda-toolkit)
 [![Target](https://img.shields.io/badge/target-sm__121a%20(DGX%20Spark%20GB10)-1f6feb?style=flat)](docs/SPARK.md)
