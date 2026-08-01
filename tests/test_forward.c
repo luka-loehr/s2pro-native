@@ -133,33 +133,45 @@ int main(int argc, char** argv) {
     s2p_tok* tok = NULL;
     CHECK(s2p_tok_load(model_dir, &tok), "tokenizer load");
 
-    /* Prompt (optional voice-cloning reference: S2P_TEST_REF wav +
-     * S2P_TEST_REF_TEXT transcript; needs the full codec artifact). */
+    /* Prompt (optional voice-cloning references: S2P_TEST_REF is one wav
+     * path or a comma-separated list; S2P_TEST_REF_TEXT is the ONE combined
+     * transcript covering all clips in order — the prompt builder emits a
+     * single system block for all refs. Needs the full codec artifact.) */
     s2p_request_text req;
     memset(&req, 0, sizeof(req));
     req.text = text;
-    s2p_vq_part refpart;
-    int32_t* ref_codes = NULL;
-    const char* refwav = getenv("S2P_TEST_REF");
-    if (refwav != NULL) {
-        int64_t rn = 0;
-        float* rpcm = wav_read_f32(refwav, &rn);
-        if (rpcm == NULL) {
-            fprintf(stderr, "FAIL: cannot read ref wav %s\n", refwav);
-            return 1;
+#define MAX_REFS 8
+    s2p_vq_part refparts[MAX_REFS];
+    int n_refwavs = 0;
+    const char* refenv = getenv("S2P_TEST_REF");
+    if (refenv != NULL) {
+        char reflist[2048];
+        snprintf(reflist, sizeof(reflist), "%s", refenv);
+        for (char* tokp = strtok(reflist, ","); tokp != NULL;
+             tokp = strtok(NULL, ",")) {
+            if (n_refwavs >= MAX_REFS) break;
+            int64_t rn = 0;
+            float* rpcm = wav_read_f32(tokp, &rn);
+            if (rpcm == NULL) {
+                fprintf(stderr, "FAIL: cannot read ref wav %s\n", tokp);
+                return 1;
+            }
+            int refT = 0;
+            int32_t* rc32 = NULL;
+            double tr = now_ms();
+            CHECK(s2p_dac_encode(dac, rpcm, rn, &rc32, &refT, 0),
+                  "dac encode (reference)");
+            fprintf(stderr,
+                    "[test] reference[%d]: %s  %.2f s -> %d frames (%.0f ms)\n",
+                    n_refwavs, tokp, (double)rn / S2P_SAMPLE_RATE, refT,
+                    now_ms() - tr);
+            free(rpcm);
+            refparts[n_refwavs].codes = rc32;
+            refparts[n_refwavs].T = refT;
+            n_refwavs++;
         }
-        int refT = 0;
-        double tr = now_ms();
-        CHECK(s2p_dac_encode(dac, rpcm, rn, &ref_codes, &refT, 0),
-              "dac encode (reference)");
-        fprintf(stderr,
-                "[test] reference: %s  %.2f s -> %d frames (%.0f ms)\n",
-                refwav, (double)rn / S2P_SAMPLE_RATE, refT, now_ms() - tr);
-        free(rpcm);
-        refpart.codes = ref_codes;
-        refpart.T = refT;
-        req.refs = &refpart;
-        req.n_refs = 1;
+        req.refs = refparts;
+        req.n_refs = n_refwavs;
         req.ref_text = getenv("S2P_TEST_REF_TEXT");
         if (req.ref_text == NULL) req.ref_text = "";
     }
