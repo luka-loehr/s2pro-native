@@ -28,6 +28,7 @@ import math
 import os
 import struct
 import sys
+import time
 
 import numpy as np
 import torch
@@ -252,6 +253,45 @@ def load_dump(path):
         torch.from_numpy(codes).long()
 
 
+NAME_MAP = {"wqkv": "attention.wqkv", "wo": "attention.wo",
+            "w1": "feed_forward.w1", "w3": "feed_forward.w3",
+            "w2": "feed_forward.w2"}
+
+
+def save_patch(student, path):
+    """Export the student's trainable tensors as a checkpoint patch."""
+    from safetensors.torch import save_file
+    sd = student.state_dict()
+    patched = {}
+    for i in range(N_LAYER):
+        for short, full in NAME_MAP.items():
+            patched[f"audio_decoder.layers.{i}.{full}.weight"] = \
+                sd[f"blocks.{i}.{short}.weight"].bfloat16()
+    patched["audio_decoder.output.weight"] = sd["output.weight"].bfloat16()
+    save_file(patched, path)
+    return len(patched)
+
+
+def load_patch(student, path):
+    """Warm start: load a previously exported patch into the student."""
+    from safetensors import safe_open
+    cnt = 0
+    with safe_open(path, framework="pt") as sf:
+        keys = set(sf.keys())
+        for i in range(N_LAYER):
+            for short, full in NAME_MAP.items():
+                k = f"audio_decoder.layers.{i}.{full}.weight"
+                if k in keys:
+                    getattr(student.blocks[i], short).weight.data.copy_(
+                        sf.get_tensor(k).float())
+                    cnt += 1
+        if "audio_decoder.output.weight" in keys:
+            student.output.weight.data.copy_(
+                sf.get_tensor("audio_decoder.output.weight").float())
+            cnt += 1
+    return cnt
+
+
 def load_checkpoint_tensors(model_dir):
     from safetensors import safe_open
     tensors = {}
@@ -273,9 +313,23 @@ def main():
     ap.add_argument("--batch", type=int, default=256)
     ap.add_argument("--lr", type=float, default=2e-5)
     ap.add_argument("--holdout", type=int, default=8192)
+    ap.add_argument("--holdout-from", type=int, default=0,
+                    help="draw the holdout only from frames >= this index "
+                         "(keeps warm-start evals honest when the dump grew "
+                         "by appending: earlier frames may have been trained "
+                         "on by the init run)")
     ap.add_argument("--dagger", type=float, default=0.5,
                     help="fraction of each batch forced with student "
-                         "free-run codes in the second training half")
+                         "free-run codes once the DAgger phase begins")
+    ap.add_argument("--dagger-start", type=float, default=0.5,
+                    help="fraction of total steps after which DAgger "
+                         "mixing begins")
+    ap.add_argument("--init", default=None,
+                    help="warm start from a qat_patch.safetensors of a "
+                         "previous run")
+    ap.add_argument("--eval-every", type=int, default=500)
+    ap.add_argument("--lr-min", type=float, default=0.0,
+                    help="cosine floor")
     ap.add_argument("--eval-only", action="store_true")
     args = ap.parse_args()
     dev = "cuda"
@@ -293,25 +347,37 @@ def main():
     hid, sem, codes = load_dump(args.dump)
     n = hid.shape[0]
     print(f"[qat] {n} frames", flush=True)
-    perm = torch.randperm(n, generator=torch.Generator().manual_seed(7))
-    hold = perm[: args.holdout]
-    train = perm[args.holdout:]
+    pool = torch.arange(args.holdout_from, n)
+    pp = pool[torch.randperm(len(pool),
+                             generator=torch.Generator().manual_seed(7))]
+    hold = pp[: args.holdout]
+    train = torch.cat([torch.arange(0, args.holdout_from),
+                       pp[args.holdout:]])
 
     teacher = FastAR(tensors, RefLinear, eps, rope_base).to(dev).eval()
     student = FastAR(tensors, FQLinear, eps, rope_base).to(dev)
+    if args.init:
+        cnt = load_patch(student, args.init)
+        print(f"[qat] warm start: {cnt} tensors from {args.init}",
+              flush=True)
 
     # ---- prep: exact BF16 teacher trajectories for ALL frames
     tpath = os.path.join(args.out, "teacher_codes.pt")
-    if os.path.exists(tpath):
-        tcodes = torch.load(tpath)
-    else:
-        outs = []
+    tcodes = torch.load(tpath) if os.path.exists(tpath) \
+        else torch.zeros(0, 9, dtype=torch.long)
+    if tcodes.shape[0] > n:
+        tcodes = tcodes[:n]
+    if tcodes.shape[0] < n:
+        # dump files only ever grow by appending, so a cached prefix
+        # stays valid — compute just the tail
+        outs = [tcodes]
         with torch.no_grad():
-            for i in range(0, n, 4096):
+            for i in range(tcodes.shape[0], n, 4096):
                 h = hid[i: i + 4096].to(dev)
                 s = sem[i: i + 4096].to(dev)
                 outs.append(teacher.greedy(h, s).cpu())
-                print(f"[qat] teacher gen {i + len(h)}/{n}", flush=True)
+                print(f"[qat] teacher gen {min(i + 4096, n)}/{n}",
+                      flush=True)
         tcodes = torch.cat(outs)
         torch.save(tcodes, tpath)
     agree_engine = (tcodes[:, :9] == codes[:, 1:10]).float().mean().item()
@@ -347,8 +413,17 @@ def main():
     # ---- train: teacher-forced KL
     opt = torch.optim.AdamW(
         [p for p in student.parameters() if p.requires_grad], lr=args.lr)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.steps)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+        opt, args.steps, eta_min=args.lr_min)
     g = torch.Generator().manual_seed(11)
+    best_fr = -1.0
+    bpath = os.path.join(args.out, "qat_patch_best.safetensors")
+    lpath = os.path.join(args.out, "qat_patch_last.safetensors")
+    if args.init:
+        # the warm-start weights are the incumbent best until beaten
+        best_fr = base_fr
+        save_patch(student, bpath)
+    t0 = time.time()
     student.train()
     for step in range(args.steps):
         ix = train[torch.randint(0, len(train), (args.batch,), generator=g)]
@@ -356,7 +431,7 @@ def main():
         s = sem[ix].to(dev)
         tc = tcodes[ix].to(dev)
         force = tc[:, :8]
-        if args.dagger > 0 and step * 2 >= args.steps:
+        if args.dagger > 0 and step >= args.steps * args.dagger_start:
             # DAgger phase (second half): for a slice of the batch, force
             # with the STUDENT's own free-run codes and let the teacher
             # provide the corrective targets on those prefixes — trains
@@ -380,28 +455,30 @@ def main():
         sched.step()
         if step % 100 == 0:
             print(f"[qat] step {step} loss {loss.item():.5f} "
-                  f"lr {sched.get_last_lr()[0]:.2e}", flush=True)
-        if step % 500 == 499:
-            eval_agreement(student, hold, f"INT4 step {step + 1}")
+                  f"lr {sched.get_last_lr()[0]:.2e} "
+                  f"t={time.time() - t0:.0f}s", flush=True)
+        if step % args.eval_every == args.eval_every - 1:
+            fr = eval_agreement(student, hold, f"INT4 step {step + 1}")
+            save_patch(student, lpath)
+            if fr > best_fr:
+                best_fr = fr
+                save_patch(student, bpath)
+                print(f"[qat] new best free-run {fr:.4f} -> "
+                      f"qat_patch_best", flush=True)
             student.train()
 
     fr = eval_agreement(student, hold, "INT4 post-QAT")
     print(f"[qat] free-run agreement {base_fr:.4f} -> {fr:.4f}", flush=True)
+    if fr > best_fr:
+        best_fr = fr
+        save_patch(student, bpath)
+    print(f"[qat] BEST free-run {best_fr:.4f} (qat_patch_best.safetensors)",
+          flush=True)
 
     # ---- export: patched audio_decoder tensors (bf16)
-    patched = {}
-    sd = student.state_dict()
-    name_map = {"wqkv": "attention.wqkv", "wo": "attention.wo",
-                "w1": "feed_forward.w1", "w3": "feed_forward.w3",
-                "w2": "feed_forward.w2"}
-    for i in range(N_LAYER):
-        for short, full in name_map.items():
-            patched[f"audio_decoder.layers.{i}.{full}.weight"] = \
-                sd[f"blocks.{i}.{short}.weight"].bfloat16()
-    patched["audio_decoder.output.weight"] = sd["output.weight"].bfloat16()
-    from safetensors.torch import save_file
-    save_file(patched, os.path.join(args.out, "qat_patch.safetensors"))
-    print(f"[qat] wrote {len(patched)} patched tensors", flush=True)
+    n_p = save_patch(student, os.path.join(args.out,
+                                           "qat_patch.safetensors"))
+    print(f"[qat] wrote {n_p} patched tensors", flush=True)
 
 
 if __name__ == "__main__":
