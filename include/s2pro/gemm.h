@@ -46,11 +46,22 @@ typedef struct {
     s2p_tensor w_fp8;         /* [out, in] e4m3 */
     s2p_tensor w_scales;      /* int32-packed UE8M0 sfb, sm_120/121 layout */
     int        fp8_ready;
-    /* INT8 sidecar (present when int8_ready): */
+    /* INT8/INT4 sidecar (present when int8_ready): */
     s2p_tensor w_int8;        /* [out, in] int8, round-to-nearest */
-    s2p_tensor w_iscale;      /* [out] f32 per-out-channel absmax/127 */
+    s2p_tensor w_iscale;      /* q_group==0: [out] f32 per-out-channel;
+                               * q_group>0:  [out, in/q_group] f32 group-wise */
     int        int8_ready;
+    int        q_group;       /* 0 = per-channel (INT8 path), else group size */
 } s2p_linear;
+
+/* Which module a linear belongs to; drives the mixed-precision policy under
+ * S2P_INT4=1 (backbone -> group-wise INT4, fast-AR + head stay per-channel
+ * INT8 — the small decoder run 9x per frame is the tensor most damaged by
+ * 4-bit; S2P_INT4_ALL=1 forces group-wise INT4 everywhere for A/B). */
+typedef enum {
+    S2P_QSITE_BACKBONE = 0,
+    S2P_QSITE_FASTAR   = 1,
+} s2p_qsite;
 
 s2p_status s2p_linear_from_st(s2p_linear* lin, s2p_st* st, const char* name,
                               int in_features, int out_features,
@@ -59,6 +70,12 @@ s2p_status s2p_linear_prepare_fp8(s2p_linear* lin, cudaStream_t stream);
 /* Quantize w_bf16 -> INT8 sidecar, then FREE w_bf16 (that is the RAM win;
  * env S2P_INT8_KEEP_BF16=1 keeps it for A/B). Synchronizes `stream`. */
 s2p_status s2p_linear_prepare_int8(s2p_linear* lin, cudaStream_t stream);
+/* Same, but the scheme (per-channel INT8 vs group-wise INT4) is chosen by the
+ * mixed-precision policy from `site` and the S2P_INT4* envs (see s2p_qsite).
+ * Group size: S2P_INT4_GROUP (default 32); per-group MSE clip search:
+ * S2P_INT4_MSE (default 1). */
+s2p_status s2p_linear_prepare_int8_site(s2p_linear* lin, s2p_qsite site,
+                                        cudaStream_t stream);
 s2p_status s2p_linear_forward(const s2p_linear* lin, const void* x_bf16,
                               void* y_bf16, int M, s2p_gemm_mode mode,
                               cudaStream_t stream);
@@ -82,6 +99,20 @@ s2p_status s2p_int8_gemv(void* y_bf16, const void* x_bf16, const void* w_i8,
 /* w_bf16[N,K] = w_i8[N,K] * scales[N] (prefill fallback dequant). */
 s2p_status s2p_int8_dequant(void* w_bf16, const void* w_i8,
                             const float* scales, int N, int K,
+                            cudaStream_t stream);
+
+/* Group-wise low-bit primitives (INT4 value precision in the int8 container).
+ * scales f32 [N, K/G]; G power of two, >= 16, dividing K. levels = 7 for
+ * 4-bit symmetric (15 levels); mse != 0 grid-searches the per-group clip
+ * range for min MSE instead of plain absmax RTN. */
+s2p_status s2p_intq_quant(void* w_i8, float* scales, const void* w_bf16,
+                          int N, int K, int G, int levels, int mse,
+                          cudaStream_t stream);
+s2p_status s2p_intq_gemv(void* y_bf16, const void* x_bf16, const void* w_i8,
+                         const float* scales, int M, int N, int K, int G,
+                         cudaStream_t stream);
+s2p_status s2p_intq_dequant(void* w_bf16, const void* w_i8,
+                            const float* scales, int N, int K, int G,
                             cudaStream_t stream);
 
 #ifdef __cplusplus
