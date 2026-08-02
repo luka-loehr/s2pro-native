@@ -59,7 +59,7 @@ disconnects entirely:
 | night2.sh | qat-train container exits | preserve run-2 patch → corpus v2 (~590 takes) → stop all serving containers → launch warm-started 3000-step run | night2.log, corpus2.log, qat_night.log |
 | phase_b.sh | run-2 patch file appears | patch a checkpoint copy, serve on :8012 with S2P_INT4_ALL=1, envelope + EOS gates | phase_b.log, gate-v1/ |
 | phase_e.sh | TRAIN2-EXIT in night2.log | pick best checkpoint (best → final → run-2), deploy final server on :8011 (no dump), full gate battery, the three final listening takes | phase_e.log, final/ |
-| cutoff guard | 06:45 wall clock | warn; hard-stop the trainer at 07:00 if still running — lossless thanks to the checkpoints | monitor event |
+| cutoff guard | 06:45 wall clock | warn; hard-stop the trainer at 07:00 if still running — lossless thanks to the checkpoints. *Removed at 23:45: the owner ruled "no time pressure — everything runs to completion, however long it takes." The killed guard turned out to have survived its ssh disconnect and had to be hunted down by PID — a reminder that remote nohup-style processes outlive their launchers.* | monitor event |
 
 Monitors watch every log for eval milestones, corpus progress and error
 signatures; each event wakes the agent, which verifies state and course-
@@ -88,6 +88,18 @@ a full 2444 MHz SM clock (no throttling), hottest board zone 85–88 °C.
   incremental teacher cache (commit `ec886d2`); overnight protocol and
   corpus generator documented and pushed (`13a9424`).
 - **23:15** — thermal logger running: GPU 76 °C / 2444 MHz, zones ≤ 88 °C.
+- **23:22** — thermal event: a load transition doubled package power
+  (37 → 87 W); hottest zone peaked at 97 °C (trip: 104 °C), GPU 85 °C,
+  SM clock dipped only 2444 → 2418 MHz. Transient — back to 76/83 °C
+  minutes later. Alerting switched to transition-based thresholds
+  (zone ≥ 100 °C, GPU ≥ 92 °C, clock < 2300 MHz) to keep the night
+  signal-only.
+- **23:31** — run 2 step-1500 eval: free-run 0.6029 → 0.6380. The DAgger
+  phase is + 3.5 points per 500 steps and still flattening — the corpus
+  lever remains the right bet.
+- **23:45** — owner (awake after all): *"no time pressure — everything
+  runs through, however long it takes."* The 07:00 cutoff guard is
+  removed; the overnight run will complete its full schedule.
 - *(appended as the night unfolds)*
 
 ## Results
