@@ -62,7 +62,9 @@ typedef struct {
 /* Which module a linear belongs to; drives the mixed-precision policy under
  * S2P_INT4=1 (backbone -> group-wise INT4, fast-AR + head stay per-channel
  * INT8 — the small decoder run 9x per frame is the tensor most damaged by
- * 4-bit; S2P_INT4_ALL=1 forces group-wise INT4 everywhere for A/B). */
+ * 4-bit; S2P_INT4_ALL=1 forces group-wise INT4 everywhere for A/B).
+ * Narrowing the fast-AR promotion to tensor subsets was measured OUT
+ * (see src/fastar/fastar.cu): every subset fails the parity argmax gate. */
 typedef enum {
     S2P_QSITE_BACKBONE = 0,
     S2P_QSITE_FASTAR   = 1,
