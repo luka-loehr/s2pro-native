@@ -167,8 +167,8 @@ static s2p_status push_hard(strvec* out, const char* s, size_t len,
     return S2P_OK;
 }
 
-s2p_status s2p_text_chunks(const char* utf8, int target_bytes, char*** out,
-                           int* out_n) {
+s2p_status s2p_text_chunks(const char* utf8, int target_bytes,
+                           int max_sentences, char*** out, int* out_n) {
     if (!utf8 || !out || !out_n || target_bytes < 32) return S2P_ERR_INVALID;
     *out = NULL;
     *out_n = 0;
@@ -176,15 +176,20 @@ s2p_status s2p_text_chunks(const char* utf8, int target_bytes, char*** out,
     strvec sen = {0}, chunks = {0};
     char* cur = NULL; /* before the first goto: done frees it */
     size_t cur_len = 0, cur_cap = 0;
+    int cur_sent = 0;
     s2p_status rc = sentences(utf8, &sen);
     if (rc != S2P_OK) goto done;
 
-    /* greedy pack: current chunk grows while it stays <= target */
+    /* greedy pack: a chunk closes at target_bytes or (when max_sentences
+     * > 0) after that many sentences, whichever comes first */
     for (int i = 0; i < sen.n; i++) {
         size_t sl = strlen(sen.v[i]);
-        if (cur_len > 0 && cur_len + 1 + sl > (size_t)target_bytes) {
+        if (cur_len > 0 &&
+            (cur_len + 1 + sl > (size_t)target_bytes ||
+             (max_sentences > 0 && cur_sent >= max_sentences))) {
             rc = push(&chunks, cur, cur_len) == 0 ? S2P_OK : S2P_ERR_OOM;
             cur_len = 0;
+            cur_sent = 0;
             if (rc != S2P_OK) goto done;
         }
         if (sl > (size_t)target_bytes && cur_len == 0) {
@@ -203,6 +208,7 @@ s2p_status s2p_text_chunks(const char* utf8, int target_bytes, char*** out,
         if (cur_len > 0) cur[cur_len++] = ' ';
         memcpy(cur + cur_len, sen.v[i], sl);
         cur_len += sl;
+        cur_sent++;
     }
     if (cur_len > 0) {
         rc = push(&chunks, cur, cur_len) == 0 ? S2P_OK : S2P_ERR_OOM;
