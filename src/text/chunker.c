@@ -134,15 +134,27 @@ static s2p_status sentences(const char* text, strvec* out) {
     return S2P_OK;
 }
 
-/* Hard-split an oversize sentence at the last space (or UTF-8 boundary)
- * before target_bytes. */
+/* Hard-split an oversize sentence: prefer the last comma before
+ * target_bytes (the v1.5.1 reference splitter's fallback hierarchy:
+ * sentence -> comma -> whitespace -> hard cut), then the last space, then
+ * a UTF-8 boundary. */
 static s2p_status push_hard(strvec* out, const char* s, size_t len,
                             size_t target) {
     while (len > target) {
-        size_t cut = target;
-        while (cut > 0 && !is_space((unsigned char)s[cut])) cut--;
+        size_t cut = 0;
+        for (size_t k = 1; k <= target; k++) { /* last comma, kept left */
+            if (s[k - 1] == ',') cut = k;
+            else if ((unsigned char)s[k - 1] == 0xEF && k + 1 < len &&
+                     (unsigned char)s[k] == 0xBC &&
+                     (unsigned char)s[k + 1] == 0x8C)
+                cut = k + 2; /* ， */
+        }
         if (cut == 0) {
-            cut = target; /* no space: cut at a UTF-8 boundary */
+            cut = target;
+            while (cut > 0 && !is_space((unsigned char)s[cut])) cut--;
+        }
+        if (cut == 0) {
+            cut = target; /* no comma/space: cut at a UTF-8 boundary */
             while (cut > 0 && ((unsigned char)s[cut] & 0xC0) == 0x80) cut--;
             if (cut == 0) cut = len; /* degenerate; emit as-is */
         }
