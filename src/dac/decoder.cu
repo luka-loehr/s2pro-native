@@ -16,19 +16,158 @@
 #include <cuda_runtime.h>
 #include <math.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include "dac_internal.h"
 
 #define S2PDK_MAX_ATTN_WINDOW 1024   /* shared-mem score buffer bound */
 
+/* ------------------------- per-kernel-type profiler ----------------------
+ * S2P_DAC_PROF=1: every conv launcher brackets its kernel with events;
+ * s2pdk_prof_dump() (called by hosts after a decode) syncs, sums per type
+ * and prints. Diagnostic only — events serialize nothing but add launch
+ * overhead, so keep it off for real measurements of totals. */
+#define PROF_MAX 4096
+static struct {
+    int         inited, on, n;
+    cudaEvent_t ev[PROF_MAX][2];
+    int         type[PROF_MAX];
+    int         dim[PROF_MAX][5]; /* cin, cout, k, stride_or_dil, tout */
+} g_prof;
+
+static int prof_on(void) {
+    if (!g_prof.inited) {
+        g_prof.inited = 1;
+        const char* e = getenv("S2P_DAC_PROF");
+        g_prof.on = e && e[0] == '1' && e[1] == '\0';
+    }
+    return g_prof.on;
+}
+
+static int prof_begin(int type, cudaStream_t st, int cin, int cout, int k,
+                      int sd, int tout) {
+    if (!prof_on() || g_prof.n >= PROF_MAX) return -1;
+    int i = g_prof.n++;
+    g_prof.type[i] = type;
+    g_prof.dim[i][0] = cin; g_prof.dim[i][1] = cout; g_prof.dim[i][2] = k;
+    g_prof.dim[i][3] = sd;  g_prof.dim[i][4] = tout;
+    if (!g_prof.ev[i][0]) {
+        cudaEventCreate(&g_prof.ev[i][0]);
+        cudaEventCreate(&g_prof.ev[i][1]);
+    }
+    cudaEventRecord(g_prof.ev[i][0], st);
+    return i;
+}
+
+static void prof_end(int i, cudaStream_t st) {
+    if (i >= 0) cudaEventRecord(g_prof.ev[i][1], st);
+}
+
+extern "C" void s2pdk_prof_dump(void) {
+    if (!prof_on() || g_prof.n == 0) return;
+    cudaDeviceSynchronize();
+    static const char* names[] = {"conv1d", "dwconv", "tconv"};
+    float sum[3] = {0, 0, 0};
+    int   cnt[3] = {0, 0, 0};
+    for (int i = 0; i < g_prof.n; i++) {
+        float ms = 0;
+        cudaEventElapsedTime(&ms, g_prof.ev[i][0], g_prof.ev[i][1]);
+        sum[g_prof.type[i]] += ms;
+        cnt[g_prof.type[i]]++;
+    }
+    for (int t = 0; t < 3; t++)
+        fprintf(stderr, "[dac-prof] %-7s %4d launches  %8.2f ms\n", names[t],
+                cnt[t], sum[t]);
+    for (int i = 0; i < g_prof.n; i++) {
+        float ms = 0;
+        cudaEventElapsedTime(&ms, g_prof.ev[i][0], g_prof.ev[i][1]);
+        if (ms < 20.0f) continue; /* only the heavy launches */
+        fprintf(stderr, "[dac-prof]   %-6s cin=%-5d cout=%-5d k=%-3d sd=%-2d "
+                        "tout=%-7d %8.2f ms\n", names[g_prof.type[i]],
+                g_prof.dim[i][0], g_prof.dim[i][1], g_prof.dim[i][2],
+                g_prof.dim[i][3], g_prof.dim[i][4], ms);
+    }
+    g_prof.n = 0;
+}
+
 /* ------------------------------ conv ------------------------------------- */
 
 /* out[co,to] = b[co] + sum_ci sum_k w[co,ci,k] * in[ci, to*stride - P + k*dil]
- * (reads outside [0,Tin) are zero: covers causal left pad + dynamic right pad) */
+ * (reads outside [0,Tin) are zero: covers causal left pad + dynamic right pad)
+ *
+ * Output-channel tiling: one thread accumulates S2PDK_CO_TILE output
+ * channels for its time step, so every input load is amortized CO_TILE-fold
+ * (the naive one-block-per-co layout re-read the whole input plane once per
+ * output channel — measured 18 GB of traffic on a 192x192 pointwise conv
+ * where 0.2 GB is inherent). Each output's accumulation order stays exactly
+ * ci-outer/kk-inner — bit-identical to the untiled kernel. */
+#define S2PDK_CO_TILE 16
+
+#define S2PDK_CONV_K_MAX    7  /* largest decoder conv kernel width */
+#define S2PDK_CONV_CI_CHUNK 64 /* smem: 16*64*7*4 = 28 KB */
+
 __global__ void k_conv1d(const float* __restrict__ in, int cin, int tin,
                          const float* __restrict__ w,
                          const float* __restrict__ b, int cout,
                          int k, int dil, int stride, int leftpad,
                          float* __restrict__ out, int tout) {
+    __shared__ float sw[S2PDK_CO_TILE * S2PDK_CONV_CI_CHUNK *
+                        S2PDK_CONV_K_MAX];
+    const int to = blockIdx.x * blockDim.x + threadIdx.x;
+    const int co0 = blockIdx.y * S2PDK_CO_TILE;
+    const int nc =
+        (cout - co0) < S2PDK_CO_TILE ? (cout - co0) : S2PDK_CO_TILE;
+    const int active = (to < tout);
+
+    float acc[S2PDK_CO_TILE];
+    for (int c = 0; c < nc; c++) acc[c] = b ? b[co0 + c] : 0.f;
+
+    const int t0 = to * stride - leftpad;
+    for (int ci0 = 0; ci0 < cin; ci0 += S2PDK_CONV_CI_CHUNK) {
+        const int nci = (cin - ci0) < S2PDK_CONV_CI_CHUNK
+                            ? (cin - ci0)
+                            : S2PDK_CONV_CI_CHUNK;
+        __syncthreads();
+        for (int c = 0; c < nc; c++) { /* contiguous nci*k floats per c */
+            const float* src = w + ((size_t)(co0 + c) * cin + ci0) * k;
+            for (int idx = threadIdx.x; idx < nci * k; idx += blockDim.x)
+                sw[(size_t)c * S2PDK_CONV_CI_CHUNK * k + idx] = src[idx];
+        }
+        __syncthreads();
+        if (!active) continue;
+        for (int ci = 0; ci < nci; ci++) {
+            const float* inr = in + (size_t)(ci0 + ci) * tin;
+            const float* swc = sw + (size_t)ci * k;
+            for (int kk = 0; kk < k; kk++) {
+                int ti = t0 + kk * dil;
+                if (ti < 0 || ti >= tin) continue;
+                const float v = inr[ti];
+                if (nc == S2PDK_CO_TILE) {
+#pragma unroll
+                    for (int c = 0; c < S2PDK_CO_TILE; c++)
+                        acc[c] +=
+                            swc[(size_t)c * S2PDK_CONV_CI_CHUNK * k + kk] * v;
+                } else {
+                    for (int c = 0; c < nc; c++)
+                        acc[c] +=
+                            swc[(size_t)c * S2PDK_CONV_CI_CHUNK * k + kk] * v;
+                }
+            }
+        }
+    }
+    if (active)
+        for (int c = 0; c < nc; c++)
+            out[(size_t)(co0 + c) * tout + to] = acc[c];
+}
+
+/* reference kernel (one block row per output channel): serves k >
+ * S2PDK_CONV_K_MAX — encoder strided convs go up to k=16 — and stands as
+ * the bit-exactness reference for the tiled kernel. */
+__global__ void k_conv1d_ref(const float* __restrict__ in, int cin, int tin,
+                             const float* __restrict__ w,
+                             const float* __restrict__ b, int cout,
+                             int k, int dil, int stride, int leftpad,
+                             float* __restrict__ out, int tout) {
     int to = blockIdx.x * blockDim.x + threadIdx.x;
     int co = blockIdx.y;
     if (to >= tout || co >= cout) return;
@@ -50,9 +189,24 @@ extern "C" cudaError_t s2pdk_conv1d(const float* in, int cin, int tin,
                                     const float* w, const float* b, int cout,
                                     int k, int dil, int stride, int leftpad,
                                     float* out, int tout, cudaStream_t st) {
-    dim3 grid((tout + 255) / 256, cout);
-    k_conv1d<<<grid, 256, 0, st>>>(in, cin, tin, w, b, cout, k, dil, stride,
-                                   leftpad, out, tout);
+    int pi = prof_begin(0, st, cin, cout, k, dil, tout);
+    if (k == 1) {
+        /* pointwise conv: the co-tiled kernel amortizes the input plane
+         * 16-fold — measured 4x (81 -> 20 ms on 192ch x 122880). For k > 1
+         * the tiled variant LOST to the reference (smem/FMA throughput per
+         * output dominates, not bandwidth; a GEMM-grade 2D register tile
+         * would be needed — roadmap), so wider kernels keep the reference
+         * one-block-row-per-channel layout. */
+        dim3 grid((tout + 255) / 256,
+                  (cout + S2PDK_CO_TILE - 1) / S2PDK_CO_TILE);
+        k_conv1d<<<grid, 256, 0, st>>>(in, cin, tin, w, b, cout, k, dil,
+                                       stride, leftpad, out, tout);
+    } else {
+        dim3 grid((tout + 255) / 256, cout);
+        k_conv1d_ref<<<grid, 256, 0, st>>>(in, cin, tin, w, b, cout, k, dil,
+                                           stride, leftpad, out, tout);
+    }
+    prof_end(pi, st);
     return cudaPeekAtLastError();
 }
 
@@ -80,12 +234,19 @@ extern "C" cudaError_t s2pdk_dwconv1d(const float* in, int c, int tin,
                                       int leftpad, float* out, int tout,
                                       cudaStream_t st) {
     dim3 grid((tout + 255) / 256, c);
+    int pi = prof_begin(1, st, c, c, k, 1, tout);
     k_dwconv1d<<<grid, 256, 0, st>>>(in, c, tin, w, b, k, leftpad, out, tout);
+    prof_end(pi, st);
     return cudaPeekAtLastError();
 }
 
 /* causal ConvTranspose1d: raw_out[j] = sum over (ti,k) with j = ti*stride + k;
- * causal crop keeps raw indices [0, tin*stride). w layout [Cin,Cout,K]. */
+ * causal crop keeps raw indices [0, tin*stride). w layout [Cin,Cout,K].
+ * Reference layout (one block row per output channel): two tiled variants
+ * (register co-tiling; co-tiling + per-kk smem weight staging) both LOST to
+ * this kernel — with 1/stride of threads valid per tap, tiling mostly adds
+ * synchronization and smem traffic for idle lanes. A GEMM-grade rewrite
+ * (scatter-style over input positions) is the remaining lever (roadmap). */
 __global__ void k_tconv1d(const float* __restrict__ in, int cin, int tin,
                           const float* __restrict__ w,
                           const float* __restrict__ b, int cout,
@@ -114,8 +275,10 @@ extern "C" cudaError_t s2pdk_tconv1d(const float* in, int cin, int tin,
                                      int k, int stride, float* out, int tout,
                                      cudaStream_t st) {
     dim3 grid((tout + 255) / 256, cout);
+    int pi = prof_begin(2, st, cin, cout, k, stride, tout);
     k_tconv1d<<<grid, 256, 0, st>>>(in, cin, tin, w, b, cout, k, stride, out,
                                     tout);
+    prof_end(pi, st);
     return cudaPeekAtLastError();
 }
 
