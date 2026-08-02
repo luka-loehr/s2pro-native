@@ -41,7 +41,8 @@ static s2p_status load_linear(s2p_st* st, const char* fmt, int layer, int in_f,
     snprintf(name, sizeof(name), fmt, layer);
     S2P_TRY(s2p_linear_from_st(lin, st, name, in_f, out_f, stream));
     if (mode == S2P_GEMM_FP8) S2P_TRY(s2p_linear_prepare_fp8(lin, stream));
-    if (mode == S2P_GEMM_INT8) S2P_TRY(s2p_linear_prepare_int8(lin, stream));
+    if (mode == S2P_GEMM_INT8)
+        S2P_TRY(s2p_linear_prepare_int8_site(lin, S2P_QSITE_BACKBONE, stream));
     return S2P_OK;
 }
 
@@ -72,7 +73,8 @@ static s2p_status load_gate_up(s2p_st* st, int layer, s2p_gemm_mode mode,
     S2P_CUDA_TRY(cudaMemcpyAsync((char*)lin->w_bf16.data + half, w3.data, half,
                                  cudaMemcpyHostToDevice, stream));
     if (mode == S2P_GEMM_FP8) S2P_TRY(s2p_linear_prepare_fp8(lin, stream));
-    if (mode == S2P_GEMM_INT8) S2P_TRY(s2p_linear_prepare_int8(lin, stream));
+    if (mode == S2P_GEMM_INT8)
+        S2P_TRY(s2p_linear_prepare_int8_site(lin, S2P_QSITE_BACKBONE, stream));
     return S2P_OK;
 }
 

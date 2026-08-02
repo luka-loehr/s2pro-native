@@ -215,6 +215,49 @@ static int int8_keep_bf16(void) {
     return v && v[0] == '1' && v[1] == '\0';
 }
 
+/* ── INT4 mixed-precision policy (S2P_INT4=1 on top of S2P_INT8=1) ──
+ * Backbone linears go group-wise INT4; the fast-AR (run 9x per frame, the
+ * tensor 4-bit damages most: argmax 1/9 vs oracle when naive-quantized) and
+ * the tied lm-head sidecar stay per-channel INT8. S2P_INT4_ALL=1 forces
+ * group-wise INT4 on the fast-AR too, for A/B listening. */
+static int env_flag(const char* name) {
+    const char* v = getenv(name);
+    return v && v[0] == '1' && v[1] == '\0';
+}
+
+static int int4_group(void) {
+    static int g = 0;
+    if (g == 0) {
+        const char* v = getenv("S2P_INT4_GROUP");
+        g = v ? atoi(v) : 32;
+        if (g < 16 || g > 512 || (g & (g - 1)) != 0) {
+            fprintf(stderr, "[s2pro] S2P_INT4_GROUP=%s invalid, using 32\n",
+                    v);
+            g = 32;
+        }
+    }
+    return g;
+}
+
+static int int4_mse(void) {
+    const char* v = getenv("S2P_INT4_MSE");
+    return v ? (v[0] == '1' && v[1] == '\0') : 1; /* default ON */
+}
+
+static int int4_wanted(s2p_qsite site) {
+    static int banner = 0;
+    if (!env_flag("S2P_INT4")) return 0;
+    if (!banner) {
+        banner = 1;
+        fprintf(stderr, "[s2pro] S2P_INT4=1: group-wise 4-bit values "
+                        "(g=%d, mse=%d, fastar=%s; int8 container)\n",
+                int4_group(), int4_mse(),
+                env_flag("S2P_INT4_ALL") ? "int4" : "int8");
+    }
+    if (site == S2P_QSITE_FASTAR) return env_flag("S2P_INT4_ALL");
+    return 1;
+}
+
 s2p_status s2p_linear_prepare_int8(s2p_linear* lin, cudaStream_t stream) {
     if (!lin || !lin->w_bf16.data) return S2P_ERR_INVALID;
     if (lin->int8_ready) return S2P_OK;
@@ -251,6 +294,52 @@ s2p_status s2p_linear_prepare_int8(s2p_linear* lin, cudaStream_t stream) {
     lin->int8_ready = 1;
     if (!int8_keep_bf16()) s2p_tensor_free(&lin->w_bf16);
     return S2P_OK;
+}
+
+/* Group-wise INT4 variant of prepare_int8; same lifecycle (frees the BF16
+ * source unless S2P_INT8_KEEP_BF16=1). */
+static s2p_status prepare_int4_group(s2p_linear* lin, cudaStream_t stream) {
+    if (!lin || !lin->w_bf16.data) return S2P_ERR_INVALID;
+    if (lin->int8_ready) return S2P_OK;
+    int N = lin->out_features, K = lin->in_features;
+    const int G = int4_group();
+    if (K % 512 != 0 || K % G != 0) {
+        fprintf(stderr, "[s2pro] int4 prepare [%d,%d]: shape not servable "
+                        "(K %% 512 or K %% %d), layer stays BF16\n", N, K, G);
+        return S2P_OK;
+    }
+
+    int64_t qshape[2] = { (int64_t)N, (int64_t)K };
+    S2P_TRY(s2p_tensor_device_alloc(&lin->w_int8, S2P_DT_I8, 2, qshape));
+    int64_t sshape[1] = { (int64_t)N * (K / G) };
+    s2p_status rc = s2p_tensor_device_alloc(&lin->w_iscale, S2P_DT_F32, 1,
+                                            sshape);
+    if (rc == S2P_OK)
+        rc = s2p_intq_quant(lin->w_int8.data, (float*)lin->w_iscale.data,
+                            lin->w_bf16.data, N, K, G, 7, int4_mse(), stream);
+    if (rc == S2P_OK) {
+        cudaError_t ce = cudaStreamSynchronize(stream);
+        if (ce != cudaSuccess) {
+            fprintf(stderr, "[s2pro] int4 prepare sync: %s\n",
+                    cudaGetErrorString(ce));
+            rc = S2P_ERR_CUDA;
+        }
+    }
+    if (rc != S2P_OK) {
+        s2p_tensor_free(&lin->w_int8);
+        s2p_tensor_free(&lin->w_iscale);
+        return rc;
+    }
+    lin->int8_ready = 1;
+    lin->q_group = G;
+    if (!int8_keep_bf16()) s2p_tensor_free(&lin->w_bf16);
+    return S2P_OK;
+}
+
+s2p_status s2p_linear_prepare_int8_site(s2p_linear* lin, s2p_qsite site,
+                                        cudaStream_t stream) {
+    if (int4_wanted(site)) return prepare_int4_group(lin, stream);
+    return s2p_linear_prepare_int8(lin, stream);
 }
 
 /* Ensure the dequant scratch covers one [N,K] BF16 layer. g.mu held. */
@@ -309,10 +398,15 @@ s2p_status s2p_linear_forward(const s2p_linear* lin, const void* x_bf16,
         return rc;
     }
     if (mode == S2P_GEMM_INT8 && lin->int8_ready) {
-        if (M <= S2P_INT8_GEMV_MAX_M)
+        if (M <= S2P_INT8_GEMV_MAX_M) {
+            if (lin->q_group > 0)
+                return s2p_intq_gemv(y_bf16, x_bf16, lin->w_int8.data,
+                                     (const float*)lin->w_iscale.data, M, N,
+                                     K, lin->q_group, stream);
             return s2p_int8_gemv(y_bf16, x_bf16, lin->w_int8.data,
                                  (const float*)lin->w_iscale.data, M, N, K,
                                  stream);
+        }
         /* prefill / oversize batch: dequant into the shared scratch, then
          * the proven cuBLAS call. Lock held across both so a concurrent
          * reserve can never free the scratch under the GEMM. */
@@ -320,9 +414,13 @@ s2p_status s2p_linear_forward(const s2p_linear* lin, const void* x_bf16,
         s2p_status rc = deq_scratch_reserve(
             (size_t)N * K * sizeof(uint16_t), stream);
         if (rc == S2P_OK)
-            rc = s2p_int8_dequant(g.deq, lin->w_int8.data,
-                                  (const float*)lin->w_iscale.data, N, K,
-                                  stream);
+            rc = lin->q_group > 0
+                     ? s2p_intq_dequant(g.deq, lin->w_int8.data,
+                                        (const float*)lin->w_iscale.data, N,
+                                        K, lin->q_group, stream)
+                     : s2p_int8_dequant(g.deq, lin->w_int8.data,
+                                        (const float*)lin->w_iscale.data, N,
+                                        K, stream);
         if (rc == S2P_OK)
             rc = gemm_bf16_locked(x_bf16, g.deq, y_bf16, M, N, K, stream);
         pthread_mutex_unlock(&g.mu);
@@ -342,4 +440,5 @@ void s2p_linear_free(s2p_linear* lin) {
     s2p_tensor_free(&lin->w_iscale);
     lin->fp8_ready = 0;
     lin->int8_ready = 0;
+    lin->q_group = 0;
 }
