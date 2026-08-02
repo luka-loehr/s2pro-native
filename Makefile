@@ -21,9 +21,9 @@ NVCCFLAGS   := $(GENCODE) -O3 -std=c++17 --expt-relaxed-constexpr \
                --expt-extended-lambda -Xcompiler=-Wno-psabi \
                --diag-suppress=20012,20013,20014,177,20050 \
                -U__CUDA_NO_BFLOAT16_OPERATORS__ -U__CUDA_NO_BFLOAT16_CONVERSIONS__ \
-               -DENABLE_BF16 -DENABLE_FP8 -Iinclude
+               -DENABLE_BF16 -DENABLE_FP8 -Iinclude -MMD
 CFLAGS      := -O2 -std=c11 -Wall -Wextra -Iinclude \
-               -I/usr/local/cuda/include -D_GNU_SOURCE
+               -I/usr/local/cuda/include -D_GNU_SOURCE -MMD -MP
 FSO_INC     := -I$(FSO_DIR)/csrc/gemm/include -I$(FSO_DIR)/csrc/common/compat/include \
                -I$(FSO_DIR)/3rdparty/cutlass/include -I$(FSO_DIR)/3rdparty/cutlass/tools/util/include
 LIBS        := -lcublas -lcuda -lnvrtc -lm -lpthread
@@ -107,5 +107,10 @@ $(BUILD)/syntax/fso_wrap.o: src/fso/fso_wrap.cpp src/fso/fso.h
 
 clean:
 	rm -rf $(BUILD)
+
+# Header dependency tracking (gcc -MMD / nvcc -MMD emit one .d per .o):
+# without this, struct changes in headers silently leave stale objects with
+# the old layout linked in.
+-include $(shell find $(BUILD) -name '*.d' 2>/dev/null)
 
 .PHONY: all nvcc-build syntax selftest parity clean
