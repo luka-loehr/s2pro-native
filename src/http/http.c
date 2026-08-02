@@ -8,6 +8,9 @@
  *                     body: {"text": "...", "format": "wav"|"pcm",
  *                            "temperature"?, "top_p"?, "seed"?,
  *                            "stream"?: true|false (default true),
+ *                            "chunk_length"?: bytes (default 300; 0 = off;
+ *                             long-form sentence chunking, voiced requests
+ *                             only — see submit_chunk),
  *                            "voice"?: "<registry name>",
  *                            "reference_audio_b64"?: "<wav, 44.1k mono s16,
  *                             max 15 s>", "reference_text"?: "<transcript>"}
@@ -54,7 +57,16 @@
 #include "s2pro/json.h"
 #include "s2pro/wav.h"
 #include "s2pro/scheduler.h"
+#include "s2pro/voices.h"
 #include "s2pro/server.h"
+
+/* Long-form chunking: text above this many bytes is split at sentence
+ * boundaries and generated as chained requests (prosody stays at the
+ * fresh-context quality the first ~25 s of a take have; see
+ * src/text/chunker.c). Request field "chunk_length" overrides, 0 disables;
+ * env S2P_CHUNK_BYTES overrides the default. Applies only when a voice
+ * reference pins the voice — zero-shot chunks would each draw a new voice. */
+#define HTTP_CHUNK_BYTES_DEFAULT 300
 
 #define HTTP_MAX_HEAD   (16 * 1024)
 #define HTTP_MAX_BODY   (4 * 1024 * 1024) /* fits a 15 s wav as base64 JSON */
@@ -87,6 +99,18 @@ typedef struct {
     int         buffered;
     char*       acc;
     size_t      acc_len, acc_cap;
+    /* long-form chunk chain: text split at sentence boundaries, one
+     * scheduler request per chunk, all audio in ONE response. The audio cb
+     * (scheduler thread) sets chunk_advance on a non-last chunk's final
+     * instead of finished; the poll loop then submits the next chunk. */
+    char**      chunks;
+    int         n_chunks, cur_chunk;
+    atomic_int  chunk_advance;
+    const s2p_voice* lf_voice;      /* registry voice (stable) or NULL */
+    float*      lf_clone_pcm;       /* inline clone, re-encoded per chunk */
+    int64_t     lf_clone_n;
+    char*       lf_clone_text;
+    s2p_sampling_cfg lf_sampling;   /* base; per-chunk seed derived */
 } conn;
 
 typedef struct {
@@ -215,6 +239,12 @@ static int tts_audio_cb(void* user, const int16_t* pcm, int64_t n, int final) {
             memcpy(c->acc + c->acc_len, pcm, add);
             c->acc_len += add;
         }
+        if (final && c->cur_chunk + 1 < c->n_chunks) {
+            /* non-last chunk done: hand back to the poll loop for the next
+             * submit. LAST touch of c by this thread until resubmitted. */
+            atomic_store(&c->chunk_advance, 1);
+            return 0;
+        }
         if (final) {
             char head[256];
             size_t body = c->acc_len + (c->wav ? 44u : 0u);
@@ -251,10 +281,39 @@ static int tts_audio_cb(void* user, const int16_t* pcm, int64_t n, int final) {
             return 1;
     }
     if (final) {
+        if (c->cur_chunk + 1 < c->n_chunks) {
+            atomic_store(&c->chunk_advance, 1); /* poll loop submits next */
+            return 0;
+        }
         (void)send_all(c->fd, "0\r\n\r\n", 5); /* terminal chunk */
         atomic_store(&c->finished, 1);         /* LAST touch of c by this thread */
     }
     return 0;
+}
+
+/* Submit chunk c->cur_chunk of a long-form chain (poll-loop thread only).
+ * Reproducibility: an explicit seed varies per chunk (seed + k*P) so chunks
+ * do not share sampler trajectories; seed 0 stays 0 (fresh RNG). */
+static s2p_status submit_chunk(http_srv* s, conn* c) {
+    s2p_request_text req;
+    memset(&req, 0, sizeof(req));
+    req.text = c->chunks[c->cur_chunk];
+    if (c->lf_clone_pcm) {
+        req.ref_pcm = c->lf_clone_pcm;
+        req.ref_pcm_n = c->lf_clone_n;
+        req.ref_text = c->lf_clone_text;
+    } else if (c->lf_voice) {
+        req.refs = &c->lf_voice->part;
+        req.n_refs = 1;
+        req.ref_text = c->lf_voice->transcript;
+    }
+    s2p_sampling_cfg sampling = c->lf_sampling;
+    if (sampling.seed != 0) {
+        sampling.seed += 1000003ull * (uint64_t)c->cur_chunk;
+        if (sampling.seed == 0) sampling.seed = 1;
+    }
+    return s2p_sched_submit(s->sched, &req, &sampling, tts_audio_cb, c,
+                            &c->req_id);
 }
 
 /* ------------------------------------------------------------- conn mgmt */
@@ -263,6 +322,9 @@ static void conn_reset(conn* c) {
     if (c->fd >= 0) close(c->fd);
     free(c->buf);
     free(c->acc);
+    s2p_text_chunks_free(c->chunks, c->n_chunks);
+    free(c->lf_clone_pcm);
+    free(c->lf_clone_text);
     memset(c, 0, sizeof(*c));
     c->fd = -1;
     c->st = C_FREE;
@@ -447,6 +509,14 @@ static void route_tts(http_srv* s, conn* c) {
     if ((v = s2p_jobj_get(root, "stream")) != NULL && !s2p_jis_null(v))
         buffered = !s2p_jbool(v);
 
+    int chunk_target = HTTP_CHUNK_BYTES_DEFAULT;
+    {
+        const char* e = getenv("S2P_CHUNK_BYTES");
+        if (e && e[0]) chunk_target = atoi(e);
+    }
+    if ((v = s2p_jobj_get(root, "chunk_length")) != NULL && !s2p_jis_null(v))
+        chunk_target = (int)s2p_jint(v);
+
     /* voice selection / on-the-fly cloning (all errors here are pre-header,
      * so clients still get proper JSON error responses) */
     const s2p_voice* named = NULL;
@@ -506,6 +576,30 @@ static void route_tts(http_srv* s, conn* c) {
 #undef TTS_FAIL
     s2p_json_free(j);
 
+    /* Long-form chunking: only when a reference pins the voice (zero-shot
+     * chunks would each draw a new voice), and only when the split actually
+     * yields more than one chunk. */
+    if ((named != NULL || clone_pcm != NULL) && chunk_target >= 32 &&
+        strlen(text_c) > (size_t)chunk_target) {
+        char** chunks = NULL;
+        int    n = 0;
+        if (s2p_text_chunks(text_c, chunk_target, &chunks, &n) == S2P_OK) {
+            if (n > 1) {
+                c->chunks = chunks;
+                c->n_chunks = n;
+                c->cur_chunk = 0;
+                c->lf_voice = named;
+                c->lf_clone_pcm = clone_pcm;   /* ownership -> conn */
+                c->lf_clone_n = clone_n;
+                c->lf_clone_text = clone_text_c;
+                clone_pcm = NULL;
+                clone_text_c = NULL;
+            } else {
+                s2p_text_chunks_free(chunks, n);
+            }
+        }
+    }
+
     s2p_request_text req;
     memset(&req, 0, sizeof(req));
     req.text = text_c;
@@ -523,6 +617,7 @@ static void route_tts(http_srv* s, conn* c) {
     c->sent_wav_hdr = 0;
     c->buffered = buffered;
     atomic_store(&c->finished, 0);
+    atomic_store(&c->chunk_advance, 0);
 
     if (!buffered) {
         /* Response headers BEFORE submit so the cb can stream immediately.
@@ -544,9 +639,16 @@ static void route_tts(http_srv* s, conn* c) {
         }
     } /* buffered: nothing on the wire until the final callback */
 
-    uint64_t req_id = 0;
-    s2p_status rc = s2p_sched_submit(s->sched, &req, &sampling, tts_audio_cb,
-                                     c, &req_id);
+    s2p_status rc;
+    if (c->n_chunks > 1) {
+        c->lf_sampling = sampling;
+        rc = submit_chunk(s, c);
+    } else {
+        uint64_t req_id = 0;
+        rc = s2p_sched_submit(s->sched, &req, &sampling, tts_audio_cb, c,
+                              &req_id);
+        c->req_id = req_id;
+    }
     free(text_c); /* scheduler deep-copies everything */
     free(clone_pcm);
     free(clone_text_c);
@@ -560,7 +662,6 @@ static void route_tts(http_srv* s, conn* c) {
         conn_reset(c);
         return;
     }
-    c->req_id = req_id;
     c->st = C_STREAMING;
 }
 
@@ -707,6 +808,25 @@ s2p_status s2p_server_run(s2p_sched* sched, const s2p_server_opts* opts) {
             if (c->st == C_STREAMING && atomic_load(&c->finished)) {
                 conn_reset(c); /* final chunk delivered; close */
                 continue;
+            }
+            if (c->st == C_STREAMING && atomic_load(&c->chunk_advance)) {
+                /* previous long-form chunk finished; submit the next */
+                atomic_store(&c->chunk_advance, 0);
+                c->cur_chunk++;
+                s2p_status crc = submit_chunk(&srv, c);
+                if (crc != S2P_OK) {
+                    fprintf(stderr,
+                            "[s2pro] http: chunk %d/%d submit failed (%d)\n",
+                            c->cur_chunk + 1, c->n_chunks, (int)crc);
+                    if (c->buffered)
+                        send_simple(c->fd, 503, "Service Unavailable",
+                                    "application/json",
+                                    "{\"error\":\"submit failed\"}");
+                    else
+                        (void)send_all(c->fd, "0\r\n\r\n", 5);
+                    conn_reset(c);
+                    continue;
+                }
             }
             pfds[np].fd = c->fd;
             /* Streaming conns are watched for hangup only (POLLIN fires on
