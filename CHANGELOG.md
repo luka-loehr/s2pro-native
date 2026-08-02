@@ -34,6 +34,20 @@ for published releases.
 
 ### Added
 
+- Group-wise INT4 value precision (`S2P_INT4=1` on top of `S2P_INT8=1`):
+  backbone linears quantize to 4-bit symmetric with one f32 scale per 32
+  K-elements (`S2P_INT4_GROUP`) and a per-group MSE clip search
+  (`S2P_INT4_MSE`, default on); the fast-AR and tied lm-head stay
+  per-channel INT8 (mixed precision — the small decoder run 9x per frame
+  is the tensor 4-bit damages most; `S2P_INT4_ALL=1` for A/B). Values
+  stay in the int8 container: audio equals a packed-INT4 deployment,
+  memory/bandwidth stay INT8 until packed kernels land (roadmap). This
+  replaces the naive per-channel INT4 listening experiment, which
+  audibly muffled from ~10 s (AR compounding of per-step weight noise).
+  Parity: prefill AND step-1 argmax identical, fast-AR 8/9 (the known
+  bf16 near-tie) — INT8-class discrete decisions; HF-envelope over 104 s
+  takes shows no muffling collapse. Ablations: g64 loses step-1 argmax
+  (fast-AR 3/9); disabling MSE at g32 costs prefill cos 0.9987 → 0.9907.
 - Device-side semantic sampling: the exact two-softmax sampler (RAS detect,
   repetition penalty, torch-order top-30, seeded hash-Gumbel / xoshiro
   draw) runs as a kernel against per-session device state; the fast-AR

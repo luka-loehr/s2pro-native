@@ -78,6 +78,34 @@ above) and is the 8-bit serving path.
 
 Evidence: [`results/parity-fp8-oracle-fox-2026-08-01.json`](results/parity-fp8-oracle-fox-2026-08-01.json)
 
+### INT4 values, group-wise g32 + MSE clip search, mixed precision (`S2P_INT4=1`)
+
+4-bit VALUE precision inside the int8 container (audio identical to a real
+packed-INT4 deployment; memory/bandwidth stay INT8 until packed kernels
+exist). Scheme: backbone linears group-wise symmetric INT4 (one f32 scale
+per 32 K-elements, per-group MSE clip search), fast-AR and tied lm-head
+per-channel INT8.
+
+| Stage | Result |
+| --- | --- |
+| Backbone hiddens | cos min 0.9927, median 0.9977 |
+| Prefill logits | cos 0.998698, argmax identical |
+| Step-1 logits | cos 0.991705, argmax identical |
+| Fast-AR first-frame residual steps | 8 of 9 argmax identical (the INT8/BF16 near-tie) |
+| Semantic trajectory | follows the oracle 3 steps, 5 total matches |
+
+For contrast, naive per-channel INT4 (the first listening experiment)
+FAILED here: prefill argmax wrong, fast-AR argmax 1/9, and audibly
+progressive muffling from ~10 s (autoregressive compounding of per-step
+weight noise). Group-wise scales carry most of the recovery; the MSE
+search ablation at g32 costs prefill cos 0.9987 → 0.9907 and fast-AR
+8/9 → 7/9 when disabled; g64 loses step-1 argmax and drops fast-AR to
+3/9. HF-envelope trajectories over 104 s takes show no muffling collapse
+(the per-channel INT4 floor pattern is gone; envelope tracks content and
+recovers). Perceptual sign-off pending the project owner's ear.
+
+Evidence: [`results/parity-int4-g32-oracle-fox-2026-08-02.json`](results/parity-int4-g32-oracle-fox-2026-08-02.json)
+
 ## Listening evidence
 
 Parity establishes numeric fidelity, not perceptual quality. The listening
