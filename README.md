@@ -32,18 +32,21 @@ after prefill runs at RTF 0.86 before vocoding. End-to-end serving
 (bit-exact incremental DAC, pipelined and batched on its own CUDA stream,
 split-K decode attention, device-side sampling, CUDA-graph replay of the
 whole decode tick, packed 4-bit backbone, reference-block KV-prefix
-cache) is **below realtime on every path** — down from wall RTF 2.05:
-**0.95** zero-shot, **0.94** with a 60 s voice reference, **0.92**
-on ~150 s chunked long-form takes; TTFA 0.18 s zero-shot / 0.23 s with a
-warm voice cache. The [roadmap](#roadmap-to-rtf--1) items that remain
-(DAC conv tiling, fast-AR fusion) are now headroom, not necessity.
+cache, GEMM-grade DAC conv kernels) is **below realtime on every path**
+— down from wall RTF 2.05: **0.76** zero-shot, **0.76** with a 60 s
+voice reference, **0.75** on ~147 s chunked long-form takes; TTFA 0.15 s
+zero-shot / 0.21 s with a warm voice cache. The full engineering record
+lives in [docs/QUANT.md](docs/QUANT.md) (the quantization ladder,
+including measured negative results) and
+[docs/DAC-KERNELS.md](docs/DAC-KERNELS.md) (the vocoder kernel work,
+15.1 → 2.1 ms/frame bit-identical).
 
 > **Status: functional pre-release.** BF16, INT8, and the packed
 > group-wise INT4 backbone pass the layer-parity gate against the PyTorch
 > reference; voice cloning, the multilingual voice registry, and the HTTP
 > streaming server are exercised end to end on real hardware.
 > Single-stream synthesis runs below realtime on every serving path
-> (wall RTF 0.92–0.95, zero-shot and voice-referenced, short and
+> (wall RTF 0.75–0.76, zero-shot and voice-referenced, short and
 > long-form). There is no published release line yet; deploy from a
 > reviewed, pinned `main` commit.
 
@@ -267,13 +270,16 @@ the memory system, not as a viable quality path.
 
 ## Roadmap to RTF < 1
 
-- [x] co-tiled pointwise DAC convs — the k=1 residual-unit convs re-read
-      the input plane once per output channel (18 GB measured where 0.2 GB
-      is inherent); one thread now serves 16 channels, bit-identical
-      output (MD5), whole-buffer DAC 15.1 → 12.5 ms/frame. Measured
-      negative: the same tiling loses on k=7 convs and tconvs
-      (smem/FMA-throughput-bound, idle lanes per tconv tap) — a
-      GEMM-grade 2D register tile for those is the remaining DAC lever
+- [ ] fast-AR QAT to INT4 (`tools/qat_fastar.py`) — the BF16 fast-AR
+      distills its own 4-bit copy (teacher-forced KL + DAgger, the
+      deployment quantizer inside the training loop); target: the
+      all-INT4 weight stream (4.37 GB/frame, decode floor ~20 ms) at the
+      INT8 quality bar (free-run argmax agreement 0.896)
+- [x] GEMM-grade DAC conv kernels — 2D register blocking +
+      phase-partitioned tconvs, bit-identical PCM (MD5); whole-buffer
+      DAC 15.1 → **2.1 ms/frame**, server wall RTF 0.92–0.95 → 0.75–0.76
+      ([docs/DAC-KERNELS.md](docs/DAC-KERNELS.md), negative attempts
+      included)
 - [x] reference-block KV-prefix cache — the per-voice system block
       prefills once (one 2D copy seeds later sessions, ~189 MB per voice,
       LRU, `S2P_KV_CACHE_VOICES`); voice-ref TTFA 1.58 → **0.23 s**,
@@ -305,14 +311,12 @@ the memory system, not as a viable quality path.
       INT8 **PASS**, FP8 **FAIL**
       ([benchmarks/parity](benchmarks/parity/README.md))
 
-Every serving path is below realtime (0.93–0.95). The remaining items
-buy headroom for concurrency and battery: a GEMM-grade rewrite of the
-k=7 DAC convs and tconvs (the pointwise ones are done), and the fast-AR
-is the dominant non-attention stream
-(3.73 GB/frame INT8 — its nine sequential re-reads outweigh the whole
-packed backbone), so the reserves there are narrowing its INT8 promotion
-to the sensitive tensors (down/v/out projections, ~half its weights) and
-kernel fusion.
+Every serving path runs at 0.75–0.76 and the DAC is no longer a factor;
+the frame is backbone-dominated. The one remaining structural lever is
+the fast-AR weight stream (3.73 GB/frame at INT8 — nine sequential
+re-reads outweigh the whole packed backbone): untrained 4-bit fails its
+argmax gate in every tensor subset (docs/QUANT.md), so the path is QAT
+self-distillation, in progress via `tools/qat_fastar.py`.
 - [x] voice-cloning encode — active with the full codec artifact
       (`tools/convert_codec_full.py`); reference wav → 21.5 Hz VQ codes →
       prompt injection, exercised end to end
