@@ -87,11 +87,13 @@ static s2p_status pb_text_speaker(s2p_tok* t, pb_buf* b, const char* body) {
 s2p_status s2p_prompt_build(s2p_tok* t, const s2p_config* cfg,
                             const s2p_request_text* req, int64_t** ids,
                             uint8_t** vq_mask, int* n_ids,
-                            s2p_vq_part** parts, int* n_parts) {
+                            s2p_vq_part** parts, int* n_parts,
+                            int* n_sys_ids) {
     (void)cfg;
     if (!t || !req || !req->text || !ids || !vq_mask || !n_ids || !parts ||
         !n_parts)
         return S2P_ERR_INVALID;
+    if (n_sys_ids) *n_sys_ids = 0;
     if (req->n_refs < 0 || (req->n_refs > 0 && !req->refs))
         return S2P_ERR_INVALID;
 
@@ -158,6 +160,10 @@ s2p_status s2p_prompt_build(s2p_tok* t, const s2p_config* cfg,
         }
         rc = pb_text(t, &b, "<|im_end|>\n");
         if (rc != S2P_OK) goto fail;
+        /* everything up to here is constant for a given voice reference —
+         * the KV-prefix-cacheable system block (tokenization of the user
+         * block is independent: <|im_start|> is a special token). */
+        if (n_sys_ids) *n_sys_ids = b.n;
     }
 
     /* user block */

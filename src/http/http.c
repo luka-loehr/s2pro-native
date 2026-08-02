@@ -307,7 +307,13 @@ static size_t sil_tail(const int16_t* p, size_t n) {
 }
 
 /* Feed chunk audio through the boundary filter: trim a later chunk's
- * leading silence, hold back the tail window, forward the rest. */
+ * leading silence, hold back the tail window, forward the rest.
+ *
+ * The tail holdback (for trailing-silence trim) applies to BUFFERED
+ * responses only: on a streamed response it would delay first audio by the
+ * window length, which is a real TTFA cost. Streamed joins therefore keep
+ * the model's trailing silence and get leading-trim + the inserted gap;
+ * buffered joins are fully normalized to exactly gap_ms. */
 static int gap_feed(conn* c, const int16_t* pcm, size_t n) {
     if (!c->gap_hold) return conn_emit(c, pcm, n); /* filter disabled */
     if (c->gap_lead_skip) {
@@ -321,6 +327,7 @@ static int gap_feed(conn* c, const int16_t* pcm, size_t n) {
             c->gap_lead_skip = 0;
         if (n == 0) return 0;
     }
+    if (!c->buffered) return conn_emit(c, pcm, n); /* no holdback on stream */
     while (n > 0) {
         size_t room = GAP_HOLD_SAMPLES - c->gap_hold_n;
         if (room == 0) {
@@ -346,9 +353,11 @@ static int gap_feed(conn* c, const int16_t* pcm, size_t n) {
  * chunk. */
 static int gap_boundary(conn* c) {
     if (!c->gap_hold) return 0;
-    size_t tail = sil_tail(c->gap_hold, c->gap_hold_n);
-    if (conn_emit(c, c->gap_hold, c->gap_hold_n - tail) != 0) return 1;
-    c->gap_hold_n = 0;
+    if (c->buffered) {
+        size_t tail = sil_tail(c->gap_hold, c->gap_hold_n);
+        if (conn_emit(c, c->gap_hold, c->gap_hold_n - tail) != 0) return 1;
+        c->gap_hold_n = 0;
+    }
     static const int16_t zeros[4410] = {0};
     size_t gap = (size_t)c->gap_ms * 44100 / 1000;
     while (gap > 0) {
@@ -429,6 +438,7 @@ static s2p_status submit_chunk(http_srv* s, conn* c) {
         req.refs = &c->lf_voice->part;
         req.n_refs = 1;
         req.ref_text = c->lf_voice->transcript;
+        req.cache_key = c->lf_voice->name;
     }
     s2p_sampling_cfg sampling = c->lf_sampling;
     if (sampling.seed != 0) {
@@ -758,6 +768,7 @@ static void route_tts(http_srv* s, conn* c) {
         req.refs = &named->part;
         req.n_refs = 1;
         req.ref_text = named->transcript;
+        req.cache_key = named->name;
     }
 
     c->wav = wav;

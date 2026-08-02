@@ -51,6 +51,18 @@ s2p_status s2p_session_create(s2p_model* m, const s2p_sampling_cfg* cfg,
 s2p_status s2p_session_prefill(s2p_session* s, const int64_t* ids,
                                const uint8_t* vq_mask, int n_ids,
                                const s2p_vq_part* parts, int n_parts);
+
+/* KV prefix caching (additive, 2026-08-02). A constant prompt prefix (the
+ * per-voice system block incl. VQ injection) is prefetched once and reused:
+ * save copies the first n_tokens of a prefilled session's KV into a caller
+ * device blob; load seeds a NEW session's KV from the blob, after which
+ * s2p_session_prefill continues at that offset with the remaining ids
+ * (attention, RoPE and the KV append are offset-native). Blob layout is the
+ * session KV's plane order at n_tokens depth; s2p_session_kv_bytes sizes it. */
+size_t     s2p_session_kv_bytes(const s2p_model* m, int n_tokens);
+s2p_status s2p_session_kv_save(s2p_session* s, int n_tokens, void* blob_dev);
+s2p_status s2p_session_kv_load(s2p_session* s, const void* blob_dev,
+                               int n_tokens);
 /* One frame: 10 codes out. *is_eos set when generation finished (the frame
  * containing EOS produces no codes). */
 s2p_status s2p_session_next_frame(s2p_session* s,
