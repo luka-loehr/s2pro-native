@@ -63,6 +63,15 @@ keyed on filesystem and container conditions, with log monitors on
 evaluation milestones and error signatures. Runs are therefore
 reproducible end-to-end from scripts rather than interactive sessions.
 
+One orchestration defect occurred and was repaired mid-run: the trainer
+container writes its exported patch as root with mode 0600, so the
+host-side stage guarding the warm-start copy failed silently and
+selected its cold-start fallback. The permission was corrected through a
+container, the copy re-established, and the post-corpus stages were
+replaced by a corrected orchestrator before training started — run 3
+therefore warm-starts as designed. Lesson recorded: stage guards must
+distinguish "file missing" from "file unreadable".
+
 ### 2.4 Thermal conditions
 
 Sustained mixed load (batch inference for corpus generation, then dense
