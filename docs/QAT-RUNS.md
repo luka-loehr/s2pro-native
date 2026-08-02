@@ -113,6 +113,24 @@ Run 2 closes at 75 % of the INT8 bar's free-run agreement (0.6690 vs
 0.8951); its artifact proceeds through the audio gate battery
 regardless, since the audibility threshold on this proxy is unknown.
 
+**Run-2 artifact, audio gates (all-INT4 deployment via
+`apply_qat_patch.py` + `S2P_INT4_ALL=1`):**
+
+- *HF envelope*, two 148 s takes on the held-out long text: no muffling
+  collapse. deeper-male rises 0.051 → 0.076 (first → last 10 s mean)
+  with content-driven variation; neutral-female flat 0.014 → 0.012.
+- *EOS probe*, 24 utterance pairs vs INT8: 0 flags; mean length 3.4 s
+  vs 3.4 s; both long takes terminate at 148 s, matching the INT8
+  reference length.
+- Wall RTF during these gates is not meaningful (corpus generation
+  shared the GPU by design); the clean measurement follows with the
+  final artifact.
+- Listening verdict: pending.
+
+The catastrophic failure mode of untrained INT4 (progressive muffling
+from ~10 s) is absent at 0.6690 agreement — the audio gates pass well
+below the INT8 bar on the proxy metric.
+
 ### 3.2 Run 3 (v2 corpus, warm start) — in progress
 
 Warm start from run 2's exported patch; holdout drawn only from v2
