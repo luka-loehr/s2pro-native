@@ -318,10 +318,10 @@ static s2p_status prepare_int4_group(s2p_linear* lin, cudaStream_t stream) {
     int64_t qshape[2] = { (int64_t)N, (int64_t)K };
     S2P_TRY(s2p_tensor_device_alloc(&lin->w_int8, S2P_DT_I8, 2, qshape));
     int64_t sshape[1] = { (int64_t)N * (K / G) };
-    s2p_status rc = s2p_tensor_device_alloc(&lin->w_iscale, S2P_DT_F32, 1,
+    s2p_status rc = s2p_tensor_device_alloc(&lin->w_iscale, S2P_DT_F16, 1,
                                             sshape);
     if (rc == S2P_OK)
-        rc = s2p_intq_quant(lin->w_int8.data, (float*)lin->w_iscale.data,
+        rc = s2p_intq_quant(lin->w_int8.data, lin->w_iscale.data,
                             lin->w_bf16.data, N, K, G, 7, int4_mse(), stream);
     if (rc == S2P_OK) {
         cudaError_t ce = cudaStreamSynchronize(stream);
@@ -429,12 +429,12 @@ s2p_status s2p_linear_forward(const s2p_linear* lin, const void* x_bf16,
         if (M <= S2P_INT8_GEMV_MAX_M) {
             if (lin->q_packed)
                 return s2p_int4p_gemv(y_bf16, x_bf16, lin->w_pack.data,
-                                      (const float*)lin->w_iscale.data, M, N,
-                                      K, lin->q_group, stream);
+                                      lin->w_iscale.data, M, N, K,
+                                      lin->q_group, stream);
             if (lin->q_group > 0)
                 return s2p_intq_gemv(y_bf16, x_bf16, lin->w_int8.data,
-                                     (const float*)lin->w_iscale.data, M, N,
-                                     K, lin->q_group, stream);
+                                     lin->w_iscale.data, M, N, K,
+                                     lin->q_group, stream);
             return s2p_int8_gemv(y_bf16, x_bf16, lin->w_int8.data,
                                  (const float*)lin->w_iscale.data, M, N, K,
                                  stream);
@@ -448,12 +448,12 @@ s2p_status s2p_linear_forward(const s2p_linear* lin, const void* x_bf16,
         if (rc == S2P_OK) {
             if (lin->q_packed)
                 rc = s2p_int4p_dequant(g.deq, lin->w_pack.data,
-                                       (const float*)lin->w_iscale.data, N,
-                                       K, lin->q_group, stream);
+                                       lin->w_iscale.data, N, K,
+                                       lin->q_group, stream);
             else if (lin->q_group > 0)
                 rc = s2p_intq_dequant(g.deq, lin->w_int8.data,
-                                      (const float*)lin->w_iscale.data, N,
-                                      K, lin->q_group, stream);
+                                      lin->w_iscale.data, N, K,
+                                      lin->q_group, stream);
             else
                 rc = s2p_int8_dequant(g.deq, lin->w_int8.data,
                                       (const float*)lin->w_iscale.data, N,

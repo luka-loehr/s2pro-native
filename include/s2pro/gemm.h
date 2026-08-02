@@ -50,7 +50,9 @@ typedef struct {
     s2p_tensor w_int8;        /* [out, in] int8, round-to-nearest (absent when
                                * q_packed — the packed nibbles replace it) */
     s2p_tensor w_iscale;      /* q_group==0: [out] f32 per-out-channel;
-                               * q_group>0:  [out, in/q_group] f32 group-wise */
+                               * q_group>0:  [out, in/q_group] f16 group-wise
+                               * (f16-exact by construction: the quantizer
+                               * rounds every scale candidate through f16) */
     s2p_tensor w_pack;        /* [out, in/2] packed nibbles (q_packed only) */
     int        int8_ready;
     int        q_group;       /* 0 = per-channel (INT8 path), else group size */
@@ -104,31 +106,33 @@ s2p_status s2p_int8_dequant(void* w_bf16, const void* w_i8,
                             const float* scales, int N, int K,
                             cudaStream_t stream);
 
-/* Group-wise low-bit primitives (INT4 value precision in the int8 container).
- * scales f32 [N, K/G]; G power of two, >= 16, dividing K. levels = 7 for
- * 4-bit symmetric (15 levels); mse != 0 grid-searches the per-group clip
- * range for min MSE instead of plain absmax RTN. */
-s2p_status s2p_intq_quant(void* w_i8, float* scales, const void* w_bf16,
+/* Group-wise low-bit primitives (4-bit weights). scales f16 [N, K/G]
+ * (passed as void* — C has no half type); G power of two, >= 16, dividing
+ * K. levels = 7 for 4-bit symmetric (15 levels); mse != 0 grid-searches
+ * the per-group clip range for min MSE instead of plain absmax RTN, with
+ * every candidate evaluated at its f16-rounded value. */
+s2p_status s2p_intq_quant(void* w_i8, void* scales_f16, const void* w_bf16,
                           int N, int K, int G, int levels, int mse,
                           cudaStream_t stream);
 s2p_status s2p_intq_gemv(void* y_bf16, const void* x_bf16, const void* w_i8,
-                         const float* scales, int M, int N, int K, int G,
+                         const void* scales_f16, int M, int N, int K, int G,
                          cudaStream_t stream);
 s2p_status s2p_intq_dequant(void* w_bf16, const void* w_i8,
-                            const float* scales, int N, int K, int G,
+                            const void* scales_f16, int N, int K, int G,
                             cudaStream_t stream);
 
 /* Packed 4-bit storage: two weights per byte (low nibble = even K index).
- * The packed GEMV/dequant read the SAME f32 group scales and accumulate in
+ * The packed GEMV/dequant read the SAME f16 group scales and accumulate in
  * the SAME op order as the int8-container kernels — outputs are
- * bit-identical; only the weight stream halves. */
+ * bit-identical between the two storages; the weight stream halves and the
+ * scale plane costs 16/G extra bits per weight (4.5 bpw at g32). */
 s2p_status s2p_int4_pack(void* w_pack, const void* w_i8, int N, int K,
                          cudaStream_t stream);
 s2p_status s2p_int4p_gemv(void* y_bf16, const void* x_bf16,
-                          const void* w_pack, const float* scales, int M,
+                          const void* w_pack, const void* scales_f16, int M,
                           int N, int K, int G, cudaStream_t stream);
 s2p_status s2p_int4p_dequant(void* w_bf16, const void* w_pack,
-                             const float* scales, int N, int K, int G,
+                             const void* scales_f16, int N, int K, int G,
                              cudaStream_t stream);
 
 #ifdef __cplusplus
