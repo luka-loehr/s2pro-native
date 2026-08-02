@@ -592,6 +592,40 @@ s2p_status s2p_model_batch_next_frame(s2p_model* m, s2p_session** sess, int n,
     const int64_t* toks = (const int64_t*)m->h_out;
     const int32_t* codes = (const int32_t*)((char*)m->h_out + m->out_off_codes);
     const uint8_t* eflag = (const uint8_t*)((char*)m->h_out + m->out_off_eos);
+    const int32_t* sems = (const int32_t*)((char*)m->h_out + m->out_off_sem);
+
+    /* S2P_DUMP_FRAMES=path: append per-frame fast-AR training records for
+     * the INT4 QAT self-distillation — [2560 bf16 final-normed hidden]
+     * [i32 sem][10 x i32 codes] per non-EOS frame (5164 B). The teacher
+     * trajectory is recomputed in torch from (hidden, sem); codes ride
+     * along for verification. Worker-thread only; sync above makes
+     * shidden/h_out coherent. */
+    {
+        static FILE* df = NULL;
+        static int checked = 0;
+        if (!checked) {
+            checked = 1;
+            const char* p = getenv("S2P_DUMP_FRAMES");
+            if (p && p[0]) df = fopen(p, "ab");
+        }
+        if (df) {
+            static uint16_t hrow[S2P_DIM];
+            for (int b = 0; b < nact; b++) {
+                if (eflag[b]) continue;
+                if (cudaMemcpy(hrow,
+                               (const uint16_t*)m->shidden.data +
+                                   (size_t)b * S2P_DIM,
+                               sizeof(hrow),
+                               cudaMemcpyDeviceToHost) != cudaSuccess)
+                    continue;
+                fwrite(hrow, sizeof(hrow), 1, df);
+                fwrite(&sems[b], sizeof(int32_t), 1, df);
+                fwrite(codes + (size_t)b * S2P_NUM_CODEBOOKS,
+                       sizeof(int32_t), S2P_NUM_CODEBOOKS, df);
+            }
+            fflush(df);
+        }
+    }
 
     /* harvest */
     for (int b = 0; b < nact; b++) {
