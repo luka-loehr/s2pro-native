@@ -93,13 +93,16 @@ Held-out agreement (teacher-forced / free-run):
 | step 500 | 0.7918 | 0.5556 |
 | step 1000 | 0.8196 | 0.6029 |
 | step 1500 (DAgger active) | 0.8414 | 0.6380 |
-| step 2000 (final) | pending | pending |
+| step 2000 (final) | 0.8609 | 0.6690 |
 
-The per-interval gain decays (+10.1, +4.7, +3.5 points free-run per 500
-steps) while the trainer accumulates epochs over the 52 k-frame training
-split — the signature of a data ceiling rather than a schedule ceiling.
-This motivated run 3's design: grow the corpus ~4.5× and continue from
-run 2's weights instead of extending run 2's schedule.
+The per-interval gain decays (+10.1, +4.7, +3.5, +3.1 points free-run
+per 500 steps) while the trainer accumulates epochs over the 52 k-frame
+training split — the signature of a data ceiling rather than a schedule
+ceiling. This motivated run 3's design: grow the corpus ~4.5× and
+continue from run 2's weights instead of extending run 2's schedule.
+Run 2 closes at 75 % of the INT8 bar's free-run agreement (0.6690 vs
+0.8951); its artifact proceeds through the audio gate battery
+regardless, since the audibility threshold on this proxy is unknown.
 
 ### 3.2 Run 3 (v2 corpus, warm start) — in progress
 
