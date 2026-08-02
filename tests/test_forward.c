@@ -259,6 +259,11 @@ int main(int argc, char** argv) {
     float*  pcm = NULL;
     int64_t n_samples = 0;
     CHECK(s2p_dac_decode(dac, codes, T, &pcm, &n_samples, 0), "dac decode");
+    {
+        /* S2P_DAC_PROF=1: per-conv-kernel-type GPU time totals */
+        extern void s2pdk_prof_dump(void);
+        s2pdk_prof_dump();
+    }
     double dac_ms = now_ms() - t0;
 
     /* Diagnostic: S2P_TEST_STREAM_WAV=path additionally decodes the SAME
