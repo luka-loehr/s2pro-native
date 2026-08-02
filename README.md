@@ -31,17 +31,19 @@ INT8 decode is **below the 46.4 ms frame budget**: sustained generation
 after prefill runs at RTF 0.86 before vocoding. End-to-end streamed serving
 (bit-exact incremental DAC, pipelined and batched on its own CUDA stream,
 split-K decode attention, device-side sampling, CUDA-graph replay of the
-whole decode tick) measures wall RTF 1.10–1.19 today — down from 2.05 —
-with TTFA 0.48 s zero-shot / 1.77 s behind a 51 s voice reference; the
-[roadmap](#roadmap-to-rtf--1) holds the remaining arithmetic to below
-realtime.
+whole decode tick, packed 4-bit backbone) measures wall RTF **0.95**
+zero-shot / 1.03–1.05 behind a 51 s voice reference — down from 2.05 —
+with TTFA 0.18 s zero-shot / 1.58 s with the reference block; the
+[roadmap](#roadmap-to-rtf--1) holds the remaining arithmetic for the
+voice-referenced path.
 
-> **Status: functional pre-release.** BF16 and INT8 pass the layer-parity
-> gate against the PyTorch reference; voice cloning, the multilingual voice
-> registry, and the HTTP streaming server are exercised end to end on real
-> hardware (TTFA ~1.1 s zero-shot / ~2.5 s with a 50 s reference block).
-> End-to-end single-stream synthesis is not yet below realtime. There is no
-> published release line yet; deploy from a reviewed, pinned `main` commit.
+> **Status: functional pre-release.** BF16, INT8, and the packed
+> group-wise INT4 backbone pass the layer-parity gate against the PyTorch
+> reference; voice cloning, the multilingual voice registry, and the HTTP
+> streaming server are exercised end to end on real hardware. Zero-shot
+> single-stream synthesis runs below realtime (wall RTF 0.95);
+> voice-referenced serving is at 1.03–1.05. There is no published release
+> line yet; deploy from a reviewed, pinned `main` commit.
 
 ## What this project provides
 
@@ -214,13 +216,21 @@ group-wise 4-bit weights: symmetric quantization with one f32 scale per
 (`S2P_INT4_MSE`, default on), stored PACKED two weights per byte
 (`S2P_INT4_PACKED=0` keeps the int8 container for A/B — outputs are
 bit-identical either way, proven by exactly equal parity metrics and
-byte-identical server WAVs at fixed seed). The fast-AR — run nine times
-per frame and empirically the tensor 4-bit damages most (group-wise g32
-still collapses it to argmax 2/9) — and the tied lm-head stay
-per-channel INT8. Measured on the GB10 server: zero-shot wall RTF 1.10 →
-**0.97**, 51 s-reference wall RTF 1.19 → 1.08 (104 s takes: 1.20 →
-1.05), TTFA unchanged (0.17 s zero-shot / 1.58 s with the reference
-block), backbone weight memory 3.63 GB int8 → 2.27 GB packed+scales.
+byte-identical server WAVs at fixed seed). Scales store as f16 — 4.5
+bits per weight all-in — and the quantizer rounds every scale candidate
+through f16 before evaluating it, so the stored half is exactly the
+value the MSE search optimized. The fast-AR — run nine times per frame
+and empirically the tensor 4-bit damages most (group-wise g32 still
+collapses it to argmax 2/9) — and the tied lm-head stay per-channel
+INT8. Measured on the GB10 server: zero-shot wall RTF 1.10 → **0.95**,
+51 s-reference wall RTF 1.19 → 1.05 (104 s takes: 1.20 → 1.03), TTFA
+unchanged (0.18 s zero-shot / 1.58 s with the reference block), backbone
+weight memory 3.63 GB int8 → 2.04 GB packed nibbles + f16 scales.
+Termination behavior is probed separately (low-bit mis-sampling
+concentrates on low-entropy tokens, where end-of-audio lives, and an
+envelope metric cannot see it): 24 utterance pairs INT4 vs INT8 show
+length ratios 0.88–1.23 with zero runaway or premature-EOS flags, and
+the 104 s takes terminate at the identical frame as INT8.
 Naive per-channel INT4 audibly muffled from ~10 s of generation onward
 (autoregressive compounding of per-step weight noise); the group-wise
 mixed scheme restores INT8-class discrete decisions (prefill/step-1
@@ -256,10 +266,11 @@ the memory system, not as a viable quality path.
       wall RTF 2.05 → 1.25 (51 s voice reference), 1.16 zero-shot
 - [x] split-K flash-decode attention — long-context decode 46.9 → 42.7
       ms/frame
-- [x] packed 4-bit backbone kernels — two weights per byte, bit-identical
-      outputs (equal parity JSON, byte-identical WAVs); zero-shot wall
-      RTF 1.10 → **0.97**, first sub-realtime serving on a
-      quality-passing path; 51 s-reference RTF 1.19 → 1.08
+- [x] packed 4-bit backbone kernels + f16 group scales (4.5 bpw) — two
+      weights per byte, bit-identical outputs (equal parity JSON,
+      byte-identical WAVs); zero-shot wall RTF 1.10 → **0.95**, first
+      sub-realtime serving on a quality-passing path; 51 s-reference
+      RTF 1.19 → 1.05
 - [x] group-wise INT4 weights (`S2P_INT4=1`) — g32 + MSE clip search +
       INT8 fast-AR/lm-head; INT8-class parity decisions, stable 104 s HF
       envelope (naive per-channel INT4 muffled from ~10 s; fast-AR stays
@@ -271,14 +282,16 @@ the memory system, not as a viable quality path.
       ([benchmarks/parity](benchmarks/parity/README.md))
 
 Zero-shot serving is below realtime as of the packed 4-bit backbone
-(wall RTF 0.97). With a long voice reference the wall RTF is 1.05–1.08 —
+(wall RTF 0.95). With a long voice reference the wall RTF is 1.03–1.05 —
 the extra cost is attention over the ~1100-frame reference KV plus the
 DAC. The remaining distance there is arithmetic, not hope: tiling the
 DAC convs removes ~5 ms/frame of k-fold global re-reads without touching
 the accumulation order, and the reference-block KV-prefix cache removes
-the reference prefill from TTFA; fast-AR kernel fusion (its nine
-sequential micro-steps now dominate the non-attention decode stream at
-3.73 GB/frame INT8) is the reserve beyond that.
+the reference prefill from TTFA. The fast-AR is now the dominant
+non-attention stream (3.73 GB/frame INT8 — its nine sequential re-reads
+outweigh the whole packed backbone): the reserves there are narrowing
+its INT8 promotion to the sensitive tensors (down/v/out projections,
+~half its weights) and kernel fusion.
 - [x] voice-cloning encode — active with the full codec artifact
       (`tools/convert_codec_full.py`); reference wav → 21.5 Hz VQ codes →
       prompt injection, exercised end to end
