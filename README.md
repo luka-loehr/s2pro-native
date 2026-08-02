@@ -209,20 +209,23 @@ embedding lookups). Process peak memory drops from ~12 GB to ~8.5 GB
 (delta of system used memory across the run, single session, ctx 4096).
 
 `S2P_INT4=1` (on top of `S2P_INT8=1`) switches the backbone linears to
-4-bit VALUE precision: group-wise symmetric quantization (one f32 scale
-per `S2P_INT4_GROUP` K-elements, default 32) with a per-group MSE clip
-search (`S2P_INT4_MSE`, default on), while the fast-AR — run nine times
-per frame and empirically the tensor 4-bit damages most — and the tied
-lm-head stay per-channel INT8. Values still occupy the int8 container, so
-the audio is exactly what a packed-INT4 deployment would produce while
-memory and bandwidth stay INT8-class (peak ~9.2 GB: the INT8 footprint
-plus f32 group scales); the bandwidth win arrives with packed kernels
-(roadmap). Naive per-channel INT4 audibly muffled from ~10 s of
-generation onward (autoregressive compounding of per-step weight noise);
-the group-wise mixed scheme restores INT8-class discrete decisions
-(prefill/step-1 argmax, fast-AR 8/9) and holds a stable HF envelope over
-104 s takes — details in
-[benchmarks/parity](benchmarks/parity/README.md).
+group-wise 4-bit weights: symmetric quantization with one f32 scale per
+`S2P_INT4_GROUP` K-elements (default 32) and a per-group MSE clip search
+(`S2P_INT4_MSE`, default on), stored PACKED two weights per byte
+(`S2P_INT4_PACKED=0` keeps the int8 container for A/B — outputs are
+bit-identical either way, proven by exactly equal parity metrics and
+byte-identical server WAVs at fixed seed). The fast-AR — run nine times
+per frame and empirically the tensor 4-bit damages most (group-wise g32
+still collapses it to argmax 2/9) — and the tied lm-head stay
+per-channel INT8. Measured on the GB10 server: zero-shot wall RTF 1.10 →
+**0.97**, 51 s-reference wall RTF 1.19 → 1.08 (104 s takes: 1.20 →
+1.05), TTFA unchanged (0.17 s zero-shot / 1.58 s with the reference
+block), backbone weight memory 3.63 GB int8 → 2.27 GB packed+scales.
+Naive per-channel INT4 audibly muffled from ~10 s of generation onward
+(autoregressive compounding of per-step weight noise); the group-wise
+mixed scheme restores INT8-class discrete decisions (prefill/step-1
+argmax, fast-AR 8/9) and holds a stable HF envelope over 104 s takes —
+details in [benchmarks/parity](benchmarks/parity/README.md).
 
 Numeric fidelity is gated by the layer-parity protocol
 ([benchmarks/parity](benchmarks/parity/README.md)): the BF16 path matches
@@ -253,26 +256,29 @@ the memory system, not as a viable quality path.
       wall RTF 2.05 → 1.25 (51 s voice reference), 1.16 zero-shot
 - [x] split-K flash-decode attention — long-context decode 46.9 → 42.7
       ms/frame
-- [ ] packed 4-bit kernels — two weights per byte on the validated
-      group-wise INT4 scheme halves the weight stream again (backbone
-      bandwidth floor ~35 → ~18 ms/frame, weights ~4.5 → ~2.4 GB);
-      value-precision quality is already proven in the int8 container
-- [x] group-wise INT4 value precision (`S2P_INT4=1`) — g32 + MSE clip
-      search + INT8 fast-AR/lm-head; INT8-class parity decisions, stable
-      104 s HF envelope (naive per-channel INT4 muffled from ~10 s)
+- [x] packed 4-bit backbone kernels — two weights per byte, bit-identical
+      outputs (equal parity JSON, byte-identical WAVs); zero-shot wall
+      RTF 1.10 → **0.97**, first sub-realtime serving on a
+      quality-passing path; 51 s-reference RTF 1.19 → 1.08
+- [x] group-wise INT4 weights (`S2P_INT4=1`) — g32 + MSE clip search +
+      INT8 fast-AR/lm-head; INT8-class parity decisions, stable 104 s HF
+      envelope (naive per-channel INT4 muffled from ~10 s; fast-AR stays
+      INT8 — even group-wise 4-bit collapses it to argmax 2/9)
 - [x] INT8 per-channel weight-only GEMV — decode 93.3 → 39.7 ms/frame,
       process memory ~19 → ~8.5 GB, parity **PASS**
 - [x] layer-parity validation against the PyTorch reference — BF16 **PASS**,
       INT8 **PASS**, FP8 **FAIL**
       ([benchmarks/parity](benchmarks/parity/README.md))
 
-The remaining distance to sustained sub-realtime is arithmetic, not hope:
-long-context backbone 39.6 ms + batched DAC ~10 ms GPU per 46.4 ms frame
-today (the two streams share SMs, so DAC GPU time adds to the frame
-regardless of overlap). Tiling the DAC convs is the step that crosses 1:
-~5 ms of their GPU time is k-fold re-reads the shared-memory tile removes
-without touching the accumulation order — landing the sum at ~45 ms
-(RTF ≈ 0.96), with fast-AR kernel fusion as the reserve beyond that.
+Zero-shot serving is below realtime as of the packed 4-bit backbone
+(wall RTF 0.97). With a long voice reference the wall RTF is 1.05–1.08 —
+the extra cost is attention over the ~1100-frame reference KV plus the
+DAC. The remaining distance there is arithmetic, not hope: tiling the
+DAC convs removes ~5 ms/frame of k-fold global re-reads without touching
+the accumulation order, and the reference-block KV-prefix cache removes
+the reference prefill from TTFA; fast-AR kernel fusion (its nine
+sequential micro-steps now dominate the non-attention decode stream at
+3.73 GB/frame INT8) is the reserve beyond that.
 - [x] voice-cloning encode — active with the full codec artifact
       (`tools/convert_codec_full.py`); reference wav → 21.5 Hz VQ codes →
       prompt injection, exercised end to end
