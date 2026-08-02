@@ -129,3 +129,43 @@ the ear can detect. Method (`tools/qat_fastar.py`):
 
 Gate chain for the QAT artifact: held-out agreement vs the INT8 bar →
 HF-envelope stability on long takes → EOS probe → listening sign-off.
+
+### Training runs
+
+- **Run 1** (aborted): unchunked candidate search made the fake quantizer
+  ~6 s/step; killed after the first eval. The chunked 8-candidate search
+  (identical first-minimum tie order, verified by exact reproduction of
+  the pre-QAT eval) and a no-grad quantized-weight cache in `FQLinear`
+  (a DAgger rollout would otherwise re-quantize every tensor nine times)
+  brought non-DAgger steps to interactive speed. DAgger steps stay
+  ~4× more expensive — the 9-step greedy rollout is inherent.
+- **Run 2**: 2000 steps, batch 256, lr 3e-5 cosine, DAgger second half,
+  corpus 60,222 frames (360 takes: 10 texts × 12 voices × 3 seeds).
+  Free-run agreement 0.4550 → 0.5556 (step 500) → 0.6029 (step 1000);
+  the flattening (+10.1, then +4.7 per 500 steps) motivated the
+  overnight protocol instead of blindly extending the schedule.
+
+### Overnight protocol (corpus v2 + warm-started long run)
+
+Two levers, applied together because per-step gains were flattening
+while epochs over the 52k-frame training split were piling up:
+
+1. **Corpus v2** (`tools/qat_corpus.py`): grow the dump from 60k toward
+   ~270k frames — all 33 registry voices, 22 texts across the seven
+   languages, ~30 % long-form (three ~80 s multilingual passages), 590
+   sampled (voice, text, seed) combos. The dump hook opens its file in
+   append mode, so the v1 frames stay valid as a prefix and the cached
+   teacher trajectories are reused; only the tail is recomputed.
+   The two demo texts used for final listening takes are deliberately
+   excluded from v2 so the deliverables are not generated from training
+   material (the v1 corpus did contain the short Sprachentag text —
+   recorded here for honesty; the long demo text was never trained on).
+2. **Warm-started long run**: `--init` continues from run 2's weights
+   instead of restarting; `--holdout-from` draws the held-out set only
+   from frames the init run never saw, keeping the eval honest. Best-by-
+   holdout and last checkpoints are written at every eval interval, so
+   the run can be cut at a wall-clock deadline (07:00 cutoff policy)
+   and still yield its best artifact. Cosine floor `--lr-min 1e-6`,
+   DAgger from 35 % of the schedule.
+
+Results: recorded after the run completes.
