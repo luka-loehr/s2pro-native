@@ -47,11 +47,14 @@ typedef struct {
     s2p_tensor w_scales;      /* int32-packed UE8M0 sfb, sm_120/121 layout */
     int        fp8_ready;
     /* INT8/INT4 sidecar (present when int8_ready): */
-    s2p_tensor w_int8;        /* [out, in] int8, round-to-nearest */
+    s2p_tensor w_int8;        /* [out, in] int8, round-to-nearest (absent when
+                               * q_packed — the packed nibbles replace it) */
     s2p_tensor w_iscale;      /* q_group==0: [out] f32 per-out-channel;
                                * q_group>0:  [out, in/q_group] f32 group-wise */
+    s2p_tensor w_pack;        /* [out, in/2] packed nibbles (q_packed only) */
     int        int8_ready;
     int        q_group;       /* 0 = per-channel (INT8 path), else group size */
+    int        q_packed;      /* 1 = two 4-bit weights per byte in w_pack */
 } s2p_linear;
 
 /* Which module a linear belongs to; drives the mixed-precision policy under
@@ -114,6 +117,19 @@ s2p_status s2p_intq_gemv(void* y_bf16, const void* x_bf16, const void* w_i8,
 s2p_status s2p_intq_dequant(void* w_bf16, const void* w_i8,
                             const float* scales, int N, int K, int G,
                             cudaStream_t stream);
+
+/* Packed 4-bit storage: two weights per byte (low nibble = even K index).
+ * The packed GEMV/dequant read the SAME f32 group scales and accumulate in
+ * the SAME op order as the int8-container kernels — outputs are
+ * bit-identical; only the weight stream halves. */
+s2p_status s2p_int4_pack(void* w_pack, const void* w_i8, int N, int K,
+                         cudaStream_t stream);
+s2p_status s2p_int4p_gemv(void* y_bf16, const void* x_bf16,
+                          const void* w_pack, const float* scales, int M,
+                          int N, int K, int G, cudaStream_t stream);
+s2p_status s2p_int4p_dequant(void* w_bf16, const void* w_pack,
+                             const float* scales, int N, int K, int G,
+                             cudaStream_t stream);
 
 #ifdef __cplusplus
 }
