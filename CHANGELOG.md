@@ -1,6 +1,8 @@
 # Changelog
 
-All notable changes to s2pro-native are documented in this file.
+All notable changes to s2pro-native are documented in this file. Entries
+state their measurement conditions inline; the technical reports under
+`docs/` own the full evidence.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
@@ -238,8 +240,9 @@ for published releases.
 
 ### Known gaps
 
-- Single-stream decode is above realtime (BF16 RTF 2.38); the path below
-  1.0 is tracked in the README roadmap, with INT8 per-channel weight-only
-  GEMV as the primary 8-bit candidate after the FP8 parity failure.
-- Encoder output has no oracle-fixture parity comparison yet (judged by
-  cloning fidelity by ear so far).
+- The all-INT4 configuration (`S2P_INT4_ALL=1`) requires a QAT-patched
+  checkpoint; training runs are in progress
+  ([docs/QAT-RUNS.md](docs/QAT-RUNS.md)). Without it, the fast-AR and
+  tied lm-head stay per-channel INT8 (measured necessity, not caution).
+- Encoder output has no oracle-fixture parity comparison yet (validated
+  through cloning fidelity in listening so far).

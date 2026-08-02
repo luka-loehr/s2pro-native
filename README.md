@@ -5,90 +5,80 @@
 [![Target](https://img.shields.io/badge/target-sm__121%20(DGX%20Spark%20GB10)-1f6feb?style=flat)](docs/SPARK.md)
 [![License](https://img.shields.io/badge/License-Apache--2.0-blue?style=flat)](LICENSE)
 
-Native C and CUDA inference for
-[Fish Audio S2-Pro](https://huggingface.co/fishaudio/s2-pro) (OpenAudio S2),
-designed and qualified for NVIDIA DGX Spark.
+Native C11 + CUDA inference for
+[Fish Audio S2-Pro](https://huggingface.co/fishaudio/s2-pro)
+(OpenAudio S2), designed and qualified for the NVIDIA DGX Spark.
 
-The project turns text into progressive 44.1 kHz mono PCM. The complete
-inference path—prompt preparation, the 36-layer slow-AR backbone, the
-4-layer fast-AR residual decoder, the DAC vocoder, scheduling, and HTTP
-delivery—runs in native C and CUDA. Python, PyTorch, SGLang, and vLLM are
-not part of the runtime.
+I built the complete inference path — prompt preparation, the 36-layer
+slow-AR backbone, the 4-layer fast-AR residual decoder, the DAC vocoder,
+scheduling, and HTTP delivery — in native C and CUDA. Python, PyTorch,
+SGLang, and vLLM are not part of the runtime. Every numerical stage is
+validated against a pure-PyTorch oracle (layer parity), every
+optimization is gated on measured evidence, and rejected approaches are
+documented with the same rigor as the ones that shipped.
 
-## At a glance
+## 1. Results
 
-Measured on one DGX Spark (GB10, `sm_121`), single stream, 67-token prompt,
-60 frames, sampled (temp 0.8, seed 3; details in
-[Performance](#performance)):
+Measured on one DGX Spark (GB10, `sm_121`), single stream, streamed
+serving over HTTP, sampled (temperature 0.8, top-p 0.8, fixed seed). RTF
+is compute ÷ audio; below 1.0 means synthesis outruns playback.
 
-|  | BF16 cuBLAS (default) | INT8 weight-only (`S2P_INT8=1`) |
+| serving path | wall RTF | TTFA |
 | --- | ---: | ---: |
-| Decode per frame (46.4 ms of audio) | 93.3 ms | **39.7 ms** |
-| RTF (compute ÷ audio, lower is better) | 2.41 | **1.27** |
-| Weight + runtime memory | ~12 GB | **~8.5 GB** |
+| zero-shot | **0.76** | 0.15 s |
+| 60 s voice reference (warm voice cache) | **0.76** | 0.21 s |
+| ~147 s chunked long-form | **0.75** | 0.21 s |
 
-INT8 decode is **below the 46.4 ms frame budget**: sustained generation
-after prefill runs at RTF 0.86 before vocoding. End-to-end serving
-(bit-exact incremental DAC, pipelined and batched on its own CUDA stream,
-split-K decode attention, device-side sampling, CUDA-graph replay of the
-whole decode tick, packed 4-bit backbone, reference-block KV-prefix
-cache, GEMM-grade DAC conv kernels) is **below realtime on every path**
-— down from wall RTF 2.05: **0.76** zero-shot, **0.76** with a 60 s
-voice reference, **0.75** on ~147 s chunked long-form takes; TTFA 0.15 s
-zero-shot / 0.21 s with a warm voice cache. The full engineering record
-lives in [docs/QUANT.md](docs/QUANT.md) (the quantization ladder,
-including measured negative results) and
-[docs/DAC-KERNELS.md](docs/DAC-KERNELS.md) (the vocoder kernel work,
-15.1 → 2.1 ms/frame bit-identical).
+Starting point of the same stack: wall RTF 2.05. The complete measured
+path from 2.05 to 0.75 — including the negative results — is recorded in
+the technical reports (§7).
 
 > **Status: functional pre-release.** BF16, INT8, and the packed
 > group-wise INT4 backbone pass the layer-parity gate against the PyTorch
 > reference; voice cloning, the multilingual voice registry, and the HTTP
-> streaming server are exercised end to end on real hardware.
-> Single-stream synthesis runs below realtime on every serving path
-> (wall RTF 0.75–0.76, zero-shot and voice-referenced, short and
-> long-form). There is no published release line yet; deploy from a
-> reviewed, pinned `main` commit.
+> streaming server are exercised end to end on real hardware. There is no
+> published release line yet; deploy from a reviewed, pinned `main`
+> commit.
 
-## What this project provides
+## 2. System
 
 - Native S2-Pro Dual-AR inference with custom CUDA kernels and cuBLAS
   execution on real `sm_121` SASS.
-- An FP8 block-scale GEMM path through
-  [fish-scales-ops](https://github.com/fishaudio/fish-scales-ops), weights
-  quantized once at load, verified numerically on this GPU (cos 0.9993 vs
-  BF16).
-- Incremental frame generation and streaming vocoder decode without a Python
-  or framework sidecar.
-- A byte-level BPE tokenizer that is bit-exact against the HF `tokenizers`
-  reference on a 4,000-case fuzz, and a hand-written ChatML prompt builder
-  with VQ-part injection.
+- Weight-precision ladder under a strict quality gate: per-channel INT8
+  (the workhorse), packed group-wise INT4 backbone (4.5 bits per weight),
+  an FP8 path kept for measurement after failing parity, and QAT
+  self-distillation toward all-INT4 in progress
+  ([docs/QUANT.md](docs/QUANT.md), [docs/QAT-RUNS.md](docs/QAT-RUNS.md)).
+- Bit-exact incremental streaming vocoder — streamed PCM equals the
+  whole-buffer decode bit for bit — with GEMM-grade convolution kernels
+  ([docs/DAC-KERNELS.md](docs/DAC-KERNELS.md)).
+- A byte-level BPE tokenizer that is bit-exact against the HF
+  `tokenizers` reference on a 4,000-case fuzz, and a hand-written ChatML
+  prompt builder with VQ-part injection.
 - One shared engine with lockstep-batched sessions, first-frame priority,
-  cancellation, and graceful shutdown.
+  cancellation, graceful shutdown, CUDA-graph replay of the decode tick,
+  and device-side sampling.
 - A multilingual named-voice registry (drop `<name>.wav` + `<name>.txt`
   into `voices/`) plus per-request cloning over HTTP
-  ([docs/VOICES.md](docs/VOICES.md)). Reference audio is generated per
-  deployment rather than committed — one command produces any or all 30
-  multilingual voices ([`tools/voicegen`](tools/voicegen/README.md)).
-- Frozen module contracts (`include/s2pro/`) that let independent
-  contributors build against stable interfaces ([CONTRACT.md](CONTRACT.md)).
+  ([docs/VOICES.md](docs/VOICES.md)); reference audio is generated per
+  deployment by [`tools/voicegen`](tools/voicegen/README.md), not
+  committed.
+- Frozen module contracts (`include/s2pro/`) that allowed the five module
+  tracks to be built in parallel and keep the codebase auditable
+  ([CONTRACT.md](CONTRACT.md)).
 
-The project intentionally targets **S2-Pro only**. It does not include
-S2.1-Pro (API-only, no public weights), S1, or any model framework in the
-runtime. Voice cloning (encode + prompt injection) is active with the full
-codec artifact and drives the named-voice registry.
+The project intentionally targets S2-Pro only — no S2.1-Pro (API-only, no
+public weights), no S1, no model framework in the runtime.
 
-## Supported languages and audio
+### Supported languages and audio
 
 S2-Pro is multilingual (80+ languages) with inline free-form `[bracket]`
 prosody and emotion control; language coverage and control quality are
-properties of the upstream checkpoint, not re-qualified per language here.
+properties of the upstream checkpoint and are not re-qualified per
+language here. Audio is emitted as 44,100 Hz mono signed 16-bit
+little-endian PCM; each codec frame represents 2,048 samples (~46.4 ms).
 
-Audio is emitted as 44,100 Hz, mono, signed 16-bit little-endian PCM. Each
-codec frame represents 2,048 samples, or ~46.4 ms; streaming delivery uses
-overlapping vocoder windows with crossfade.
-
-## Architecture
+## 3. Architecture
 
 ```text
 HTTP client
@@ -99,7 +89,7 @@ native C HTTP server (validation, auth, chunked streaming, cancellation)
     v
 lockstep scheduler (sessions, first-frame priority, backpressure)
     |
-    +--> slow-AR backbone, 36L d2560 GQA 32/8 + qk-norm (CUDA/cuBLAS/FP8)
+    +--> slow-AR backbone, 36L d2560 GQA 32/8 + qk-norm (CUDA/cuBLAS)
     |          |
     |          `-- one semantic token per frame (two-softmax sampling)
     |
@@ -107,7 +97,7 @@ lockstep scheduler (sessions, first-frame priority, backpressure)
     |          |
     |          `-- 10 RVQ codes per frame
     |
-    `--> DAC / Firefly-GAN vocoder (CUDA)
+    `--> DAC / Firefly-GAN vocoder (CUDA, bit-exact incremental)
                |
                `-- progressive 44.1 kHz PCM
 ```
@@ -115,29 +105,26 @@ lockstep scheduler (sessions, first-frame priority, backpressure)
 | Path | Contents |
 | --- | --- |
 | `src/core` | Arena JSON parser, safetensors mmap loader (single + sharded), tensors, config, WAV. |
-| `src/slowar` | Shared CUDA primitives, 36-layer backbone, KV cache, lockstep batch decode, reference-exact sampling. |
+| `src/slowar` | Shared CUDA primitives, 36-layer backbone, KV cache + KV-prefix cache, lockstep batch decode, reference-exact sampling. |
 | `src/fastar` | 4-layer residual decoder: untied head, no qk-norm, KV depth 11. |
-| `src/text` | Byte-level BPE tokenizer and ChatML prompt builder. |
-| `src/dac` | RVQ `from_indices`, causal/dilated conv stacks, snake activations, streaming crossfade. |
-| `src/sched`, `src/http` | Scheduler and dependency-free HTTP/1.1 server. |
-| `src/voice` | Named-voice registry: `<name>.wav` + `<name>.txt` pairs, DAC-encoded once at startup ([docs/VOICES.md](docs/VOICES.md)). |
+| `src/text` | Byte-level BPE tokenizer, ChatML prompt builder, sentence chunker. |
+| `src/dac` | RVQ `from_indices`, causal/dilated conv stacks, snake activations, bit-exact incremental streaming, encoder. |
+| `src/sched`, `src/http` | Scheduler, INT8/INT4 GEMV kernels, dependency-free HTTP/1.1 server. |
+| `src/voice` | Named-voice registry, DAC-encoded once at startup ([docs/VOICES.md](docs/VOICES.md)). |
 | `src/fso` | The single C++ TU: extern-C shim over the fish-scales-ops FP8 GEMM. |
-| `docs` | Porting spec (`PORTING.md`), Spark build guide (`SPARK.md`). |
-| `scripts` | Checkpoint fetch, fish-scales-ops object build. |
-| `tools/voicegen` | Offline Rust generator for the reference voices (Gemini TTS on Vertex AI, 24 → 44.1 kHz resample, transcript verification). Not part of the runtime. |
-| Root community files | Contribution, security, conduct, changelog, citation, and Apache-2.0 license policies. |
+| `tools` | Offline tooling: codec conversion, parity fixtures, QAT trainer + corpus + patcher, voice generator (Rust). Never part of the runtime. |
 
-## Quickstart
+## 4. Quickstart
 
 Requires Docker with the NVIDIA runtime on an `sm_121` machine; the host
-needs no CUDA toolkit, Python, or PyTorch. See [docs/SPARK.md](docs/SPARK.md)
-for the full walkthrough.
+needs no CUDA toolkit, Python, or PyTorch. Full walkthrough:
+[docs/SPARK.md](docs/SPARK.md).
 
 ```bash
 # 1. checkpoint (Fish Audio Research License — not distributed here)
 scripts/fetch_model.sh model
 
-# 2. fish-scales-ops objects for the FP8 path (one-time)
+# 2. fish-scales-ops objects (one-time)
 docker run --rm -v "$PWD":/work -w /work nvidia/cuda:13.0.3-devel-ubuntu24.04 \
     bash -c "ARCH=121a FSO_DIR=/work/3rdparty/fish-scales-ops FSO_OUT=/work/3rdparty/build scripts/build_fso.sh"
 
@@ -155,7 +142,7 @@ docker run --rm --gpus all -v "$PWD":/work -w /work -v "$PWD/model":/model:ro \
 curl -X POST localhost:8010/v1/tts -d '{"text":"Hello.","format":"wav"}' -o hello.wav
 ```
 
-## HTTP API
+## 5. HTTP API
 
 | Method and path | Purpose |
 | --- | --- |
@@ -163,182 +150,132 @@ curl -X POST localhost:8010/v1/tts -d '{"text":"Hello.","format":"wav"}' -o hell
 | `GET /v1/voices` | Named-voice registry listing. |
 | `POST /v1/tts` | Chunked streaming synthesis (WAV or raw PCM). |
 
-`POST /v1/tts` accepts `{"text": "…", "format": "wav"|"pcm", "temperature",
-"top_p", "seed", "stream", "chunk_length", "voice", "reference_audio_b64",
-"reference_text"}` and, when the server is started with `--token`, requires
-`Authorization: Bearer <token>`. Voiced requests are served as a
-long-form chain: the text splits at sentence boundaries into chunks that
-close after `chunk_sentences` sentences (default 2, env
-`S2P_CHUNK_SENTENCES`; `0` = byte limit only) or `chunk_length` bytes
-(default 300, env `S2P_CHUNK_BYTES`; `0` disables chunking), whichever
-comes first, and each chunk generates against the fresh voice reference,
-all audio in one response. Chunk joins are normalized: boundary silence is
-trimmed on both sides and replaced by exactly `chunk_gap_ms` of silence
-(default 1000, env `S2P_CHUNK_GAP_MS`; `0` = raw concatenation) — the
-model's own sentence pauses inside a chunk are untouched, only the
-stitched joins get a deterministic, runtime-tunable pause. Measured reason: single-shot prosody flattens — punctuation
-pauses per 10 s bucket decay from ~0.5–1.0 s early to ~0–0.2 s after
-~40 s at every weight precision — while chunked generation holds the
-opening-quality prosody across the whole take (2–5 pauses per bucket
-through 130+ s; the same text runs ~26 % longer because the rushing is
-gone). Zero-shot requests never chunk (each chunk would draw a new
-voice). `voice` selects a pre-encoded registry
-voice; `reference_audio_b64` + `reference_text` clone a per-request wav
-(max 15 s) on the fly; neither selects zero-shot. Mixed-language text is
-ONE generation — voices are multilingual by construction
-([docs/VOICES.md](docs/VOICES.md)). `wav` streams a header followed by
-S16LE frames as they are generated; a client can start playback while
-generation is still running.
+`POST /v1/tts` accepts `{"text", "format": "wav"|"pcm", "temperature",
+"top_p", "seed", "stream", "chunk_length", "chunk_gap_ms", "voice",
+"reference_audio_b64", "reference_text"}`; with `--token` set, requests
+require `Authorization: Bearer <token>`.
 
-A streamed WAV necessarily advertises saturated RIFF sizes — the header is
-on the wire before the first frame is sampled, and chunked transfer cannot
-rewrite bytes already sent. Tolerant players handle that; strict ones
-(Apple's, notably) refuse it. `"stream": false` buffers the take
-server-side and responds with exact `Content-Length` and exact RIFF sizes —
-a well-formed file at the cost of time-to-first-audio.
+**Voice selection.** `voice` selects a pre-encoded registry voice;
+`reference_audio_b64` + `reference_text` clone a per-request wav (max
+15 s) on the fly; neither selects zero-shot (a random, unpinned speaker).
+Mixed-language text is one generation — voices are multilingual by
+construction ([docs/VOICES.md](docs/VOICES.md)).
+
+**Long-form chunking.** Voiced requests are served as a chunk chain: the
+text splits at sentence boundaries into chunks that close after
+`chunk_sentences` sentences (default 2, env `S2P_CHUNK_SENTENCES`) or
+`chunk_length` bytes (default 300, env `S2P_CHUNK_BYTES`), whichever
+comes first, and each chunk generates against the fresh voice reference,
+all audio in one response. The measured reason: single-shot prosody
+flattens — punctuation pauses per 10 s bucket decay from ~0.5–1.0 s early
+to ~0–0.2 s after ~40 s at every weight precision — while chunked
+generation holds the opening-quality prosody across the whole take (2–5
+pauses per bucket through 130+ s; the same text runs ~26 % longer because
+the rushing is gone). Zero-shot requests never chunk (each chunk would
+draw a new voice).
+
+**Join normalization.** Boundary silence at chunk joins is trimmed on
+both sides and replaced by exactly `chunk_gap_ms` of silence (default
+1000, env `S2P_CHUNK_GAP_MS`; `0` = raw concatenation). The model's own
+sentence pauses inside a chunk are untouched; only the stitched joins get
+a deterministic, runtime-tunable pause.
+
+**Streaming semantics.** `wav` streams a header followed by S16LE frames
+as they are generated; playback can start while generation runs. A
+streamed WAV necessarily advertises saturated RIFF sizes — the header is
+on the wire before the first frame is sampled, and chunked transfer
+cannot rewrite sent bytes. Tolerant players handle that; strict ones
+(Apple's, notably) refuse it. `"stream": false` buffers server-side and
+responds with exact `Content-Length` and RIFF sizes — a well-formed file
+at the cost of time-to-first-audio.
 
 The server binds loopback by default and does not terminate TLS. Public
 deployments must place it behind an authenticated, rate-limited proxy.
 Review [SECURITY.md](SECURITY.md) before exposing the service.
 
-## Performance
+## 6. Performance
 
-Single stream, 67-token prompt, 60 frames, sampled (temp 0.8, top-p 0.8,
-seed 3), container on an otherwise idle GB10:
+Why weight precision dominates: at batch 1 every frame reads ~7.75 B
+weight parameters (backbone once, tied lm-head once, nine sequential
+fast-AR passes), so decode is bandwidth-bound and 16-bit weights sit
+above realtime on this memory system by construction (~220 GB/s
+sustained). The full analysis, per-scheme measurements, and ablations are
+in [docs/QUANT.md](docs/QUANT.md).
 
-| GEMM path | Prefill | Decode per frame | DAC per frame | RTF |
-| --- | ---: | ---: | ---: | ---: |
-| BF16 cuBLAS (default) | 306.6 ms | 93.3 ms | ~14 ms | 2.41 |
-| INT8 weight-only (`S2P_INT8=1`) | 353.4 ms | **39.7 ms** | ~14 ms | **1.27** |
+Engine-level decode (single stream, 67-token prompt, 60 frames):
 
-With a realistic serving prompt (51 s voice reference → 1445 prompt tokens,
-400 frames), INT8 decode rises to 47.5 ms/frame — the extra ~8 ms is
-attention over the longer KV — with prefill at 1.88 s and end-to-end RTF
-1.52. FP8 (fish-scales-ops) measured 49.4 ms/frame under the earlier greedy
-protocol but FAILED the parity gate and is not a quality path.
+| GEMM path | Prefill | Decode per frame | RTF (compute ÷ audio) |
+| --- | ---: | ---: | ---: |
+| BF16 cuBLAS (default) | 306.6 ms | 93.3 ms | 2.41 |
+| INT8 weight-only (`S2P_INT8=1`) | 353.4 ms | **39.7 ms** | **1.27** |
 
-RTF is compute ÷ audio; below 1.0 means synthesis is faster than playback.
-At batch 1 every frame reads ~7.75 B weight parameters (backbone, tied LM
-head, and nine sequential fast-AR passes), so 16-bit weights are
-bandwidth-bound above realtime on this memory system by construction — the
-8-bit floor is ~35 ms/frame, and the INT8 GEMV runs within ~13 % of it.
-
-The INT8 path quantizes every linear per output channel at load
-(absmax/127, round-to-nearest), frees the BF16 copies, and serves decode-M
-GEMMs from a fused int8×bf16 GEMV kernel; prefill dequantizes layer-by-layer
-into a shared scratch and reuses the proven cuBLAS call. The tied lm-head
-gets an int8 sidecar of the embedding table (the bf16 table stays for
-embedding lookups). Process peak memory drops from ~12 GB to ~8.5 GB
-(delta of system used memory across the run, single session, ctx 4096).
-
-`S2P_INT4=1` (on top of `S2P_INT8=1`) switches the backbone linears to
-group-wise 4-bit weights: symmetric quantization with one f32 scale per
-`S2P_INT4_GROUP` K-elements (default 32) and a per-group MSE clip search
-(`S2P_INT4_MSE`, default on), stored PACKED two weights per byte
-(`S2P_INT4_PACKED=0` keeps the int8 container for A/B — outputs are
-bit-identical either way, proven by exactly equal parity metrics and
-byte-identical server WAVs at fixed seed). Scales store as f16 — 4.5
-bits per weight all-in — and the quantizer rounds every scale candidate
-through f16 before evaluating it, so the stored half is exactly the
-value the MSE search optimized. The fast-AR — run nine times per frame
-and empirically the tensor 4-bit damages most (group-wise g32 still
-collapses it to argmax 2/9) — and the tied lm-head stay per-channel
-INT8. Measured on the GB10 server: zero-shot wall RTF 1.10 → **0.95**,
-51 s-reference wall RTF 1.19 → 1.05 (104 s takes: 1.20 → 1.03), TTFA
-unchanged (0.18 s zero-shot / 1.58 s with the reference block), backbone
-weight memory 3.63 GB int8 → 2.04 GB packed nibbles + f16 scales.
-Termination behavior is probed separately (low-bit mis-sampling
-concentrates on low-entropy tokens, where end-of-audio lives, and an
-envelope metric cannot see it): 24 utterance pairs INT4 vs INT8 show
-length ratios 0.88–1.23 with zero runaway or premature-EOS flags, and
-the 104 s takes terminate at the identical frame as INT8.
-Naive per-channel INT4 audibly muffled from ~10 s of generation onward
-(autoregressive compounding of per-step weight noise); the group-wise
-mixed scheme restores INT8-class discrete decisions (prefill/step-1
-argmax, fast-AR 8/9) and holds a stable HF envelope over 104 s takes —
-details in [benchmarks/parity](benchmarks/parity/README.md).
+Serving configuration (`S2P_INT8=1 S2P_INT4=1`): packed group-wise INT4
+backbone (4.5 bits per weight, bit-identical to the unpacked container),
+per-channel INT8 fast-AR and lm-head (measured necessity — untrained
+4-bit collapses the fast-AR's argmax cascade), GEMM-grade DAC kernels
+(2.1 ms/frame, bit-identical PCM), per-voice KV-prefix cache (~189 MB per
+voice, LRU). Result: the wall-RTF table in §1. Process memory: ~8.5 GB
+(INT8) vs ~12 GB (BF16); backbone weights 2.04 GB packed.
 
 Numeric fidelity is gated by the layer-parity protocol
-([benchmarks/parity](benchmarks/parity/README.md)): the BF16 path matches
-the PyTorch reference at every stage (backbone cos ≥ 0.99996, identical
-first-frame argmax except one exact bf16 tie, native DAC at SNR 65.9 dB on
-reference frames), and the INT8 path holds the same class (backbone cos
-≥ 0.99989, prefill/step-1 logits argmax identical, the same single
-codebook-8 near-tie flip). The FP8 path FAILS the same gate (backbone cos
-collapses to 0.33 over 36 layers) — its timings remain as measurements of
-the memory system, not as a viable quality path.
+([benchmarks/parity](benchmarks/parity/README.md)): BF16 and INT8 pass at
+every stage (backbone cos ≥ 0.99989, prefill/step-1 argmax identical,
+native DAC at SNR 65.9 dB); the packed INT4 backbone holds the same
+argmax class; FP8 fails (backbone cos collapses to 0.33 over 36 layers)
+and is retained for memory-system measurements only.
 
-## Roadmap to RTF < 1
+## 7. Optimization record
 
-- [ ] fast-AR QAT to INT4 (`tools/qat_fastar.py`) — the BF16 fast-AR
-      distills its own 4-bit copy (teacher-forced KL + DAgger, the
-      deployment quantizer inside the training loop); target: the
-      all-INT4 weight stream (4.37 GB/frame, decode floor ~20 ms) at the
-      INT8 quality bar (free-run argmax agreement 0.896)
-- [x] GEMM-grade DAC conv kernels — 2D register blocking +
-      phase-partitioned tconvs, bit-identical PCM (MD5); whole-buffer
-      DAC 15.1 → **2.1 ms/frame**, server wall RTF 0.92–0.95 → 0.75–0.76
-      ([docs/DAC-KERNELS.md](docs/DAC-KERNELS.md), negative attempts
-      included)
-- [x] reference-block KV-prefix cache — the per-voice system block
-      prefills once (one 2D copy seeds later sessions, ~189 MB per voice,
-      LRU, `S2P_KV_CACHE_VOICES`); voice-ref TTFA 1.58 → **0.23 s**,
-      voice-ref wall RTF 1.05 → **0.94**, chunked long-form 1.15 →
-      **0.93** — every serving path below realtime
-- [x] CUDA-graph replay of the steady decode tick — one launch instead of
-      ~1100; graph vs eager byte-identical; decode 42.4 → 39.6 ms/frame
-- [x] device-side sampling — exact two-softmax port, per-session device
-      state, one small download per frame
-- [x] bit-exact incremental streaming DAC — streamed PCM equals the
-      whole-buffer decode bit for bit; replaces the reference
-      window/overlap/crossfade scheme
-- [x] DAC pipelined on a dedicated CUDA stream + batched pushes — server
-      wall RTF 2.05 → 1.25 (51 s voice reference), 1.16 zero-shot
-- [x] split-K flash-decode attention — long-context decode 46.9 → 42.7
-      ms/frame
-- [x] packed 4-bit backbone kernels + f16 group scales (4.5 bpw) — two
-      weights per byte, bit-identical outputs (equal parity JSON,
-      byte-identical WAVs); zero-shot wall RTF 1.10 → **0.95**, first
-      sub-realtime serving on a quality-passing path; 51 s-reference
-      RTF 1.19 → 1.05
-- [x] group-wise INT4 weights (`S2P_INT4=1`) — g32 + MSE clip search +
-      INT8 fast-AR/lm-head; INT8-class parity decisions, stable 104 s HF
-      envelope (naive per-channel INT4 muffled from ~10 s; fast-AR stays
-      INT8 — even group-wise 4-bit collapses it to argmax 2/9)
-- [x] INT8 per-channel weight-only GEMV — decode 93.3 → 39.7 ms/frame,
-      process memory ~19 → ~8.5 GB, parity **PASS**
-- [x] layer-parity validation against the PyTorch reference — BF16 **PASS**,
-      INT8 **PASS**, FP8 **FAIL**
-      ([benchmarks/parity](benchmarks/parity/README.md))
+Each step shipped only after its gate (parity, MD5 bit-exactness, or the
+audio battery); the reports own the details, including what lost.
 
-Every serving path runs at 0.75–0.76 and the DAC is no longer a factor;
-the frame is backbone-dominated. The one remaining structural lever is
-the fast-AR weight stream (3.73 GB/frame at INT8 — nine sequential
-re-reads outweigh the whole packed backbone): untrained 4-bit fails its
-argmax gate in every tensor subset (docs/QUANT.md), so the path is QAT
-self-distillation, in progress via `tools/qat_fastar.py`.
-- [x] voice-cloning encode — active with the full codec artifact
-      (`tools/convert_codec_full.py`); reference wav → 21.5 Hz VQ codes →
-      prompt injection, exercised end to end
+| step | measured effect |
+| --- | --- |
+| layer-parity validation vs the PyTorch reference | BF16 PASS, INT8 PASS, FP8 FAIL |
+| INT8 per-channel weight-only GEMV | decode 93.3 → 39.7 ms/frame; memory ~12 → ~8.5 GB |
+| DAC on a dedicated CUDA stream + batched pushes | wall RTF 2.05 → 1.19 (51 s reference) |
+| split-K flash-decode attention | long-context decode 46.9 → 42.7 ms/frame |
+| device-side sampling (exact two-softmax port) | removes the 623 KB per-frame logits round-trip |
+| CUDA-graph replay of the decode tick | 42.4 → 39.6 ms/frame; graph vs eager byte-identical |
+| bit-exact incremental streaming DAC | streamed PCM ≡ whole-buffer decode, bit for bit |
+| group-wise INT4 backbone (g32 + MSE clip search) | INT8-class parity decisions; rescued naive INT4's audible failure |
+| packed nibbles + f16 group scales (4.5 bpw) | zero-shot wall RTF 1.10 → 0.95, bit-identical to unpacked |
+| sentence chunking + join normalization | long-form prosody holds through 130+ s (was flattening at ~40 s) |
+| per-voice KV-prefix cache | voice-ref TTFA 1.58 → 0.23 s; every path below realtime |
+| GEMM-grade DAC conv kernels | DAC 15.1 → 2.1 ms/frame; wall RTF 0.75–0.76 |
 
-## Contributing and security
+Open: QAT self-distillation of the fast-AR to INT4 — the last structural
+lever (nine sequential re-reads make the 0.41 B module the largest weight
+stream; all-INT4 puts the decode floor near 20 ms/frame). Method in
+[docs/QUANT.md §6](docs/QUANT.md); runs in
+[docs/QAT-RUNS.md](docs/QAT-RUNS.md).
 
-Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a change.
-Documentation must be written in English, performance claims must state
-their measurement conditions, model weights must never enter Git, and shared
-branches must never be force-pushed.
+## 8. Documentation map
 
-Report vulnerabilities privately according to [SECURITY.md](SECURITY.md).
-Community participation is governed by the
-[Code of Conduct](CODE_OF_CONDUCT.md). Use [`CITATION.cff`](CITATION.cff)
-when citing the software.
+| document | class | scope |
+| --- | --- | --- |
+| [docs/PORTING.md](docs/PORTING.md) | specification | the model, exact algorithms, and every fidelity pitfall of the port |
+| [CONTRACT.md](CONTRACT.md) | specification | frozen module interfaces and ownership |
+| [docs/QUANT.md](docs/QUANT.md) | report | weight-quantization ladder, methods, negative results |
+| [docs/DAC-KERNELS.md](docs/DAC-KERNELS.md) | report | vocoder kernel optimization, winning and losing designs |
+| [docs/QAT-RUNS.md](docs/QAT-RUNS.md) | report | QAT distillation runs: conditions, telemetry, results |
+| [benchmarks/parity/README.md](benchmarks/parity/README.md) | report | layer-parity protocol and per-path verdicts |
+| [docs/SPARK.md](docs/SPARK.md) | guide | build and deployment on the DGX Spark |
+| [docs/VOICES.md](docs/VOICES.md) | guide | the voice reference system and the accent constraint |
+| [CHANGELOG.md](CHANGELOG.md) | record | all notable changes with measurement conditions |
 
-## License and model provenance
+## 9. Contributing, security, license
+
+Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a change — it also
+defines the documentation scheme this repository follows. Report
+vulnerabilities privately per [SECURITY.md](SECURITY.md). Community
+participation is governed by the [Code of Conduct](CODE_OF_CONDUCT.md);
+cite the software via [`CITATION.cff`](CITATION.cff).
 
 The application source is licensed under the
 [Apache License 2.0](LICENSE). Model weights are not included: Fish Audio
-S2-Pro is licensed by its upstream publisher under the Fish Audio Research
-License (non-commercial; commercial licensing via Fish Audio). Built
-binaries link Apache-2.0 and BSD-3-Clause NVIDIA components through
-fish-scales-ops. See the
+S2-Pro is licensed by its upstream publisher under the Fish Audio
+Research License (non-commercial; commercial licensing via Fish Audio).
+Built binaries link Apache-2.0 and BSD-3-Clause NVIDIA components through
+fish-scales-ops — see the
 [third-party notices](THIRD_PARTY_NOTICES.md).
