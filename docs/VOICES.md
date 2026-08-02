@@ -1,99 +1,86 @@
-# Voices: the reference system
+# The Voice Reference System
 
-s2pro-native pins the speaker identity of every generation through
-**reference audio** (voice cloning). This document explains how references
-work, why they must come from a specific kind of source, and how to add
-your own.
+Guide. s2pro-native pins the speaker identity of every generation through
+reference audio (voice cloning). This document specifies how references
+work, the constraint that governs where they may come from, and how to add
+one.
 
-## How a voice works
+## 1. Mechanism
 
-S2-Pro conditions generation on a reference clip plus its exact transcript:
-the clip is encoded to 21.5 Hz RVQ codes and injected into the prompt, and
-the model then speaks the request text "as this speaker". Without a
-reference the model casts a random plausible speaker per request — natural,
-but unpinned.
+S2-Pro conditions generation on a reference clip plus its exact
+transcript: the clip is encoded to 21.5 Hz RVQ codes and injected into the
+prompt, and the model then speaks the request text as that speaker.
+Without a reference, the model casts a random plausible speaker per
+request — natural-sounding, but unpinned.
 
-## The accent rule (read this before recording anything)
+## 2. The accent constraint
 
-Cloning copies **everything** about how the reference speaker talks —
-timbre, prosody, and *phonetic habits*. A monolingual reference therefore
-transfers its accent onto every other language: an English-only reference
-speaking German produces heavily English-accented German. This is inherent
-to the S2 model family ([known upstream issue](https://github.com/fishaudio/fish-speech/issues/1263))
-and is NOT steerable with inline `[tags]` (verified experimentally: prosody
-tags like `[whispering]` work, accent instructions do nothing).
+Cloning copies everything about how the reference speaker talks — timbre,
+prosody, and phonetic habits. A monolingual reference therefore transfers
+its accent onto every other language: an English-only reference speaking
+German produces heavily English-accented German. This is inherent to the
+S2 model family
+([known upstream issue](https://github.com/fishaudio/fish-speech/issues/1263))
+and is not steerable with inline `[tags]` — verified experimentally:
+prosody tags such as `[whispering]` work, accent instructions do nothing.
 
-**Therefore: reference audio MUST be produced by a voice that speaks every
-target language with native pronunciation — in ONE continuous recording
-that actually cycles through all of them.**
-
-In practice that means generating the reference with an AI voice built for
-accent-free multilinguality (e.g. Google Gemini TTS
-(`gemini-3.1-flash-tts-preview`), ElevenLabs Multilingual, or comparable
-systems). One take, one identity, every language spoken natively — the
-model then hears "this speaker is native in all of these" and switches
-pronunciation per language instead of dragging an accent along. Note that
-S2-family TTS itself does NOT qualify as a source: its own voices carry
-their reference accent across languages, which is the problem being solved.
+Reference audio must therefore be produced by a voice that speaks every
+target language with native pronunciation, in one continuous recording
+that cycles through all of them. In practice that means an AI voice built
+for accent-free multilinguality (e.g. Google Gemini TTS, ElevenLabs
+Multilingual, or comparable systems). S2-family TTS itself does not
+qualify as a source: its own voices carry their reference accent across
+languages, which is precisely the problem being solved.
 
 A single multilingual file beats per-language files: the identity stays
-perfectly continuous across language switches, and the registry treats it
-as one reference block anyway. Mixed-language request text then works in
-ONE generation — no language detection, no per-language calls, no audio
-stitching.
+continuous across language switches, and the registry treats it as one
+reference block. Mixed-language request text is then a single generation —
+no language detection, no per-language calls, no audio stitching.
 
-## Adding a voice (two files, done)
+## 3. Adding a voice
 
-Drop a pair into the voices directory (`--voices-dir`, default `./voices`):
+Drop a pair into the voices directory (`--voices-dir`, default
+`./voices`):
 
 ```
 voices/
-  my-voice.wav   RIFF wav, 16-bit PCM, mono, 44100 Hz, ~30-90 s
+  my-voice.wav   RIFF wav, 16-bit PCM, mono, 44100 Hz, ~30–90 s
   my-voice.txt   the EXACT transcript of the wav (UTF-8, one line)
 ```
 
 The name is the file basename. The supported way to produce a pair is
 [`tools/voicegen`](../tools/voicegen/README.md), which authors a
 multilingual passage, synthesizes any of the 30 Gemini prebuilt voices,
-resamples to 44.1 kHz, and verifies each take against its transcript —
-one command per new voice. For material from other sources, convert to the
-required format with, e.g.:
+resamples to 44.1 kHz, and verifies each take against its transcript. For
+material from other sources, convert to the required format:
 
 ```sh
 afconvert -f WAVE -d LEI16@44100 -c 1 input.mp3 voices/my-voice.wav   # macOS
 ffmpeg -i input.mp3 -ar 44100 -ac 1 -sample_fmt s16 voices/my-voice.wav
 ```
 
-Rules of thumb:
+Requirements:
 
-- 30–90 s total; cycle through every language your deployment serves.
+- 30–90 s total; cycle through every language the deployment serves.
 - The transcript must match the audio word for word — it is part of the
   prompt, not metadata.
 - Clean, dry audio; no music, no second speaker.
 - Every voice is DAC-encoded once at server start and cached; voice
   selection costs nothing per request.
 
-**`voices/` ships empty; you generate the references you need.** Audio is not
-committed — ~5.4 MB per voice, reproducible from one command — so the
-repository carries the generator instead of the output, and `voices/*.wav` /
-`voices/*.txt` are gitignored. An empty directory is not an error: the server
-logs it and serves zero-shot only.
+`voices/` ships empty; reference audio is generated per deployment, not
+committed (~5.4 MB per voice, reproducible from one command —
+`voices/*.wav` and `voices/*.txt` are gitignored). An empty directory is
+not an error: the server logs it and serves zero-shot only.
 
-[`tools/voicegen`](../tools/voicegen/README.md) is the reference
-implementation of everything above. It authors a passage cycling the languages
-you name, synthesizes any or all 30 `gemini-3.1-flash-tts-preview` prebuilt
-voices from that one shared passage, resamples to 44.1 kHz, and verifies each
-take against its transcript. Generate several voices from a single passage and
-they differ only in speaker identity. Name them after the producing voice
-(`sulafat`, `charon`, ...) and `GET /v1/voices` lists whatever you generated.
+Note on bandwidth: Gemini TTS returns 24 kHz PCM, so those references
+carry no energy above 12 kHz, and the model faithfully imitates the
+band-limit. `voicegen` resamples to the codec's native 44.1 kHz (required
+— the loader rejects other rates), but resampling cannot invent the
+missing top octave; export at 44.1 kHz natively where a provider offers
+it.
 
-Note Gemini's 24 kHz source rate: those references carry no energy above
-12 kHz, which the model faithfully imitates. `voicegen` resamples to the
-codec's native 44.1 kHz (required — the loader rejects other rates), but
-resampling cannot invent the missing top octave; export at 44.1 kHz natively
-where a provider offers it.
-
-## Using voices over the API
+## 4. API usage
 
 ```sh
 # list
@@ -104,14 +91,13 @@ curl -s -X POST localhost:8010/v1/tts \
   -d '{"text":"Das französische Wort bibliothèque bedeutet Bücherei.",
        "voice":"sulafat","format":"wav"}' -o out.wav
 
-# on-the-fly clone: attach a wav (<= 15 s, 44.1k mono s16) per request
+# on-the-fly clone: attach a wav (<= 15 s, 44.1 kHz mono s16) per request
 curl -s -X POST localhost:8010/v1/tts \
   -d "{\"text\":\"Hallo!\",\"format\":\"wav\",
        \"reference_text\":\"<exact transcript>\",
        \"reference_audio_b64\":\"$(base64 -i ref.wav)\"}" -o out.wav
 ```
 
-`reference_audio_b64` wins over `voice`; neither field selects zero-shot
-(a random, unpinned speaker). The on-the-fly clone pays one DAC encode
-(~1 s for 10 s of audio) on the scheduler thread per request; named voices
-do not.
+`reference_audio_b64` wins over `voice`; neither field selects zero-shot.
+The on-the-fly clone pays one DAC encode (~1 s per 10 s of audio) on the
+scheduler thread per request; named voices do not.
