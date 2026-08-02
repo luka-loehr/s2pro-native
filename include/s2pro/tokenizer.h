@@ -40,6 +40,15 @@ typedef struct {
     int64_t            ref_pcm_n;
 } s2p_request_text;
 
+/* Sentence-aware UTF-8 text chunking for long-form synthesis (additive,
+ * 2026-08-02; src/text/chunker.c). Splits at sentence boundaries and packs
+ * greedily up to target_bytes per chunk (>= 32); a lone oversize sentence
+ * is split at the last space. Returns a malloc'd array of malloc'd strings;
+ * free with s2p_text_chunks_free. */
+s2p_status s2p_text_chunks(const char* utf8, int target_bytes, char*** out,
+                           int* out_n);
+void s2p_text_chunks_free(char** chunks, int n);
+
 /* Build the full prompt: token ids, a mask marking VQ-injected positions
  * (1 where codebook-0 semantic tokens sit and vq_parts embeddings must be
  * added), and the vq parts array consumed by prefill. All outputs malloc'd. */
