@@ -220,8 +220,11 @@ s2p_status s2p_session_prefill(s2p_session* s, const int64_t* ids,
         return S2P_ERR_INVALID;
     s2p_model* m = s->m;
     if (s->state != S2P_SESS_NEW) return S2P_ERR_STATE;
+    /* pos0 > 0 when s2p_session_kv_load seeded a cached prompt prefix; the
+     * remaining ids then prefill at that offset. */
+    const int pos0 = s->kv_len;
     /* reference clamps max_new_tokens to ctx-1-prompt: need >= 1 decode slot */
-    if (n_ids > m->ctx_len - 1) return S2P_ERR_INVALID;
+    if (pos0 + n_ids > m->ctx_len - 1) return S2P_ERR_INVALID;
 
     for (int i = 0; i < n_ids; i++)
         if (ids[i] < 0 || ids[i] >= S2P_TEXT_VOCAB) return S2P_ERR_INVALID;
@@ -284,7 +287,7 @@ s2p_status s2p_session_prefill(s2p_session* s, const int64_t* ids,
     }
 
     for (int l = 0; l < S2P_SLOW_LAYERS; l++) {
-        S2P_TRY(run_layer(m, l, n_ids, 0, s, NULL));
+        S2P_TRY(run_layer(m, l, n_ids, pos0, s, NULL));
         if (s2psl_dump_dir() != NULL) { /* parity: residual after layer l,
                                          * last prompt position */
             char nm[32];
@@ -303,8 +306,49 @@ s2p_status s2p_session_prefill(s2p_session* s, const int64_t* ids,
                         st);
     S2P_CUDA_TRY(cudaStreamSynchronize(st));
 
-    s->kv_len = n_ids;
+    s->kv_len = pos0 + n_ids;
     s->state = S2P_SESS_PREFILLED;
+    return S2P_OK;
+}
+
+/* -------------------------------------------------- KV prefix cache ----- */
+
+/* The session KV is [36][2*KVH][ctx][128] bf16 — 36*16 contiguous planes of
+ * [ctx][128]. A prefix blob keeps the same plane order at n_tokens depth,
+ * so save/load are single strided 2D copies. */
+#define S2P_KV_PLANES (S2P_SLOW_LAYERS * 2 * S2P_SLOW_KV_HEADS)
+
+size_t s2p_session_kv_bytes(const s2p_model* m, int n_tokens) {
+    if (m == NULL || n_tokens <= 0) return 0;
+    return (size_t)S2P_KV_PLANES * n_tokens * S2P_HEAD_DIM * sizeof(uint16_t);
+}
+
+s2p_status s2p_session_kv_save(s2p_session* s, int n_tokens, void* blob_dev) {
+    if (s == NULL || blob_dev == NULL || n_tokens <= 0) return S2P_ERR_INVALID;
+    if (n_tokens > s->kv_len) return S2P_ERR_INVALID;
+    s2p_model* m = s->m;
+    const size_t width = (size_t)n_tokens * S2P_HEAD_DIM * sizeof(uint16_t);
+    const size_t pitch = (size_t)m->ctx_len * S2P_HEAD_DIM * sizeof(uint16_t);
+    S2P_CUDA_TRY(cudaMemcpy2DAsync(blob_dev, width, s->kv.data, pitch, width,
+                                   S2P_KV_PLANES, cudaMemcpyDeviceToDevice,
+                                   m->stream));
+    S2P_CUDA_TRY(cudaStreamSynchronize(m->stream));
+    return S2P_OK;
+}
+
+s2p_status s2p_session_kv_load(s2p_session* s, const void* blob_dev,
+                               int n_tokens) {
+    if (s == NULL || blob_dev == NULL || n_tokens <= 0) return S2P_ERR_INVALID;
+    s2p_model* m = s->m;
+    if (s->state != S2P_SESS_NEW || s->kv_len != 0) return S2P_ERR_STATE;
+    if (n_tokens > m->ctx_len - 1) return S2P_ERR_INVALID;
+    const size_t width = (size_t)n_tokens * S2P_HEAD_DIM * sizeof(uint16_t);
+    const size_t pitch = (size_t)m->ctx_len * S2P_HEAD_DIM * sizeof(uint16_t);
+    S2P_CUDA_TRY(cudaMemcpy2DAsync(s->kv.data, pitch, blob_dev, width, width,
+                                   S2P_KV_PLANES, cudaMemcpyDeviceToDevice,
+                                   m->stream));
+    S2P_CUDA_TRY(cudaStreamSynchronize(m->stream));
+    s->kv_len = n_tokens;
     return S2P_OK;
 }
 

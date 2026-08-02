@@ -52,6 +52,7 @@ typedef struct sched_req {
     int              n_refs;
     float*           ref_pcm;   /* on-the-fly clone: encoded on the worker */
     int64_t          ref_pcm_n;
+    char*            cache_key;  /* KV-prefix-cache identity (NULL = none) */
     s2p_sampling_cfg sampling;
     s2p_audio_cb     cb;
     void*            user;
@@ -90,6 +91,20 @@ struct s2p_sched {
     int       stop;
 
     cudaStream_t custream; /* DAC stream work */
+
+    /* KV prefix cache: the per-voice system block (reference VQ included)
+     * prefills once; later requests seed their session KV from the blob and
+     * prefill only the user turn. Worker-thread only, LRU by last_use.
+     * Capacity: S2P_KV_CACHE_VOICES entries (default 4, 0 disables); one
+     * entry is ~190 MB at a 60 s reference. */
+    struct kvc_entry {
+        char*    name;
+        int      P;        /* prefix token count */
+        void*    blob;     /* device */
+        uint64_t last_use;
+    } kvc[16];
+    int      kvc_cap;
+    uint64_t kvc_tick;
 };
 
 /* ---------------------------------------------------------------- helpers */
@@ -101,8 +116,13 @@ static void req_free(sched_req* r) {
     for (int i = 0; i < r->n_refs; i++) free(r->refs[i].codes);
     free(r->refs);
     free(r->ref_pcm);
+    free(r->cache_key);
     free(r);
 }
+
+static struct kvc_entry* kvc_lookup(s2p_sched* s, const char* key, int n_sys);
+static void kvc_insert(s2p_sched* s, const char* key, int n_sys,
+                       s2p_session* sess);
 
 static char* xstrdup(const char* s) {
     if (!s) return NULL;
@@ -310,9 +330,9 @@ static int start_request(s2p_sched* s, sched_req* r, sched_active* slot) {
     int64_t*     ids = NULL;
     uint8_t*     vq_mask = NULL;
     s2p_vq_part* parts = NULL;
-    int          n_ids = 0, n_parts = 0;
+    int          n_ids = 0, n_parts = 0, n_sys = 0;
     s2p_status rc = s2p_prompt_build(s->tok, s->cfg, &req_text, &ids, &vq_mask,
-                                     &n_ids, &parts, &n_parts);
+                                     &n_ids, &parts, &n_parts, &n_sys);
     free(ref_parts);
     if (rc != S2P_OK) {
         fprintf(stderr, "[s2pro] sched: prompt build failed (%d) req %llu\n",
@@ -323,7 +343,19 @@ static int start_request(s2p_sched* s, sched_req* r, sched_active* slot) {
     s2p_session* sess = NULL;
     rc = s2p_session_create(s->model, &r->sampling, &sess);
     if (rc == S2P_OK) {
-        rc = s2p_session_prefill(sess, ids, vq_mask, n_ids, parts, n_parts);
+        struct kvc_entry* hit = kvc_lookup(s, r->cache_key, n_sys);
+        if (hit != NULL) {
+            /* seed the constant system block from the cache, prefill only
+             * the user turn (all VQ parts live inside the prefix) */
+            rc = s2p_session_kv_load(sess, hit->blob, hit->P);
+            if (rc == S2P_OK)
+                rc = s2p_session_prefill(sess, ids + n_sys, NULL,
+                                         n_ids - n_sys, NULL, 0);
+        } else {
+            rc = s2p_session_prefill(sess, ids, vq_mask, n_ids, parts,
+                                     n_parts);
+            if (rc == S2P_OK) kvc_insert(s, r->cache_key, n_sys, sess);
+        }
         if (rc != S2P_OK) {
             s2p_session_destroy(sess);
             sess = NULL;
@@ -361,6 +393,56 @@ fail_cb:
     req_free(r);
     pthread_mutex_unlock(&s->mu);
     return 0;
+}
+
+/* --------------------------------------------------- KV prefix cache --- */
+
+/* Worker-thread only. A cacheable request has a stable key AND a reference
+ * prefix; the user turn must contain no VQ (guaranteed by prompt layout). */
+static struct kvc_entry* kvc_lookup(s2p_sched* s, const char* key, int n_sys) {
+    if (s->kvc_cap <= 0 || key == NULL || n_sys <= 0) return NULL;
+    for (int i = 0; i < s->kvc_cap; i++) {
+        struct kvc_entry* e = &s->kvc[i];
+        if (e->name && strcmp(e->name, key) == 0) {
+            if (e->P != n_sys) return NULL; /* voice re-registered? refuse */
+            e->last_use = ++s->kvc_tick;
+            return e;
+        }
+    }
+    return NULL;
+}
+
+static void kvc_insert(s2p_sched* s, const char* key, int n_sys,
+                       s2p_session* sess) {
+    if (s->kvc_cap <= 0 || key == NULL || n_sys <= 0) return;
+    struct kvc_entry* slot = NULL;
+    for (int i = 0; i < s->kvc_cap && !slot; i++)
+        if (s->kvc[i].name == NULL) slot = &s->kvc[i];
+    if (!slot) { /* evict LRU */
+        slot = &s->kvc[0];
+        for (int i = 1; i < s->kvc_cap; i++)
+            if (s->kvc[i].last_use < slot->last_use) slot = &s->kvc[i];
+        free(slot->name);
+        cudaFree(slot->blob);
+        memset(slot, 0, sizeof(*slot));
+    }
+    size_t bytes = s2p_session_kv_bytes(s->model, n_sys);
+    void* blob = NULL;
+    if (bytes == 0 || cudaMalloc(&blob, bytes) != cudaSuccess) return;
+    if (s2p_session_kv_save(sess, n_sys, blob) != S2P_OK) {
+        cudaFree(blob);
+        return;
+    }
+    slot->name = strdup(key);
+    if (!slot->name) {
+        cudaFree(blob);
+        return;
+    }
+    slot->P = n_sys;
+    slot->blob = blob;
+    slot->last_use = ++s->kvc_tick;
+    fprintf(stderr, "[s2pro] sched: kv-prefix cached '%s' (%d tokens, %.0f MB)\n",
+            slot->name, n_sys, (double)bytes / 1e6);
 }
 
 /* ------------------------------------------------------------ worker loop */
@@ -510,6 +592,13 @@ s2p_status s2p_sched_create(s2p_model* m, s2p_dac* d, s2p_tok* t,
     s->queue_depth = (opts && opts->queue_depth > 0) ? opts->queue_depth
                                                      : SCHED_QUEUE_DEPTH_DEFAULT;
     s->next_id = 1;
+    s->kvc_cap = 4; /* KV-prefix cache entries; ~190 MB per 60 s voice */
+    {
+        const char* e = getenv("S2P_KV_CACHE_VOICES");
+        if (e && e[0]) s->kvc_cap = atoi(e);
+        if (s->kvc_cap < 0) s->kvc_cap = 0;
+        if (s->kvc_cap > 16) s->kvc_cap = 16;
+    }
     s->queue = (sched_req**)calloc((size_t)s->queue_depth, sizeof(*s->queue));
     s->active =
         (sched_active*)calloc((size_t)s->max_sessions, sizeof(*s->active));
@@ -553,6 +642,7 @@ s2p_status s2p_sched_submit(s2p_sched* s, const s2p_request_text* req,
     if (!r) return S2P_ERR_OOM;
     r->text = xstrdup(req->text);
     r->ref_text = xstrdup(req->ref_text);
+    r->cache_key = xstrdup(req->cache_key);
     r->sampling = sampling ? *sampling : s2p_sampling_defaults();
     r->cb = cb;
     r->user = user;
@@ -689,6 +779,10 @@ void s2p_sched_destroy(s2p_sched* s) {
     if (!s) return;
     (void)s2p_sched_stop(s);
     /* Worker exit path drained the queue and retired all sessions. */
+    for (int i = 0; i < 16; i++) {
+        free(s->kvc[i].name);
+        if (s->kvc[i].blob) cudaFree(s->kvc[i].blob);
+    }
     cudaStreamDestroy(s->custream);
     pthread_mutex_destroy(&s->mu);
     pthread_cond_destroy(&s->cv);

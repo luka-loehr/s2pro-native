@@ -78,7 +78,7 @@ int main(int argc, char** argv) {
     uint8_t*     mask = NULL;
     s2p_vq_part* parts = NULL;
     int          n = 0, n_parts = 0;
-    T(s2p_prompt_build(tok, cfg, &req, &ids, &mask, &n, &parts, &n_parts) ==
+    T(s2p_prompt_build(tok, cfg, &req, &ids, &mask, &n, &parts, &n_parts, NULL) ==
               S2P_OK &&
           n > 0,
       "prompt build (no refs)");
@@ -106,7 +106,7 @@ int main(int argc, char** argv) {
     req.refs = &ref;
     req.n_refs = 1;
     ids = NULL; mask = NULL; parts = NULL; n = 0; n_parts = 0;
-    T(s2p_prompt_build(tok, cfg, &req, &ids, &mask, &n, &parts, &n_parts) ==
+    T(s2p_prompt_build(tok, cfg, &req, &ids, &mask, &n, &parts, &n_parts, NULL) ==
               S2P_OK &&
           n > 0,
       "prompt build (1 ref)");
