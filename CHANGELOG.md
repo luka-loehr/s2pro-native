@@ -34,6 +34,15 @@ for published releases.
 
 ### Added
 
+- Normalized inter-chunk pauses (`chunk_gap_ms`, default 1000 ms, env
+  S2P_CHUNK_GAP_MS, 0 = raw concatenation): the boundary filter holds
+  back a tail window per chunk, trims the trailing/leading silence around
+  each join and inserts an exact runtime-tunable gap instead — listening
+  verdict was that the model's own ~1-1.3 s sentence pauses are perfect
+  while the raw stitched joins ran mostly under 1 s. Take-level edges are
+  never trimmed. Verified: every join lands at the target within scan
+  granularity; the model's in-chunk pauses are untouched. Also
+  `chunk_sentences` (default 2) closes chunks after N sentences.
 - Long-form sentence chunking on `POST /v1/tts` (`chunk_length`, default
   300 bytes, env `S2P_CHUNK_BYTES`, 0 = off; voiced requests only): text
   splits at sentence boundaries (`src/text/chunker.c`, UTF-8-aware,

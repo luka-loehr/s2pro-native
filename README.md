@@ -167,7 +167,11 @@ close after `chunk_sentences` sentences (default 2, env
 `S2P_CHUNK_SENTENCES`; `0` = byte limit only) or `chunk_length` bytes
 (default 300, env `S2P_CHUNK_BYTES`; `0` disables chunking), whichever
 comes first, and each chunk generates against the fresh voice reference,
-all audio in one response. Measured reason: single-shot prosody flattens — punctuation
+all audio in one response. Chunk joins are normalized: boundary silence is
+trimmed on both sides and replaced by exactly `chunk_gap_ms` of silence
+(default 1000, env `S2P_CHUNK_GAP_MS`; `0` = raw concatenation) — the
+model's own sentence pauses inside a chunk are untouched, only the
+stitched joins get a deterministic, runtime-tunable pause. Measured reason: single-shot prosody flattens — punctuation
 pauses per 10 s bucket decay from ~0.5–1.0 s early to ~0–0.2 s after
 ~40 s at every weight precision — while chunked generation holds the
 opening-quality prosody across the whole take (2–5 pauses per bucket

@@ -11,6 +11,10 @@
  *                            "chunk_length"?: bytes (default 300; 0 = off;
  *                             long-form sentence chunking, voiced requests
  *                             only — see submit_chunk),
+ *                            "chunk_sentences"?: max sentences per chunk
+ *                             (default 2; 0 = byte limit only),
+ *                            "chunk_gap_ms"?: normalized inter-chunk pause
+ *                             (default 1000; 0 = raw concatenation),
  *                            "voice"?: "<registry name>",
  *                            "reference_audio_b64"?: "<wav, 44.1k mono s16,
  *                             max 15 s>", "reference_text"?: "<transcript>"}
@@ -73,6 +77,21 @@
 #define HTTP_CHUNK_BYTES_DEFAULT     300
 #define HTTP_CHUNK_SENTENCES_DEFAULT 2
 
+/* Inter-chunk gap normalization: the model's own sentence pauses inside a
+ * take run ~1.0-1.3 s (the project owner's "perfect" range), but the
+ * trailing/leading silence around a chunk join is whatever the two takes
+ * happened to emit — mostly under 1 s and variable. The filter holds back
+ * a tail window per chunk, trims boundary silence on BOTH sides of a join,
+ * and inserts exactly chunk_gap_ms of silence instead (request field
+ * "chunk_gap_ms", env S2P_CHUNK_GAP_MS; 0 restores raw concatenation).
+ * Take-level edges (start of chunk 1, end of the last chunk) are never
+ * trimmed. */
+#define HTTP_CHUNK_GAP_MS_DEFAULT 1000
+#define GAP_HOLD_SAMPLES (3 * 44100)     /* boundary tail window held back */
+#define GAP_LEAD_MAX     (44100 * 2)     /* max leading silence trimmed */
+#define GAP_SIL_PEAK     400             /* |s16| below this = silence */
+#define GAP_FRAME        441             /* 10 ms scan granularity */
+
 #define HTTP_MAX_HEAD   (16 * 1024)
 #define HTTP_MAX_BODY   (4 * 1024 * 1024) /* fits a 15 s wav as base64 JSON */
 #define HTTP_CLONE_MAX_SAMPLES (15 * 44100) /* inline-clone cap: 15 s */
@@ -111,6 +130,11 @@ typedef struct {
     char**      chunks;
     int         n_chunks, cur_chunk;
     atomic_int  chunk_advance;
+    int         gap_ms;             /* inter-chunk gap; 0 = raw concat */
+    int16_t*    gap_hold;           /* boundary tail window (scheduler thr) */
+    size_t      gap_hold_n;
+    int         gap_lead_skip;      /* trimming next chunk's leading silence */
+    size_t      gap_lead_skipped;
     const s2p_voice* lf_voice;      /* registry voice (stable) or NULL */
     float*      lf_clone_pcm;       /* inline clone, re-encoded per chunk */
     int64_t     lf_clone_n;
@@ -223,33 +247,141 @@ static void send_simple(int fd, int code, const char* reason,
 
 /* Runs on the SCHEDULER thread. Writes chunked body bytes to the socket.
  * Nonzero return => cancel (client gone / write failed / timed out). */
+/* Append audio to the response (accumulator or wire). Returns nonzero on
+ * failure (client gone / oom; error handling done, caller just cancels). */
+static int conn_emit(conn* c, const int16_t* pcm, size_t n) {
+    if (c->buffered) {
+        if (n == 0) return 0;
+        size_t add = n * sizeof(int16_t);
+        if (c->acc_len + add > c->acc_cap) {
+            size_t nc = c->acc_cap ? c->acc_cap * 2 : (1u << 20);
+            while (nc < c->acc_len + add) nc *= 2;
+            char* nb = (char*)realloc(c->acc, nc);
+            if (!nb) {
+                send_simple(c->fd, 500, "Internal Server Error",
+                            "application/json", "{\"error\":\"oom\"}");
+                atomic_store(&c->finished, 1); /* poll loop reaps */
+                return 1;
+            }
+            c->acc = nb;
+            c->acc_cap = nc;
+        }
+        memcpy(c->acc + c->acc_len, pcm, add);
+        c->acc_len += add;
+        return 0;
+    }
+    if (c->wav && !c->sent_wav_hdr) {
+        /* WAV header with unknown length: pass the max so players stream. */
+        uint8_t hdr[44];
+        size_t hn = s2p_wav_header(hdr, 0xFFFFFFFFu, S2P_SAMPLE_RATE);
+        if (send_chunk(c->fd, hdr, hn) != 0) return 1;
+        c->sent_wav_hdr = 1;
+    }
+    if (n > 0 && send_chunk(c->fd, pcm, n * sizeof(int16_t)) != 0) return 1;
+    return 0;
+}
+
+/* Silent samples at the head / tail of a buffer (10 ms peak scan). */
+static size_t sil_lead(const int16_t* p, size_t n) {
+    size_t i = 0;
+    while (i < n) {
+        size_t f = n - i < GAP_FRAME ? n - i : GAP_FRAME;
+        for (size_t k = 0; k < f; k++)
+            if (p[i + k] > GAP_SIL_PEAK || p[i + k] < -GAP_SIL_PEAK)
+                return i + k;
+        i += f;
+    }
+    return n;
+}
+
+static size_t sil_tail(const int16_t* p, size_t n) {
+    size_t i = n;
+    while (i > 0) {
+        size_t f = i < GAP_FRAME ? i : GAP_FRAME;
+        for (size_t k = 0; k < f; k++)
+            if (p[i - 1 - k] > GAP_SIL_PEAK || p[i - 1 - k] < -GAP_SIL_PEAK)
+                return n - (i - k);
+        i -= f;
+    }
+    return n;
+}
+
+/* Feed chunk audio through the boundary filter: trim a later chunk's
+ * leading silence, hold back the tail window, forward the rest. */
+static int gap_feed(conn* c, const int16_t* pcm, size_t n) {
+    if (!c->gap_hold) return conn_emit(c, pcm, n); /* filter disabled */
+    if (c->gap_lead_skip) {
+        size_t lead = sil_lead(pcm, n);
+        size_t budget = GAP_LEAD_MAX - c->gap_lead_skipped;
+        if (lead > budget) lead = budget;
+        c->gap_lead_skipped += lead;
+        pcm += lead;
+        n -= lead;
+        if (n > 0 || c->gap_lead_skipped >= GAP_LEAD_MAX)
+            c->gap_lead_skip = 0;
+        if (n == 0) return 0;
+    }
+    while (n > 0) {
+        size_t room = GAP_HOLD_SAMPLES - c->gap_hold_n;
+        if (room == 0) {
+            /* forward the oldest half, keep the newest half held back */
+            size_t fwd = GAP_HOLD_SAMPLES / 2;
+            if (conn_emit(c, c->gap_hold, fwd) != 0) return 1;
+            memmove(c->gap_hold, c->gap_hold + fwd,
+                    (c->gap_hold_n - fwd) * sizeof(int16_t));
+            c->gap_hold_n -= fwd;
+            room = GAP_HOLD_SAMPLES - c->gap_hold_n;
+        }
+        size_t take = n < room ? n : room;
+        memcpy(c->gap_hold + c->gap_hold_n, pcm, take * sizeof(int16_t));
+        c->gap_hold_n += take;
+        pcm += take;
+        n -= take;
+    }
+    return 0;
+}
+
+/* Non-last chunk finished: trim the trailing silence out of the held-back
+ * tail, insert exactly gap_ms of silence, arm leading-trim for the next
+ * chunk. */
+static int gap_boundary(conn* c) {
+    if (!c->gap_hold) return 0;
+    size_t tail = sil_tail(c->gap_hold, c->gap_hold_n);
+    if (conn_emit(c, c->gap_hold, c->gap_hold_n - tail) != 0) return 1;
+    c->gap_hold_n = 0;
+    static const int16_t zeros[4410] = {0};
+    size_t gap = (size_t)c->gap_ms * 44100 / 1000;
+    while (gap > 0) {
+        size_t t = gap < 4410 ? gap : 4410;
+        if (conn_emit(c, zeros, t) != 0) return 1;
+        gap -= t;
+    }
+    c->gap_lead_skip = 1;
+    c->gap_lead_skipped = 0;
+    return 0;
+}
+
 static int tts_audio_cb(void* user, const int16_t* pcm, int64_t n, int final) {
     conn* c = (conn*)user;
+    const int chained = c->n_chunks > 1;
+    if (n > 0 && pcm) {
+        int rc = chained ? gap_feed(c, pcm, (size_t)n)
+                         : conn_emit(c, pcm, (size_t)n);
+        if (rc != 0) return 1;
+    }
+    if (final && chained && c->cur_chunk + 1 < c->n_chunks) {
+        if (gap_boundary(c) != 0) return 1;
+        /* non-last chunk done: hand back to the poll loop for the next
+         * submit. LAST touch of c by this thread until resubmitted. */
+        atomic_store(&c->chunk_advance, 1);
+        return 0;
+    }
+    if (final && chained && c->gap_hold) {
+        /* last chunk: flush the held-back tail untrimmed */
+        if (conn_emit(c, c->gap_hold, c->gap_hold_n) != 0) return 1;
+        c->gap_hold_n = 0;
+    }
     if (c->buffered) {
-        if (n > 0 && pcm) {
-            size_t add = (size_t)n * sizeof(int16_t);
-            if (c->acc_len + add > c->acc_cap) {
-                size_t nc = c->acc_cap ? c->acc_cap * 2 : (1u << 20);
-                while (nc < c->acc_len + add) nc *= 2;
-                char* nb = (char*)realloc(c->acc, nc);
-                if (!nb) {
-                    send_simple(c->fd, 500, "Internal Server Error",
-                                "application/json", "{\"error\":\"oom\"}");
-                    atomic_store(&c->finished, 1); /* poll loop reaps */
-                    return 1;
-                }
-                c->acc = nb;
-                c->acc_cap = nc;
-            }
-            memcpy(c->acc + c->acc_len, pcm, add);
-            c->acc_len += add;
-        }
-        if (final && c->cur_chunk + 1 < c->n_chunks) {
-            /* non-last chunk done: hand back to the poll loop for the next
-             * submit. LAST touch of c by this thread until resubmitted. */
-            atomic_store(&c->chunk_advance, 1);
-            return 0;
-        }
         if (final) {
             char head[256];
             size_t body = c->acc_len + (c->wav ? 44u : 0u);
@@ -274,22 +406,8 @@ static int tts_audio_cb(void* user, const int16_t* pcm, int64_t n, int final) {
         }
         return 0;
     }
-    if (c->wav && !c->sent_wav_hdr) {
-        /* WAV header with unknown length: pass the max so players stream. */
-        uint8_t hdr[44];
-        size_t hn = s2p_wav_header(hdr, 0xFFFFFFFFu, S2P_SAMPLE_RATE);
-        if (send_chunk(c->fd, hdr, hn) != 0) return 1;
-        c->sent_wav_hdr = 1;
-    }
-    if (n > 0 && pcm) {
-        if (send_chunk(c->fd, pcm, (size_t)n * sizeof(int16_t)) != 0)
-            return 1;
-    }
     if (final) {
-        if (c->cur_chunk + 1 < c->n_chunks) {
-            atomic_store(&c->chunk_advance, 1); /* poll loop submits next */
-            return 0;
-        }
+        (void)conn_emit(c, NULL, 0); /* header even for an empty stream */
         (void)send_all(c->fd, "0\r\n\r\n", 5); /* terminal chunk */
         atomic_store(&c->finished, 1);         /* LAST touch of c by this thread */
     }
@@ -330,6 +448,7 @@ static void conn_reset(conn* c) {
     s2p_text_chunks_free(c->chunks, c->n_chunks);
     free(c->lf_clone_pcm);
     free(c->lf_clone_text);
+    free(c->gap_hold);
     memset(c, 0, sizeof(*c));
     c->fd = -1;
     c->st = C_FREE;
@@ -527,6 +646,15 @@ static void route_tts(http_srv* s, conn* c) {
     if ((v = s2p_jobj_get(root, "chunk_sentences")) != NULL &&
         !s2p_jis_null(v))
         chunk_sentences = (int)s2p_jint(v);
+    int chunk_gap_ms = HTTP_CHUNK_GAP_MS_DEFAULT;
+    {
+        const char* e = getenv("S2P_CHUNK_GAP_MS");
+        if (e && e[0]) chunk_gap_ms = atoi(e);
+    }
+    if ((v = s2p_jobj_get(root, "chunk_gap_ms")) != NULL && !s2p_jis_null(v))
+        chunk_gap_ms = (int)s2p_jint(v);
+    if (chunk_gap_ms < 0) chunk_gap_ms = 0;
+    if (chunk_gap_ms > 10000) chunk_gap_ms = 10000;
 
     /* voice selection / on-the-fly cloning (all errors here are pre-header,
      * so clients still get proper JSON error responses) */
@@ -605,6 +733,14 @@ static void route_tts(http_srv* s, conn* c) {
                 c->lf_clone_text = clone_text_c;
                 clone_pcm = NULL;
                 clone_text_c = NULL;
+                c->gap_ms = chunk_gap_ms;
+                c->gap_hold_n = 0;
+                c->gap_lead_skip = 0;
+                if (chunk_gap_ms > 0) {
+                    c->gap_hold = (int16_t*)malloc(GAP_HOLD_SAMPLES *
+                                                   sizeof(int16_t));
+                    /* alloc failure: filter off, raw concatenation */
+                }
             } else {
                 s2p_text_chunks_free(chunks, n);
             }
