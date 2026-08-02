@@ -259,6 +259,9 @@ def main():
     ap.add_argument("--batch", type=int, default=256)
     ap.add_argument("--lr", type=float, default=2e-5)
     ap.add_argument("--holdout", type=int, default=8192)
+    ap.add_argument("--dagger", type=float, default=0.5,
+                    help="fraction of each batch forced with student "
+                         "free-run codes in the second training half")
     ap.add_argument("--eval-only", action="store_true")
     args = ap.parse_args()
     dev = "cuda"
@@ -338,9 +341,22 @@ def main():
         h = hid[ix].to(dev)
         s = sem[ix].to(dev)
         tc = tcodes[ix].to(dev)
+        force = tc[:, :8]
+        if args.dagger > 0 and step * 2 >= args.steps:
+            # DAgger phase (second half): for a slice of the batch, force
+            # with the STUDENT's own free-run codes and let the teacher
+            # provide the corrective targets on those prefixes — trains
+            # recovery from the student's own drift (exposure bias).
+            nd = int(args.batch * args.dagger)
+            if nd > 0:
+                with torch.no_grad():
+                    student.eval()
+                    sc = student.greedy(h[:nd], s[:nd])
+                    student.train()
+                force = torch.cat([sc[:, :8], tc[nd:, :8]], dim=0)
         with torch.no_grad():
-            tlog = teacher.forward_seq(h, s, tc[:, :8])
-        slog = student.forward_seq(h, s, tc[:, :8])
+            tlog = teacher.forward_seq(h, s, force)
+        slog = student.forward_seq(h, s, force)
         loss = F.kl_div(F.log_softmax(slog, -1),
                         F.log_softmax(tlog, -1),
                         log_target=True, reduction="batchmean") / 9.0
