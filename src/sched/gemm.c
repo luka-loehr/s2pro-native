@@ -244,6 +244,11 @@ static int int4_mse(void) {
     return v ? (v[0] == '1' && v[1] == '\0') : 1; /* default ON */
 }
 
+static int int4_packed(void) {
+    const char* v = getenv("S2P_INT4_PACKED");
+    return v ? (v[0] == '1' && v[1] == '\0') : 1; /* default ON */
+}
+
 static int int4_wanted(s2p_qsite site) {
     static int banner = 0;
     if (!env_flag("S2P_INT4")) return 0;
@@ -325,9 +330,31 @@ static s2p_status prepare_int4_group(s2p_linear* lin, cudaStream_t stream) {
             rc = S2P_ERR_CUDA;
         }
     }
+    if (rc == S2P_OK && int4_packed()) {
+        /* pack two nibbles per byte, then drop the int8 container — that is
+         * the INT4 bandwidth/RAM win (outputs stay bit-identical). */
+        int64_t pshape[2] = { (int64_t)N, (int64_t)K / 2 };
+        rc = s2p_tensor_device_alloc(&lin->w_pack, S2P_DT_I8, 2, pshape);
+        if (rc == S2P_OK)
+            rc = s2p_int4_pack(lin->w_pack.data, lin->w_int8.data, N, K,
+                               stream);
+        if (rc == S2P_OK) {
+            cudaError_t ce = cudaStreamSynchronize(stream);
+            if (ce != cudaSuccess) {
+                fprintf(stderr, "[s2pro] int4 pack sync: %s\n",
+                        cudaGetErrorString(ce));
+                rc = S2P_ERR_CUDA;
+            }
+        }
+        if (rc == S2P_OK) {
+            s2p_tensor_free(&lin->w_int8);
+            lin->q_packed = 1;
+        }
+    }
     if (rc != S2P_OK) {
         s2p_tensor_free(&lin->w_int8);
         s2p_tensor_free(&lin->w_iscale);
+        s2p_tensor_free(&lin->w_pack);
         return rc;
     }
     lin->int8_ready = 1;
@@ -399,6 +426,10 @@ s2p_status s2p_linear_forward(const s2p_linear* lin, const void* x_bf16,
     }
     if (mode == S2P_GEMM_INT8 && lin->int8_ready) {
         if (M <= S2P_INT8_GEMV_MAX_M) {
+            if (lin->q_packed)
+                return s2p_int4p_gemv(y_bf16, x_bf16, lin->w_pack.data,
+                                      (const float*)lin->w_iscale.data, M, N,
+                                      K, lin->q_group, stream);
             if (lin->q_group > 0)
                 return s2p_intq_gemv(y_bf16, x_bf16, lin->w_int8.data,
                                      (const float*)lin->w_iscale.data, M, N,
@@ -413,21 +444,33 @@ s2p_status s2p_linear_forward(const s2p_linear* lin, const void* x_bf16,
         pthread_mutex_lock(&g.mu);
         s2p_status rc = deq_scratch_reserve(
             (size_t)N * K * sizeof(uint16_t), stream);
-        if (rc == S2P_OK)
-            rc = lin->q_group > 0
-                     ? s2p_intq_dequant(g.deq, lin->w_int8.data,
-                                        (const float*)lin->w_iscale.data, N,
-                                        K, lin->q_group, stream)
-                     : s2p_int8_dequant(g.deq, lin->w_int8.data,
-                                        (const float*)lin->w_iscale.data, N,
-                                        K, stream);
+        if (rc == S2P_OK) {
+            if (lin->q_packed)
+                rc = s2p_int4p_dequant(g.deq, lin->w_pack.data,
+                                       (const float*)lin->w_iscale.data, N,
+                                       K, lin->q_group, stream);
+            else if (lin->q_group > 0)
+                rc = s2p_intq_dequant(g.deq, lin->w_int8.data,
+                                      (const float*)lin->w_iscale.data, N,
+                                      K, lin->q_group, stream);
+            else
+                rc = s2p_int8_dequant(g.deq, lin->w_int8.data,
+                                      (const float*)lin->w_iscale.data, N,
+                                      K, stream);
+        }
         if (rc == S2P_OK)
             rc = gemm_bf16_locked(x_bf16, g.deq, y_bf16, M, N, K, stream);
         pthread_mutex_unlock(&g.mu);
         return rc;
     }
     /* BF16 default; also the silent fallback for FP8/INT8-unready layers. */
-    if (!lin->w_bf16.data) return S2P_ERR_STATE; /* dropped by prepare_int8 */
+    if (!lin->w_bf16.data) {
+        fprintf(stderr, "[s2pro] forward fallback without BF16 copy "
+                        "[N=%d,K=%d] M=%d mode=%d ready=%d grp=%d pk=%d\n",
+                N, K, M, (int)mode, lin->int8_ready, lin->q_group,
+                lin->q_packed);
+        return S2P_ERR_STATE; /* dropped by prepare_int8 */
+    }
     return s2p_gemm_bf16(x_bf16, lin->w_bf16.data, y_bf16, M, N, K, stream);
 }
 
@@ -438,7 +481,9 @@ void s2p_linear_free(s2p_linear* lin) {
     s2p_tensor_free(&lin->w_scales);
     s2p_tensor_free(&lin->w_int8);
     s2p_tensor_free(&lin->w_iscale);
+    s2p_tensor_free(&lin->w_pack);
     lin->fp8_ready = 0;
     lin->int8_ready = 0;
     lin->q_group = 0;
+    lin->q_packed = 0;
 }

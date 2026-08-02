@@ -237,6 +237,90 @@ static __global__ void k_dequant_g(__nv_bfloat16* o, const int8_t* w,
         orow[k] = __float2bfloat16((float)wrow[k] * srow[k >> gshift]);
 }
 
+/* ── Packed 4-bit storage: two weights per byte ──
+ *
+ * Byte i of a packed row holds weight 2i in the low nibble and weight 2i+1
+ * in the high nibble (two's complement, -8..7; the quantizer emits -7..7).
+ * The GEMV unpacks 16 weights from 8 bytes into the SAME j=0..15 order the
+ * int8-container kernel reads, and accumulates in the SAME op order with
+ * the SAME f32 group scales — packed output is bit-identical to the
+ * unpacked path, so listening sign-off transfers 1:1. What changes is the
+ * weight stream: 16 bytes + 4-byte scale per 32 weights instead of 32+4. */
+
+static __global__ void k_pack_nib(uint8_t* p, const int8_t* q, size_t n) {
+    const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    p[i] = (uint8_t)((q[2 * i] & 0xF) | ((q[2 * i + 1] & 0xF) << 4));
+}
+
+static __device__ __forceinline__ void unpack16(int8_t* w16, const uint8_t* b) {
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+        w16[2 * i] = (int8_t)((int8_t)(b[i] << 4) >> 4);
+        w16[2 * i + 1] = (int8_t)((int8_t)b[i] >> 4);
+    }
+}
+
+static __global__ void k_gemv_p(__nv_bfloat16* y, const __nv_bfloat16* x,
+                                const uint8_t* w, const float* scales, int M,
+                                int N, int K, int gshift) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int n = blockIdx.x * GEMV_WARPS + warp;
+    if (n >= N) return;
+    const uint8_t* wrow = w + (size_t)n * (K >> 1);
+    const float* srow = scales + (size_t)n * (K >> gshift);
+
+    float acc[S2P_INT8_GEMV_MAX_M];
+#pragma unroll
+    for (int m = 0; m < S2P_INT8_GEMV_MAX_M; m++) acc[m] = 0.0f;
+
+    for (int k0 = lane * 16; k0 < K; k0 += 32 * 16) {
+        const uint2 wv = *(const uint2*)(wrow + (k0 >> 1));
+        int8_t w16[16];
+        unpack16(w16, (const uint8_t*)&wv);
+        const float gs = srow[k0 >> gshift];
+        for (int m = 0; m < M; m++) { /* M uniform across the warp */
+            const __nv_bfloat16* xp = x + (size_t)m * K + k0;
+            const int4 xa = *(const int4*)xp;
+            const int4 xb = *(const int4*)(xp + 8);
+            const __nv_bfloat16* x16a = (const __nv_bfloat16*)&xa;
+            const __nv_bfloat16* x16b = (const __nv_bfloat16*)&xb;
+            float s = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 8; j++)
+                s += (float)w16[j] * __bfloat162float(x16a[j]);
+#pragma unroll
+            for (int j = 0; j < 8; j++)
+                s += (float)w16[8 + j] * __bfloat162float(x16b[j]);
+            acc[m] += s * gs;
+        }
+    }
+
+#pragma unroll
+    for (int m = 0; m < S2P_INT8_GEMV_MAX_M; m++)
+        for (int off = 16; off > 0; off >>= 1)
+            acc[m] += __shfl_down_sync(0xffffffffu, acc[m], off);
+
+    if (lane == 0)
+        for (int m = 0; m < M; m++)
+            y[(size_t)m * N + n] = __float2bfloat16(acc[m]);
+}
+
+static __global__ void k_dequant_p(__nv_bfloat16* o, const uint8_t* w,
+                                   const float* scales, int K, int gshift) {
+    const int n = blockIdx.x;
+    const uint8_t* wrow = w + (size_t)n * (K >> 1);
+    const float* srow = scales + (size_t)n * (K >> gshift);
+    __nv_bfloat16* orow = o + (size_t)n * K;
+    for (int k = threadIdx.x; k < K; k += blockDim.x) {
+        const uint8_t b = wrow[k >> 1];
+        const int8_t v = (k & 1) ? (int8_t)((int8_t)b >> 4)
+                                 : (int8_t)((int8_t)(b << 4) >> 4);
+        orow[k] = __float2bfloat16((float)v * srow[k >> gshift]);
+    }
+}
+
 static int gshift_of(int G) {
     if (G < 16 || (G & (G - 1)) != 0) return -1;
     int s = 0;
@@ -298,6 +382,62 @@ extern "C" s2p_status s2p_intq_dequant(void* w_bf16, const void* w_i8,
     if (ce != cudaSuccess) {
         fprintf(stderr, "[s2pro] intq dequant launch (N=%d,K=%d): %s\n", N, K,
                 cudaGetErrorString(ce));
+        return S2P_ERR_CUDA;
+    }
+    return S2P_OK;
+}
+
+extern "C" s2p_status s2p_int4_pack(void* w_pack, const void* w_i8,
+                                    int N, int K, cudaStream_t stream) {
+    if (!w_pack || !w_i8 || N <= 0 || K <= 0 || (K & 1)) return S2P_ERR_INVALID;
+    const size_t n = (size_t)N * (K >> 1);
+    const int threads = 256;
+    k_pack_nib<<<(unsigned)((n + threads - 1) / threads), threads, 0, stream>>>(
+        (uint8_t*)w_pack, (const int8_t*)w_i8, n);
+    cudaError_t ce = cudaGetLastError();
+    if (ce != cudaSuccess) {
+        fprintf(stderr, "[s2pro] int4 pack launch (N=%d,K=%d): %s\n", N, K,
+                cudaGetErrorString(ce));
+        return S2P_ERR_CUDA;
+    }
+    return S2P_OK;
+}
+
+extern "C" s2p_status s2p_int4p_gemv(void* y_bf16, const void* x_bf16,
+                                     const void* w_pack, const float* scales,
+                                     int M, int N, int K, int G,
+                                     cudaStream_t stream) {
+    if (!y_bf16 || !x_bf16 || !w_pack || !scales || M <= 0 || N <= 0 || K <= 0)
+        return S2P_ERR_INVALID;
+    const int gs = gshift_of(G);
+    if (M > S2P_INT8_GEMV_MAX_M || K % 512 != 0 || gs < 0 || K % G != 0)
+        return S2P_ERR_INVALID;
+    const int blocks = (N + GEMV_WARPS - 1) / GEMV_WARPS;
+    k_gemv_p<<<blocks, GEMV_WARPS * 32, 0, stream>>>(
+        (__nv_bfloat16*)y_bf16, (const __nv_bfloat16*)x_bf16,
+        (const uint8_t*)w_pack, scales, M, N, K, gs);
+    cudaError_t ce = cudaGetLastError();
+    if (ce != cudaSuccess) {
+        fprintf(stderr, "[s2pro] int4p gemv launch (M=%d,N=%d,K=%d): %s\n", M,
+                N, K, cudaGetErrorString(ce));
+        return S2P_ERR_CUDA;
+    }
+    return S2P_OK;
+}
+
+extern "C" s2p_status s2p_int4p_dequant(void* w_bf16, const void* w_pack,
+                                        const float* scales, int N, int K,
+                                        int G, cudaStream_t stream) {
+    if (!w_bf16 || !w_pack || !scales || N <= 0 || K <= 0 || (K & 1))
+        return S2P_ERR_INVALID;
+    const int gs = gshift_of(G);
+    if (gs < 0 || K % G != 0) return S2P_ERR_INVALID;
+    k_dequant_p<<<N, QUANT_THREADS, 0, stream>>>(
+        (__nv_bfloat16*)w_bf16, (const uint8_t*)w_pack, scales, K, gs);
+    cudaError_t ce = cudaGetLastError();
+    if (ce != cudaSuccess) {
+        fprintf(stderr, "[s2pro] int4p dequant launch (N=%d,K=%d): %s\n", N,
+                K, cudaGetErrorString(ce));
         return S2P_ERR_CUDA;
     }
     return S2P_OK;
