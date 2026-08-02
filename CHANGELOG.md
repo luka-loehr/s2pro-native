@@ -34,6 +34,21 @@ for published releases.
 
 ### Added
 
+- QAT self-distillation tooling for the all-INT4 fast-AR
+  (tools/qat_fastar.py + tools/apply_qat_patch.py, S2P_DUMP_FRAMES
+  engine hook): the BF16 fast-AR trains its own 4-bit copy with the
+  deployment quantizer inside the loop (teacher-forced KL + DAgger);
+  held-out per-step argmax agreement against the teacher is the metric,
+  the per-channel INT8 deployment quantizer (0.964 teacher-forced /
+  0.896 free-run) is the bar. Methodology in docs/QUANT.md.
+- GEMM-grade DAC conv kernels (docs/DAC-KERNELS.md): 2D register
+  blocking (2 time positions x 8 output channels per thread, smem
+  weight chunks) for all k<=7 convs and phase-partitioned tconvs (a
+  block serves one to%%stride phase — no masked lanes, coalesced input
+  columns). Whole-buffer DAC 15.1 -> 2.1 ms/frame, every step gated on
+  byte-identical PCM (MD5); server wall RTF 0.92-0.95 -> 0.75-0.76,
+  TTFA 0.15/0.21 s. The losing attempts (pure co-tiling, smem-staged
+  co-tiling) are recorded with their numbers.
 - DAC per-kernel-type profiler (S2P_DAC_PROF=1) and co-tiled pointwise
   convs: k=1 residual-unit convs re-read the input plane once per output
   channel (18 GB measured on 192ch where 0.2 GB is inherent); one thread
