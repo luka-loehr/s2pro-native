@@ -254,14 +254,26 @@ s2p_status s2pfa_load(s2pfa** out, s2p_st* st, s2p_gemm_mode mode,
         if (rc == S2P_OK) rc = s2p_linear_prepare_fp8(&f->output, stream);
     }
     if (rc == S2P_OK && mode == S2P_GEMM_INT8) {
+        /* S2P_QSITE_FASTAR: stays per-channel INT8 under S2P_INT4=1 (mixed
+         * precision — this module, run 9x per frame, is the one 4-bit
+         * damages most) unless S2P_INT4_ALL=1. */
         for (int l = 0; l < FA_LAYERS && rc == S2P_OK; l++) {
             s2pfa_layer* L = &f->layers[l];
-            rc = s2p_linear_prepare_int8(&L->wqkv, stream);
-            if (rc == S2P_OK) rc = s2p_linear_prepare_int8(&L->wo, stream);
-            if (rc == S2P_OK) rc = s2p_linear_prepare_int8(&L->w13, stream);
-            if (rc == S2P_OK) rc = s2p_linear_prepare_int8(&L->w2, stream);
+            rc = s2p_linear_prepare_int8_site(&L->wqkv, S2P_QSITE_FASTAR,
+                                              stream);
+            if (rc == S2P_OK)
+                rc = s2p_linear_prepare_int8_site(&L->wo, S2P_QSITE_FASTAR,
+                                                  stream);
+            if (rc == S2P_OK)
+                rc = s2p_linear_prepare_int8_site(&L->w13, S2P_QSITE_FASTAR,
+                                                  stream);
+            if (rc == S2P_OK)
+                rc = s2p_linear_prepare_int8_site(&L->w2, S2P_QSITE_FASTAR,
+                                                  stream);
         }
-        if (rc == S2P_OK) rc = s2p_linear_prepare_int8(&f->output, stream);
+        if (rc == S2P_OK)
+            rc = s2p_linear_prepare_int8_site(&f->output, S2P_QSITE_FASTAR,
+                                              stream);
     }
 
     /* decode workspace */
