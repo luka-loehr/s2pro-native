@@ -159,9 +159,19 @@ curl -X POST localhost:8010/v1/tts -d '{"text":"Hello.","format":"wav"}' -o hell
 | `POST /v1/tts` | Chunked streaming synthesis (WAV or raw PCM). |
 
 `POST /v1/tts` accepts `{"text": "…", "format": "wav"|"pcm", "temperature",
-"top_p", "seed", "stream", "voice", "reference_audio_b64",
+"top_p", "seed", "stream", "chunk_length", "voice", "reference_audio_b64",
 "reference_text"}` and, when the server is started with `--token`, requires
-`Authorization: Bearer <token>`. `voice` selects a pre-encoded registry
+`Authorization: Bearer <token>`. Voiced requests longer than
+`chunk_length` bytes (default 300, env `S2P_CHUNK_BYTES`; `0` disables)
+are served as a long-form chain: the text splits at sentence boundaries
+and each chunk generates against the fresh voice reference, all audio in
+one response. Measured reason: single-shot prosody flattens — punctuation
+pauses per 10 s bucket decay from ~0.5–1.0 s early to ~0–0.2 s after
+~40 s at every weight precision — while chunked generation holds the
+opening-quality prosody across the whole take (2–5 pauses per bucket
+through 130+ s; the same text runs ~26 % longer because the rushing is
+gone). Zero-shot requests never chunk (each chunk would draw a new
+voice). `voice` selects a pre-encoded registry
 voice; `reference_audio_b64` + `reference_text` clone a per-request wav
 (max 15 s) on the fly; neither selects zero-shot. Mixed-language text is
 ONE generation — voices are multilingual by construction

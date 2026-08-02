@@ -34,6 +34,18 @@ for published releases.
 
 ### Added
 
+- Long-form sentence chunking on `POST /v1/tts` (`chunk_length`, default
+  300 bytes, env `S2P_CHUNK_BYTES`, 0 = off; voiced requests only): text
+  splits at sentence boundaries (`src/text/chunker.c`, UTF-8-aware,
+  bracket-tag- and decimal-safe) and generates as chained scheduler
+  requests against the fresh voice reference, streamed or buffered into
+  ONE response. Fixes measured prosody flattening of long single-shot
+  takes: punctuation pauses per 10 s bucket decayed from ~0.5-1.0 s early
+  to ~0-0.2 s after ~40 s (identically at INT8 and INT4 — a property of
+  the growing self-generated context, not of quantization); chunked, the
+  pause structure holds through 130+ s and the same text runs ~26 %
+  longer (the vanished pauses were rushing). Explicit seeds vary per
+  chunk (seed + k*1000003) for reproducible-but-independent chunks.
 - f16 group scales (4.5 bits per weight all-in): at g32 the f32 scale
   plane was 20% of the packed weight stream. The quantizer rounds every
   MSE candidate through f16 before evaluating it, so the stored half is
