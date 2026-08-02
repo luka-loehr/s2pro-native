@@ -108,19 +108,199 @@ static __global__ void k_dequant(__nv_bfloat16* o, const int8_t* w,
         orow[k] = __float2bfloat16((float)wrow[k] * sc);
 }
 
-/* EXPERIMENT (listening only): S2P_INT4=1 quantizes to 15 levels (±7),
- * i.e. INT4 value precision inside the int8 container — the audio equals a
- * real per-channel INT4 deployment; memory and bandwidth stay INT8. */
-static int quant_levels(void) {
-    static int v = -1;
-    if (v < 0) {
-        const char* e = getenv("S2P_INT4");
-        v = (e && e[0] == '1' && e[1] == '\0') ? 7 : 127;
-        if (v == 7)
-            fprintf(stderr, "[s2pro] S2P_INT4=1: EXPERIMENTAL 4-bit value "
-                            "precision (int8 container)\n");
+/* ── Group-wise low-bit variants (INT4 value precision, int8 container) ──
+ *
+ * One scale per G consecutive K-elements instead of per whole row. At 4 bits
+ * the per-channel scheme audibly drifts over autoregressive generation (the
+ * absmax of a 2560..9728-wide row is a terrible shared step size); group-wise
+ * scales are the standard fix (GPTQ/AWQ/llama.cpp all quantize in groups of
+ * 32..128). Symmetric, with an optional per-group MSE scale search: absmax is
+ * only the largest candidate, shrinking the clip range trades rare saturation
+ * for a finer step over the bulk of the distribution.
+ *
+ * Layout: scales f32 [N, K/G] row-major. G must be a power of two, >= 16
+ * (so every 16-wide GEMV tile lies inside one group) and divide K. */
+
+#define GQ_NCAND 32 /* MSE search grid: cand 0 == plain absmax RTN */
+
+static __global__ void k_quant_g(int8_t* q, float* scales,
+                                 const __nv_bfloat16* w, int K, int G,
+                                 int levels, int mse) {
+    /* one block per group: blockIdx.x = n * (K/G) + g */
+    const int ng = K / G;
+    const int n = blockIdx.x / ng;
+    const int g = blockIdx.x - n * ng;
+    const __nv_bfloat16* wp = w + (size_t)n * K + (size_t)g * G;
+    __shared__ float red[QUANT_THREADS];
+
+    float amax = 0.0f;
+    for (int k = threadIdx.x; k < G; k += blockDim.x)
+        amax = fmaxf(amax, fabsf(__bfloat162float(wp[k])));
+    red[threadIdx.x] = amax;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s)
+            red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + s]);
+        __syncthreads();
     }
-    return v;
+    amax = red[0];
+    float scale = amax > 0.0f ? amax / (float)levels : 1.0f;
+
+    if (mse && amax > 0.0f) {
+        /* grid-search the clip range for min Σ(w - Q(w))² */
+        float best_err = 3.4e38f, best_s = scale;
+        for (int c = 0; c < GQ_NCAND; c++) {
+            const float s = scale * (1.0f - (float)c / (2.0f * GQ_NCAND));
+            const float inv = 1.0f / s;
+            float err = 0.0f;
+            for (int k = threadIdx.x; k < G; k += blockDim.x) {
+                const float v = __bfloat162float(wp[k]);
+                int qi = __float2int_rn(v * inv);
+                qi = qi > levels ? levels : (qi < -levels ? -levels : qi);
+                const float d = v - (float)qi * s;
+                err += d * d;
+            }
+            __syncthreads();
+            red[threadIdx.x] = err;
+            __syncthreads();
+            for (int r = blockDim.x / 2; r > 0; r >>= 1) {
+                if (threadIdx.x < r) red[threadIdx.x] += red[threadIdx.x + r];
+                __syncthreads();
+            }
+            if (red[0] < best_err) { best_err = red[0]; best_s = s; }
+        }
+        scale = best_s;
+    }
+
+    if (threadIdx.x == 0) scales[(size_t)n * ng + g] = scale;
+    const float inv = 1.0f / scale;
+    int8_t* qp = q + (size_t)n * K + (size_t)g * G;
+    for (int k = threadIdx.x; k < G; k += blockDim.x) {
+        int v = __float2int_rn(__bfloat162float(wp[k]) * inv);
+        v = v > levels ? levels : (v < -levels ? -levels : v);
+        qp[k] = (int8_t)v;
+    }
+}
+
+static __global__ void k_gemv_g(__nv_bfloat16* y, const __nv_bfloat16* x,
+                                const int8_t* w, const float* scales, int M,
+                                int N, int K, int gshift) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int n = blockIdx.x * GEMV_WARPS + warp;
+    if (n >= N) return;
+    const int8_t* wrow = w + (size_t)n * K;
+    const float* srow = scales + (size_t)n * (K >> gshift);
+
+    float acc[S2P_INT8_GEMV_MAX_M];
+#pragma unroll
+    for (int m = 0; m < S2P_INT8_GEMV_MAX_M; m++) acc[m] = 0.0f;
+
+    for (int k0 = lane * 16; k0 < K; k0 += 32 * 16) {
+        const int4 wv = *(const int4*)(wrow + k0);
+        const int8_t* wq = (const int8_t*)&wv;
+        const float gs = srow[k0 >> gshift]; /* 16-tile ⊂ one group (G>=16) */
+        for (int m = 0; m < M; m++) { /* M uniform across the warp */
+            const __nv_bfloat16* xp = x + (size_t)m * K + k0;
+            const int4 xa = *(const int4*)xp;
+            const int4 xb = *(const int4*)(xp + 8);
+            const __nv_bfloat16* x16a = (const __nv_bfloat16*)&xa;
+            const __nv_bfloat16* x16b = (const __nv_bfloat16*)&xb;
+            float s = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 8; j++)
+                s += (float)wq[j] * __bfloat162float(x16a[j]);
+#pragma unroll
+            for (int j = 0; j < 8; j++)
+                s += (float)wq[8 + j] * __bfloat162float(x16b[j]);
+            acc[m] += s * gs;
+        }
+    }
+
+#pragma unroll
+    for (int m = 0; m < S2P_INT8_GEMV_MAX_M; m++)
+        for (int off = 16; off > 0; off >>= 1)
+            acc[m] += __shfl_down_sync(0xffffffffu, acc[m], off);
+
+    if (lane == 0)
+        for (int m = 0; m < M; m++)
+            y[(size_t)m * N + n] = __float2bfloat16(acc[m]);
+}
+
+static __global__ void k_dequant_g(__nv_bfloat16* o, const int8_t* w,
+                                   const float* scales, int K, int gshift) {
+    const int n = blockIdx.x;
+    const int8_t* wrow = w + (size_t)n * K;
+    const float* srow = scales + (size_t)n * (K >> gshift);
+    __nv_bfloat16* orow = o + (size_t)n * K;
+    for (int k = threadIdx.x; k < K; k += blockDim.x)
+        orow[k] = __float2bfloat16((float)wrow[k] * srow[k >> gshift]);
+}
+
+static int gshift_of(int G) {
+    if (G < 16 || (G & (G - 1)) != 0) return -1;
+    int s = 0;
+    while ((1 << s) < G) s++;
+    return s;
+}
+
+extern "C" s2p_status s2p_intq_quant(void* w_i8, float* scales,
+                                     const void* w_bf16, int N, int K, int G,
+                                     int levels, int mse,
+                                     cudaStream_t stream) {
+    if (!w_i8 || !scales || !w_bf16 || N <= 0 || K <= 0 || levels <= 0)
+        return S2P_ERR_INVALID;
+    if (gshift_of(G) < 0 || K % G != 0) return S2P_ERR_INVALID;
+    const int threads = G < QUANT_THREADS ? G : QUANT_THREADS;
+    k_quant_g<<<(unsigned)N * (K / G), threads, 0, stream>>>(
+        (int8_t*)w_i8, scales, (const __nv_bfloat16*)w_bf16, K, G, levels,
+        mse);
+    cudaError_t ce = cudaGetLastError();
+    if (ce != cudaSuccess) {
+        fprintf(stderr, "[s2pro] intq quant launch (N=%d,K=%d,G=%d): %s\n", N,
+                K, G, cudaGetErrorString(ce));
+        return S2P_ERR_CUDA;
+    }
+    return S2P_OK;
+}
+
+extern "C" s2p_status s2p_intq_gemv(void* y_bf16, const void* x_bf16,
+                                    const void* w_i8, const float* scales,
+                                    int M, int N, int K, int G,
+                                    cudaStream_t stream) {
+    if (!y_bf16 || !x_bf16 || !w_i8 || !scales || M <= 0 || N <= 0 || K <= 0)
+        return S2P_ERR_INVALID;
+    const int gs = gshift_of(G);
+    if (M > S2P_INT8_GEMV_MAX_M || K % 512 != 0 || gs < 0 || K % G != 0)
+        return S2P_ERR_INVALID;
+    const int blocks = (N + GEMV_WARPS - 1) / GEMV_WARPS;
+    k_gemv_g<<<blocks, GEMV_WARPS * 32, 0, stream>>>(
+        (__nv_bfloat16*)y_bf16, (const __nv_bfloat16*)x_bf16,
+        (const int8_t*)w_i8, scales, M, N, K, gs);
+    cudaError_t ce = cudaGetLastError();
+    if (ce != cudaSuccess) {
+        fprintf(stderr, "[s2pro] intq gemv launch (M=%d,N=%d,K=%d): %s\n", M,
+                N, K, cudaGetErrorString(ce));
+        return S2P_ERR_CUDA;
+    }
+    return S2P_OK;
+}
+
+extern "C" s2p_status s2p_intq_dequant(void* w_bf16, const void* w_i8,
+                                       const float* scales, int N, int K,
+                                       int G, cudaStream_t stream) {
+    if (!w_bf16 || !w_i8 || !scales || N <= 0 || K <= 0) return S2P_ERR_INVALID;
+    const int gs = gshift_of(G);
+    if (gs < 0 || K % G != 0) return S2P_ERR_INVALID;
+    k_dequant_g<<<N, QUANT_THREADS, 0, stream>>>(
+        (__nv_bfloat16*)w_bf16, (const int8_t*)w_i8, scales, K, gs);
+    cudaError_t ce = cudaGetLastError();
+    if (ce != cudaSuccess) {
+        fprintf(stderr, "[s2pro] intq dequant launch (N=%d,K=%d): %s\n", N, K,
+                cudaGetErrorString(ce));
+        return S2P_ERR_CUDA;
+    }
+    return S2P_OK;
 }
 
 extern "C" s2p_status s2p_int8_quant(void* w_i8, float* scales,
@@ -128,8 +308,7 @@ extern "C" s2p_status s2p_int8_quant(void* w_i8, float* scales,
                                      cudaStream_t stream) {
     if (!w_i8 || !scales || !w_bf16 || N <= 0 || K <= 0) return S2P_ERR_INVALID;
     k_quant<<<N, QUANT_THREADS, 0, stream>>>(
-        (int8_t*)w_i8, scales, (const __nv_bfloat16*)w_bf16, K,
-        quant_levels());
+        (int8_t*)w_i8, scales, (const __nv_bfloat16*)w_bf16, K, 127);
     cudaError_t ce = cudaGetLastError();
     if (ce != cudaSuccess) {
         fprintf(stderr, "[s2pro] int8 quant launch (N=%d,K=%d): %s\n", N, K,
