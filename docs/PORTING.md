@@ -1,6 +1,6 @@
-# Porting Fish Audio S2-Pro to native Rust
+# Porting Specification: Fish Audio S2-Pro
 
-> Authoritative implementation guide for a from-scratch native Rust + CUDA reimplementation of **Fish Audio S2-Pro (OpenAudio S2)**, using the reference PyTorch package (`fishaudio_s2_pro/…` + the SGLang-integrated modeling) as the source of truth. Every constant here is either read from source or from the checkpoint `config.json`; where a value is inferred or unverified it is flagged explicitly. Read this end-to-end before writing any kernel — several numerically load-bearing details (bf16 RoPE truncation, two-softmax sampling order, interleaved VQ injection) will silently produce garbled audio if gotten wrong.
+> Authoritative specification for a from-scratch native reimplementation of **Fish Audio S2-Pro (OpenAudio S2)**, using the reference PyTorch package (`fishaudio_s2_pro/…` + the SGLang-integrated modeling) as the source of truth. I drafted this document before implementation, originally targeting Rust; the shipped implementation is C11 + CUDA and follows the same module boundaries ([CONTRACT.md](../CONTRACT.md)) — the specification itself is language-agnostic. Every constant here is either read from source or from the checkpoint `config.json`; where a value is inferred or unverified it is flagged explicitly. Read this end-to-end before writing any kernel — several numerically load-bearing details (bf16 RoPE truncation, two-softmax sampling order, interleaved VQ injection) will silently produce garbled audio if gotten wrong.
 
 ---
 
@@ -336,7 +336,10 @@ Notes: the Fast-AR checkpoint contains **NO** `q_norm`/`k_norm` tensors (its `at
 
 ---
 
-## 10. Suggested Rust crate/module structure
+## 10. Module decomposition
+
+> Drafted as a Rust crate layout; the C11 implementation realizes the same
+> decomposition as `src/` modules (mapping in [CONTRACT.md](../CONTRACT.md)).
 
 | Crate | Maps to | Responsibility |
 |---|---|---|
