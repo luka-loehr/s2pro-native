@@ -160,6 +160,72 @@ __global__ void k_conv1d(const float* __restrict__ in, int cin, int tin,
             out[(size_t)(co0 + c) * tout + to] = acc[c];
 }
 
+/* 2D-register-blocked kernel for k in [2, S2PDK_CONV_K_MAX]: each thread
+ * accumulates S2PDK_CONV_TSUB time positions x S2PDK_CONV_CO output
+ * channels (16 accumulators), weights stream through smem in ci-chunks,
+ * inputs ride L1 (adjacent threads read adjacent taps — measured
+ * effectively free on the reference kernel). Per-output accumulation
+ * order stays ci-outer/kk-inner across ascending chunks — bit-identical. */
+#define S2PDK_CONV_CO   8
+#define S2PDK_CONV_TSUB 2
+
+__global__ void k_conv1d_wide(const float* __restrict__ in, int cin, int tin,
+                              const float* __restrict__ w,
+                              const float* __restrict__ b, int cout,
+                              int k, int dil, int stride, int leftpad,
+                              float* __restrict__ out, int tout) {
+    __shared__ float sw[S2PDK_CONV_CO * S2PDK_CONV_CI_CHUNK *
+                        S2PDK_CONV_K_MAX];
+    const int t_a = blockIdx.x * (blockDim.x * S2PDK_CONV_TSUB) + threadIdx.x;
+    const int t_b = t_a + blockDim.x;
+    const int co0 = blockIdx.y * S2PDK_CONV_CO;
+    const int nc = (cout - co0) < S2PDK_CONV_CO ? (cout - co0)
+                                                : S2PDK_CONV_CO;
+    const int act_a = (t_a < tout), act_b = (t_b < tout);
+
+    float acc_a[S2PDK_CONV_CO], acc_b[S2PDK_CONV_CO];
+    for (int c = 0; c < nc; c++) acc_a[c] = acc_b[c] = b ? b[co0 + c] : 0.f;
+
+    const int t0a = t_a * stride - leftpad;
+    const int t0b = t_b * stride - leftpad;
+    for (int ci0 = 0; ci0 < cin; ci0 += S2PDK_CONV_CI_CHUNK) {
+        const int nci = (cin - ci0) < S2PDK_CONV_CI_CHUNK
+                            ? (cin - ci0)
+                            : S2PDK_CONV_CI_CHUNK;
+        __syncthreads();
+        for (int c = 0; c < nc; c++) {
+            const float* src = w + ((size_t)(co0 + c) * cin + ci0) * k;
+            for (int idx = threadIdx.x; idx < nci * k; idx += blockDim.x)
+                sw[(size_t)c * S2PDK_CONV_CI_CHUNK * k + idx] = src[idx];
+        }
+        __syncthreads();
+        if (!act_a) continue; /* t_b > t_a: both inactive */
+        for (int ci = 0; ci < nci; ci++) {
+            const float* inr = in + (size_t)(ci0 + ci) * tin;
+            const float* swc = sw + (size_t)ci * k;
+            for (int kk = 0; kk < k; kk++) {
+                const int tia = t0a + kk * dil;
+                const int tib = t0b + kk * dil;
+                const float va =
+                    (tia >= 0 && tia < tin) ? inr[tia] : 0.f;
+                const float vb =
+                    (act_b && tib >= 0 && tib < tin) ? inr[tib] : 0.f;
+#pragma unroll
+                for (int c = 0; c < S2PDK_CONV_CO; c++) {
+                    const float wv =
+                        swc[(size_t)c * S2PDK_CONV_CI_CHUNK * k + kk];
+                    acc_a[c] += wv * va;
+                    acc_b[c] += wv * vb;
+                }
+            }
+        }
+    }
+    for (int c = 0; c < nc; c++) {
+        if (act_a) out[(size_t)(co0 + c) * tout + t_a] = acc_a[c];
+        if (act_b) out[(size_t)(co0 + c) * tout + t_b] = acc_b[c];
+    }
+}
+
 /* reference kernel (one block row per output channel): serves k >
  * S2PDK_CONV_K_MAX — encoder strided convs go up to k=16 — and stands as
  * the bit-exactness reference for the tiled kernel. */
@@ -190,7 +256,7 @@ extern "C" cudaError_t s2pdk_conv1d(const float* in, int cin, int tin,
                                     int k, int dil, int stride, int leftpad,
                                     float* out, int tout, cudaStream_t st) {
     int pi = prof_begin(0, st, cin, cout, k, dil, tout);
-    if (k == 1) {
+    if (0) { /* superseded by k_conv1d_wide below; kept for A/B */
         /* pointwise conv: the co-tiled kernel amortizes the input plane
          * 16-fold — measured 4x (81 -> 20 ms on 192ch x 122880). For k > 1
          * the tiled variant LOST to the reference (smem/FMA throughput per
@@ -201,6 +267,12 @@ extern "C" cudaError_t s2pdk_conv1d(const float* in, int cin, int tin,
                   (cout + S2PDK_CO_TILE - 1) / S2PDK_CO_TILE);
         k_conv1d<<<grid, 256, 0, st>>>(in, cin, tin, w, b, cout, k, dil,
                                        stride, leftpad, out, tout);
+    } else if (k <= S2PDK_CONV_K_MAX) {
+        dim3 grid((tout + 256 * S2PDK_CONV_TSUB - 1) /
+                      (256 * S2PDK_CONV_TSUB),
+                  (cout + S2PDK_CONV_CO - 1) / S2PDK_CONV_CO);
+        k_conv1d_wide<<<grid, 256, 0, st>>>(in, cin, tin, w, b, cout, k, dil,
+                                            stride, leftpad, out, tout);
     } else {
         dim3 grid((tout + 255) / 256, cout);
         k_conv1d_ref<<<grid, 256, 0, st>>>(in, cin, tin, w, b, cout, k, dil,
@@ -242,39 +314,85 @@ extern "C" cudaError_t s2pdk_dwconv1d(const float* in, int c, int tin,
 
 /* causal ConvTranspose1d: raw_out[j] = sum over (ti,k) with j = ti*stride + k;
  * causal crop keeps raw indices [0, tin*stride). w layout [Cin,Cout,K].
- * Reference layout (one block row per output channel): two tiled variants
- * (register co-tiling; co-tiling + per-kk smem weight staging) both LOST to
- * this kernel — with 1/stride of threads valid per tap, tiling mostly adds
- * synchronization and smem traffic for idle lanes. A GEMM-grade rewrite
- * (scatter-style over input positions) is the remaining lever (roadmap). */
+ *
+ * Phase-partitioned + output-channel-tiled: all outputs with the same
+ * to % stride share the same valid tap set, so a block serves ONE phase —
+ * no masked lanes (the earlier co-tiled attempts idled (stride-1)/stride
+ * of every warp), input reads coalesce (ti = j - m is consecutive across
+ * threads), and the per-(kk, ci-chunk) weight slice streams through an
+ * 8 KB smem tile. Per-output accumulation order stays exactly
+ * kk-ascending / ci-ascending — bit-identical to the reference kernel. */
+#define S2PDK_TC_CI_CHUNK 128 /* smem: 128*16*4 = 8 KB */
+
+#define S2PDK_TC_TSUB 2
+
 __global__ void k_tconv1d(const float* __restrict__ in, int cin, int tin,
                           const float* __restrict__ w,
                           const float* __restrict__ b, int cout,
                           int k, int stride, float* __restrict__ out,
                           int tout) {
-    int to = blockIdx.x * blockDim.x + threadIdx.x;
-    int co = blockIdx.y;
-    if (to >= tout || co >= cout) return;
-    float acc = b ? b[co] : 0.f;
-    for (int kk = 0; kk < k; kk++) {
-        int num = to - kk;
-        if (num < 0) break;              /* kk increasing => num only shrinks */
-        if (num % stride) continue;
-        int ti = num / stride;
-        if (ti >= tin) continue;
-        const float* inp = in + ti;
-        const float* wp = w + (size_t)co * k + kk;   /* + ci*cout*k below */
-        for (int ci = 0; ci < cin; ci++)
-            acc += wp[(size_t)ci * cout * k] * inp[(size_t)ci * tin];
+    __shared__ float sw[S2PDK_TC_CI_CHUNK * S2PDK_CO_TILE];
+    const int j_a = blockIdx.x * (blockDim.x * S2PDK_TC_TSUB) + threadIdx.x;
+    const int j_b = j_a + blockDim.x;
+    const int phase = blockIdx.y;
+    const int co0 = blockIdx.z * S2PDK_CO_TILE;
+    const int to_a = j_a * stride + phase;
+    const int to_b = j_b * stride + phase;
+    const int nc =
+        (cout - co0) < S2PDK_CO_TILE ? (cout - co0) : S2PDK_CO_TILE;
+    const int act_a = (to_a < tout), act_b = (to_b < tout);
+
+    float acc_a[S2PDK_CO_TILE], acc_b[S2PDK_CO_TILE];
+    for (int c = 0; c < nc; c++) acc_a[c] = acc_b[c] = b ? b[co0 + c] : 0.f;
+
+    /* valid taps: kk = phase + m*stride, m = 0.., kk < k; ti = j - m */
+    for (int kk = phase, m = 0; kk < k; kk += stride, m++) {
+        const int ti_a = j_a - m, ti_b = j_b - m;
+        const int va_ok = act_a && ti_a >= 0 && ti_a < tin;
+        const int vb_ok = act_b && ti_b >= 0 && ti_b < tin;
+        for (int ci0 = 0; ci0 < cin; ci0 += S2PDK_TC_CI_CHUNK) {
+            const int nci = (cin - ci0) < S2PDK_TC_CI_CHUNK
+                                ? (cin - ci0)
+                                : S2PDK_TC_CI_CHUNK;
+            __syncthreads();
+            /* sw[ci][c] = w[(ci0+ci)*cout*k + (co0+c)*k + kk] */
+            for (int idx = threadIdx.x; idx < nci * S2PDK_CO_TILE;
+                 idx += blockDim.x) {
+                const int ci = idx / S2PDK_CO_TILE;
+                const int c = idx % S2PDK_CO_TILE;
+                sw[idx] =
+                    (c < nc)
+                        ? w[((size_t)(ci0 + ci) * cout + co0 + c) * k + kk]
+                        : 0.f;
+            }
+            __syncthreads();
+            if (!va_ok && !vb_ok) continue;
+            for (int ci = 0; ci < nci; ci++) {
+                const float* inr = in + (size_t)(ci0 + ci) * tin;
+                const float va = va_ok ? inr[ti_a] : 0.f;
+                const float vb = vb_ok ? inr[ti_b] : 0.f;
+                const float* swc = sw + (size_t)ci * S2PDK_CO_TILE;
+#pragma unroll
+                for (int c = 0; c < S2PDK_CO_TILE; c++) {
+                    acc_a[c] += swc[c] * va;
+                    acc_b[c] += swc[c] * vb;
+                }
+            }
+        }
     }
-    out[(size_t)co * tout + to] = acc;
+    for (int c = 0; c < nc; c++) {
+        if (act_a) out[(size_t)(co0 + c) * tout + to_a] = acc_a[c];
+        if (act_b) out[(size_t)(co0 + c) * tout + to_b] = acc_b[c];
+    }
 }
 
 extern "C" cudaError_t s2pdk_tconv1d(const float* in, int cin, int tin,
                                      const float* w, const float* b, int cout,
                                      int k, int stride, float* out, int tout,
                                      cudaStream_t st) {
-    dim3 grid((tout + 255) / 256, cout);
+    const int tphase = (tout + stride - 1) / stride;
+    dim3 grid((tphase + 256 * S2PDK_TC_TSUB - 1) / (256 * S2PDK_TC_TSUB),
+              stride, (cout + S2PDK_CO_TILE - 1) / S2PDK_CO_TILE);
     int pi = prof_begin(2, st, cin, cout, k, stride, tout);
     k_tconv1d<<<grid, 256, 0, st>>>(in, cin, tin, w, b, cout, k, stride, out,
                                     tout);
