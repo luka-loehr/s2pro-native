@@ -34,6 +34,15 @@ for published releases.
 
 ### Added
 
+- Packed 4-bit backbone kernels: the group-wise INT4 weights store two
+  per byte (`S2P_INT4_PACKED`, default on; the int8 container remains as
+  the A/B fallback). The packed GEMV unpacks into the same accumulation
+  order against the same f32 scales, so outputs are BIT-IDENTICAL to the
+  validated unpacked path — parity JSON exactly equal, and all five
+  listening takes reproduce byte-identically (MD5) on the packed server.
+  Measured: zero-shot wall RTF 1.10 → 0.97 (first sub-realtime serving
+  on a quality-passing path), 51 s-reference 1.19 → 1.08, 104 s takes
+  1.20 → 1.05; TTFA unchanged; backbone weights 3.63 → 2.27 GB.
 - Group-wise INT4 value precision (`S2P_INT4=1` on top of `S2P_INT8=1`):
   backbone linears quantize to 4-bit symmetric with one f32 scale per 32
   K-elements (`S2P_INT4_GROUP`) and a per-group MSE clip search

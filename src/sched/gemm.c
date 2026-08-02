@@ -254,10 +254,11 @@ static int int4_wanted(s2p_qsite site) {
     if (!env_flag("S2P_INT4")) return 0;
     if (!banner) {
         banner = 1;
-        fprintf(stderr, "[s2pro] S2P_INT4=1: group-wise 4-bit values "
-                        "(g=%d, mse=%d, fastar=%s; int8 container)\n",
+        fprintf(stderr, "[s2pro] S2P_INT4=1: group-wise 4-bit weights "
+                        "(g=%d, mse=%d, fastar=%s, %s)\n",
                 int4_group(), int4_mse(),
-                env_flag("S2P_INT4_ALL") ? "int4" : "int8");
+                env_flag("S2P_INT4_ALL") ? "int4" : "int8",
+                int4_packed() ? "packed" : "int8 container");
     }
     if (site == S2P_QSITE_FASTAR) return env_flag("S2P_INT4_ALL");
     return 1;
