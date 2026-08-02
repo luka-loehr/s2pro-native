@@ -34,6 +34,14 @@ for published releases.
 
 ### Added
 
+- f16 group scales (4.5 bits per weight all-in): at g32 the f32 scale
+  plane was 20% of the packed weight stream. The quantizer rounds every
+  MSE candidate through f16 before evaluating it, so the stored half is
+  exactly the value the search optimized and the packed/unpacked A/B
+  stays bit-identical. Zero-shot wall RTF 0.97 -> 0.95, 51 s-reference
+  1.08 -> 1.05, 104 s takes 1.03. EOS-termination probe (the failure
+  mode an envelope cannot see): 24 utterance pairs INT4 vs INT8, length
+  ratios 0.88-1.23, zero flags.
 - Packed 4-bit backbone kernels: the group-wise INT4 weights store two
   per byte (`S2P_INT4_PACKED`, default on; the int8 container remains as
   the A/B fallback). The packed GEMV unpacks into the same accumulation

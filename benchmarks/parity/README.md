@@ -78,21 +78,33 @@ above) and is the 8-bit serving path.
 
 Evidence: [`results/parity-fp8-oracle-fox-2026-08-01.json`](results/parity-fp8-oracle-fox-2026-08-01.json)
 
-### INT4 values, group-wise g32 + MSE clip search, mixed precision (`S2P_INT4=1`)
+### INT4 group-wise g32 + MSE clip search, mixed precision, packed (`S2P_INT4=1`)
 
-4-bit VALUE precision inside the int8 container (audio identical to a real
-packed-INT4 deployment; memory/bandwidth stay INT8 until packed kernels
-exist). Scheme: backbone linears group-wise symmetric INT4 (one f32 scale
-per 32 K-elements, per-group MSE clip search), fast-AR and tied lm-head
-per-channel INT8.
+Scheme: backbone linears group-wise symmetric INT4 (one f16 scale per 32
+K-elements — 4.5 bits per weight — with a per-group MSE clip search whose
+candidates are evaluated at their f16-rounded values), stored packed two
+weights per byte; fast-AR and tied lm-head per-channel INT8 (mixed
+precision — group-wise g32 still collapses the fast-AR to argmax 2/9, so
+its INT8 promotion is necessary, not precautionary). Packed and
+int8-container storages produce bit-identical outputs (parity JSON
+exactly equal, server WAVs byte-identical at fixed seed).
 
 | Stage | Result |
 | --- | --- |
 | Backbone hiddens | cos min 0.9927, median 0.9977 |
-| Prefill logits | cos 0.998698, argmax identical |
-| Step-1 logits | cos 0.991705, argmax identical |
+| Prefill logits | cos 0.998670, argmax identical |
+| Step-1 logits | cos 0.991824, argmax identical |
 | Fast-AR first-frame residual steps | 8 of 9 argmax identical (the INT8/BF16 near-tie) |
-| Semantic trajectory | follows the oracle 3 steps, 5 total matches |
+| Semantic trajectory | follows the oracle 4 steps |
+
+The fast-AR 8/9 is free-running within the frame: each residual step
+consumes the previous step's own argmax, and the one mismatch (a
+codebook mid-frame) did not cascade — the steps after it still match the
+oracle. Termination is probed separately because low-bit mis-sampling
+concentrates on low-entropy tokens (where end-of-audio lives) and an
+envelope metric cannot see it: 24 utterance pairs INT4 vs INT8 show
+length ratios 0.88–1.23 with zero runaway or premature-EOS flags, and
+104 s takes terminate at the identical frame as INT8.
 
 For contrast, naive per-channel INT4 (the first listening experiment)
 FAILED here: prefill argmax wrong, fast-AR argmax 1/9, and audibly
@@ -104,7 +116,9 @@ search ablation at g32 costs prefill cos 0.9987 → 0.9907 and fast-AR
 (the per-channel INT4 floor pattern is gone; envelope tracks content and
 recovers). Perceptual sign-off pending the project owner's ear.
 
-Evidence: [`results/parity-int4-g32-oracle-fox-2026-08-02.json`](results/parity-int4-g32-oracle-fox-2026-08-02.json)
+Evidence: [`results/parity-int4-g32f16-oracle-fox-2026-08-02.json`](results/parity-int4-g32f16-oracle-fox-2026-08-02.json)
+(f32-scale predecessor run:
+[`results/parity-int4-g32-oracle-fox-2026-08-02.json`](results/parity-int4-g32-oracle-fox-2026-08-02.json))
 
 ## Listening evidence
 
