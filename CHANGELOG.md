@@ -34,6 +34,17 @@ for published releases.
 
 ### Added
 
+- DAC per-kernel-type profiler (S2P_DAC_PROF=1) and co-tiled pointwise
+  convs: k=1 residual-unit convs re-read the input plane once per output
+  channel (18 GB measured on 192ch where 0.2 GB is inherent); one thread
+  now accumulates 16 output channels in unchanged per-output order —
+  byte-identical output (MD5), 81 -> 20 ms on the heaviest launch,
+  whole-buffer DAC 15.1 -> 12.5 ms/frame. The same tiling measured OUT
+  for k=7 convs and tconvs (throughput-bound per output, idle lanes per
+  tconv tap): those keep the reference kernels; a GEMM-grade 2D register
+  tile is the remaining DAC lever. Also measured out: narrowing the
+  fast-AR INT8 promotion (every tensor subset fails the parity argmax
+  gate — see the fastar.cu site comment).
 - Reference-block KV-prefix cache: the per-voice system block (reference
   VQ included, ~1282 of ~1360 prompt tokens at a 60 s reference) prefills
   once and later sessions seed their KV from a device blob (one strided
