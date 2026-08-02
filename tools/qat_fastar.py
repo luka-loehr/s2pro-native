@@ -55,26 +55,40 @@ def fake_quant_g32(w: torch.Tensor) -> torch.Tensor:
     base = torch.where(amax > 0, amax / 7.0, torch.ones_like(amax))
     best_err = torch.full_like(amax, float("inf"))
     best_s = base.half().float()
-    for c in range(32):  # candidate loop keeps memory at O(N*K)
-        s = (base * (1.0 - c / 64.0)).half().float()
-        q = torch.clamp(torch.round(g / s), -7, 7)
-        err = ((g - q * s) ** 2).sum(dim=-1, keepdim=True)
-        take = err < best_err  # strict <: first minimum, like the kernel
-        best_err = torch.where(take, err, best_err)
-        best_s = torch.where(take, s, best_s)
+    for c0 in range(0, 32, 8):  # candidate chunks: memory O(8*N*K)
+        cs = torch.arange(c0, c0 + 8, device=w.device,
+                          dtype=torch.float32).view(1, 1, 8)
+        s = (base * (1.0 - cs / 64.0)).half().float()  # [N, K/32, 8]
+        q = torch.clamp(torch.round(g.unsqueeze(-1) / s.unsqueeze(-2)),
+                        -7, 7)                          # [N, K/32, 32, 8]
+        err = ((g.unsqueeze(-1) - q * s.unsqueeze(-2)) ** 2).sum(dim=-2)
+        cerr, cidx = err.min(dim=-1, keepdim=True)  # first min in chunk
+        cbest = torch.gather(s, -1, cidx)
+        take = cerr < best_err  # strict <: earlier chunk wins ties
+        best_err = torch.where(take, cerr, best_err)
+        best_s = torch.where(take, cbest, best_s)
     qw = torch.clamp(torch.round(g / best_s), -7, 7) * best_s
     qw = torch.where(amax > 0, qw, g)  # all-zero group: kernel writes zeros
     return qw.reshape(N, K)
 
 
 class FQLinear(nn.Module):
-    """Linear whose weight passes through the deployment quantizer (STE)."""
+    """Linear whose weight passes through the deployment quantizer (STE).
+    Under no_grad (DAgger rollouts, evals) the quantized weight is cached
+    until the next grad-enabled forward invalidates it — the 9-step greedy
+    rollout would otherwise re-quantize every tensor nine times."""
 
     def __init__(self, weight: torch.Tensor):
         super().__init__()
         self.weight = nn.Parameter(weight.float().clone())
+        self._wq_cache = None
 
     def forward(self, x):
+        if not torch.is_grad_enabled():
+            if self._wq_cache is None:
+                self._wq_cache = fake_quant_g32(self.weight.detach())
+            return F.linear(x, self._wq_cache)
+        self._wq_cache = None
         w = self.weight
         wq = w + (fake_quant_g32(w.detach()) - w.detach())
         return F.linear(x, wq)
