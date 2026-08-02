@@ -63,10 +63,15 @@
 /* Long-form chunking: text above this many bytes is split at sentence
  * boundaries and generated as chained requests (prosody stays at the
  * fresh-context quality the first ~25 s of a take have; see
- * src/text/chunker.c). Request field "chunk_length" overrides, 0 disables;
- * env S2P_CHUNK_BYTES overrides the default. Applies only when a voice
- * reference pins the voice — zero-shot chunks would each draw a new voice. */
-#define HTTP_CHUNK_BYTES_DEFAULT 300
+ * src/text/chunker.c). A chunk additionally closes after
+ * HTTP_CHUNK_SENTENCES_DEFAULT sentences (project owner's listening
+ * verdict on the first long-form pass: prefer ~2-sentence chunks).
+ * Request fields "chunk_length" / "chunk_sentences" override (0 disables /
+ * 0 = byte limit only); envs S2P_CHUNK_BYTES / S2P_CHUNK_SENTENCES
+ * override the defaults. Applies only when a voice reference pins the
+ * voice — zero-shot chunks would each draw a new voice. */
+#define HTTP_CHUNK_BYTES_DEFAULT     300
+#define HTTP_CHUNK_SENTENCES_DEFAULT 2
 
 #define HTTP_MAX_HEAD   (16 * 1024)
 #define HTTP_MAX_BODY   (4 * 1024 * 1024) /* fits a 15 s wav as base64 JSON */
@@ -510,12 +515,18 @@ static void route_tts(http_srv* s, conn* c) {
         buffered = !s2p_jbool(v);
 
     int chunk_target = HTTP_CHUNK_BYTES_DEFAULT;
+    int chunk_sentences = HTTP_CHUNK_SENTENCES_DEFAULT;
     {
         const char* e = getenv("S2P_CHUNK_BYTES");
         if (e && e[0]) chunk_target = atoi(e);
+        e = getenv("S2P_CHUNK_SENTENCES");
+        if (e && e[0]) chunk_sentences = atoi(e);
     }
     if ((v = s2p_jobj_get(root, "chunk_length")) != NULL && !s2p_jis_null(v))
         chunk_target = (int)s2p_jint(v);
+    if ((v = s2p_jobj_get(root, "chunk_sentences")) != NULL &&
+        !s2p_jis_null(v))
+        chunk_sentences = (int)s2p_jint(v);
 
     /* voice selection / on-the-fly cloning (all errors here are pre-header,
      * so clients still get proper JSON error responses) */
@@ -579,11 +590,11 @@ static void route_tts(http_srv* s, conn* c) {
     /* Long-form chunking: only when a reference pins the voice (zero-shot
      * chunks would each draw a new voice), and only when the split actually
      * yields more than one chunk. */
-    if ((named != NULL || clone_pcm != NULL) && chunk_target >= 32 &&
-        strlen(text_c) > (size_t)chunk_target) {
+    if ((named != NULL || clone_pcm != NULL) && chunk_target >= 32) {
         char** chunks = NULL;
         int    n = 0;
-        if (s2p_text_chunks(text_c, chunk_target, &chunks, &n) == S2P_OK) {
+        if (s2p_text_chunks(text_c, chunk_target, chunk_sentences, &chunks,
+                            &n) == S2P_OK) {
             if (n > 1) {
                 c->chunks = chunks;
                 c->n_chunks = n;
