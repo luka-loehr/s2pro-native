@@ -34,6 +34,17 @@ for published releases.
 
 ### Added
 
+- Reference-block KV-prefix cache: the per-voice system block (reference
+  VQ included, ~1282 of ~1360 prompt tokens at a 60 s reference) prefills
+  once and later sessions seed their KV from a device blob (one strided
+  2D copy, ~189 MB/voice, LRU over S2P_KV_CACHE_VOICES entries, default
+  4); only the user turn still prefills. Long-form chunk chains hit the
+  cache from chunk 2 on. Measured warm: voice-ref TTFA 1.58 s -> 0.23 s,
+  voice-ref wall RTF 0.94, ~150 s chunked long-form takes 0.93-0.94 —
+  together with the packed 4-bit backbone, EVERY serving path is below
+  realtime. Also fixed: the boundary filter's tail holdback applied to
+  streamed responses delayed first audio by the window length; streamed
+  joins now trim leading silence only.
 - Normalized inter-chunk pauses (`chunk_gap_ms`, default 1000 ms, env
   S2P_CHUNK_GAP_MS, 0 = raw concatenation): the boundary filter holds
   back a tail window per chunk, trims the trailing/leading silence around

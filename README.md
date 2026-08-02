@@ -28,22 +28,24 @@ Measured on one DGX Spark (GB10, `sm_121`), single stream, 67-token prompt,
 | Weight + runtime memory | ~12 GB | **~8.5 GB** |
 
 INT8 decode is **below the 46.4 ms frame budget**: sustained generation
-after prefill runs at RTF 0.86 before vocoding. End-to-end streamed serving
+after prefill runs at RTF 0.86 before vocoding. End-to-end serving
 (bit-exact incremental DAC, pipelined and batched on its own CUDA stream,
 split-K decode attention, device-side sampling, CUDA-graph replay of the
-whole decode tick, packed 4-bit backbone) measures wall RTF **0.95**
-zero-shot / 1.03–1.05 behind a 51 s voice reference — down from 2.05 —
-with TTFA 0.18 s zero-shot / 1.58 s with the reference block; the
-[roadmap](#roadmap-to-rtf--1) holds the remaining arithmetic for the
-voice-referenced path.
+whole decode tick, packed 4-bit backbone, reference-block KV-prefix
+cache) is **below realtime on every path** — down from wall RTF 2.05:
+**0.95** zero-shot, **0.94** with a 60 s voice reference, **0.93–0.94**
+on ~150 s chunked long-form takes; TTFA 0.18 s zero-shot / 0.23 s with a
+warm voice cache. The [roadmap](#roadmap-to-rtf--1) items that remain
+(DAC conv tiling, fast-AR fusion) are now headroom, not necessity.
 
 > **Status: functional pre-release.** BF16, INT8, and the packed
 > group-wise INT4 backbone pass the layer-parity gate against the PyTorch
 > reference; voice cloning, the multilingual voice registry, and the HTTP
-> streaming server are exercised end to end on real hardware. Zero-shot
-> single-stream synthesis runs below realtime (wall RTF 0.95);
-> voice-referenced serving is at 1.03–1.05. There is no published release
-> line yet; deploy from a reviewed, pinned `main` commit.
+> streaming server are exercised end to end on real hardware.
+> Single-stream synthesis runs below realtime on every serving path
+> (wall RTF 0.93–0.95, zero-shot and voice-referenced, short and
+> long-form). There is no published release line yet; deploy from a
+> reviewed, pinned `main` commit.
 
 ## What this project provides
 
@@ -269,8 +271,11 @@ the memory system, not as a viable quality path.
       re-read inputs k-fold from global; identical per-output accumulation
       order keeps bit-exactness; est. −5 ms/frame of DAC GPU time — the
       step that crosses RTF 1)
-- [ ] reference-block KV-prefix cache (constant per voice → prefill only the
-      text; TTFA with a 51 s reference ~1.8 s → under 1 s)
+- [x] reference-block KV-prefix cache — the per-voice system block
+      prefills once (one 2D copy seeds later sessions, ~189 MB per voice,
+      LRU, `S2P_KV_CACHE_VOICES`); voice-ref TTFA 1.58 → **0.23 s**,
+      voice-ref wall RTF 1.05 → **0.94**, chunked long-form 1.15 →
+      **0.93** — every serving path below realtime
 - [x] CUDA-graph replay of the steady decode tick — one launch instead of
       ~1100; graph vs eager byte-identical; decode 42.4 → 39.6 ms/frame
 - [x] device-side sampling — exact two-softmax port, per-session device
@@ -297,17 +302,14 @@ the memory system, not as a viable quality path.
       INT8 **PASS**, FP8 **FAIL**
       ([benchmarks/parity](benchmarks/parity/README.md))
 
-Zero-shot serving is below realtime as of the packed 4-bit backbone
-(wall RTF 0.95). With a long voice reference the wall RTF is 1.03–1.05 —
-the extra cost is attention over the ~1100-frame reference KV plus the
-DAC. The remaining distance there is arithmetic, not hope: tiling the
-DAC convs removes ~5 ms/frame of k-fold global re-reads without touching
-the accumulation order, and the reference-block KV-prefix cache removes
-the reference prefill from TTFA. The fast-AR is now the dominant
-non-attention stream (3.73 GB/frame INT8 — its nine sequential re-reads
-outweigh the whole packed backbone): the reserves there are narrowing
-its INT8 promotion to the sensitive tensors (down/v/out projections,
-~half its weights) and kernel fusion.
+Every serving path is below realtime (0.93–0.95). The remaining items
+buy headroom for concurrency and battery: tiling the DAC convs removes
+~5 ms/frame of k-fold global re-reads without touching the accumulation
+order, and the fast-AR is the dominant non-attention stream
+(3.73 GB/frame INT8 — its nine sequential re-reads outweigh the whole
+packed backbone), so the reserves there are narrowing its INT8 promotion
+to the sensitive tensors (down/v/out projections, ~half its weights) and
+kernel fusion.
 - [x] voice-cloning encode — active with the full codec artifact
       (`tools/convert_codec_full.py`); reference wav → 21.5 Hz VQ codes →
       prompt injection, exercised end to end
