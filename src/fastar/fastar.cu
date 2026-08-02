@@ -254,9 +254,14 @@ s2p_status s2pfa_load(s2pfa** out, s2p_st* st, s2p_gemm_mode mode,
         if (rc == S2P_OK) rc = s2p_linear_prepare_fp8(&f->output, stream);
     }
     if (rc == S2P_OK && mode == S2P_GEMM_INT8) {
-        /* S2P_QSITE_FASTAR: stays per-channel INT8 under S2P_INT4=1 (mixed
-         * precision — this module, run 9x per frame, is the one 4-bit
-         * damages most) unless S2P_INT4_ALL=1. */
+        /* S2P_QSITE_FASTAR: the WHOLE fast-AR stays per-channel INT8 under
+         * S2P_INT4=1. Narrowing the promotion was tried and measured OUT
+         * (parity fast-AR argmax vs the 8/9 reference class): qkv+gate/up
+         * at INT4-g32 -> 5/9; gate/up alone -> 3/9; everything -> 2/9.
+         * This module decides 9 greedy 1024-way argmaxes per frame with
+         * intra-frame feedback and only 4 layers of depth — every subset
+         * of its tensors is 4-bit-sensitive. S2P_INT4_ALL=1 remains the
+         * all-INT4 A/B switch. */
         for (int l = 0; l < FA_LAYERS && rc == S2P_OK; l++) {
             s2pfa_layer* L = &f->layers[l];
             rc = s2p_linear_prepare_int8_site(&L->wqkv, S2P_QSITE_FASTAR,
