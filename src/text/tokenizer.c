@@ -790,7 +790,8 @@ int main(int argc, char** argv) {
         uint8_t* mask = NULL;
         s2p_vq_part* parts = NULL;
         int n = 0, np = 0;
-        rc = s2p_prompt_build(t, NULL, &req, &ids, &mask, &n, &parts, &np);
+        rc = s2p_prompt_build(t, NULL, &req, &ids, &mask, &n, &parts, &np,
+                              NULL);
         if (rc != S2P_OK) {
             fprintf(stderr, "prompt build failed: %d\n", rc);
             return 1;

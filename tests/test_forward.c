@@ -182,7 +182,7 @@ int main(int argc, char** argv) {
     s2p_vq_part* parts = NULL;
     int          n_ids = 0, n_parts = 0;
     CHECK(s2p_prompt_build(tok, cfg, &req, &ids, &vq_mask, &n_ids, &parts,
-                           &n_parts),
+                           &n_parts, NULL),
           "prompt build");
     fprintf(stderr, "[test] prompt: %d tokens, %d vq parts\n", n_ids, n_parts);
 

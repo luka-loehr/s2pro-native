@@ -38,6 +38,10 @@ typedef struct {
      * prompt builder itself ignores these fields. */
     const float*       ref_pcm;
     int64_t            ref_pcm_n;
+    /* KV-prefix-cache key (additive, 2026-08-02): stable identity of the
+     * reference block, e.g. the registry voice name. NULL disables caching
+     * for this request (per-request clones have no stable identity). */
+    const char*        cache_key;
 } s2p_request_text;
 
 /* Sentence-aware UTF-8 text chunking for long-form synthesis (additive,
@@ -52,11 +56,15 @@ void s2p_text_chunks_free(char** chunks, int n);
 
 /* Build the full prompt: token ids, a mask marking VQ-injected positions
  * (1 where codebook-0 semantic tokens sit and vq_parts embeddings must be
- * added), and the vq parts array consumed by prefill. All outputs malloc'd. */
+ * added), and the vq parts array consumed by prefill. All outputs malloc'd.
+ * n_sys_ids (optional, additive 2026-08-02) receives the id count of the
+ * per-voice-constant system block (0 without refs) — the KV-prefix-cache
+ * boundary. */
 s2p_status s2p_prompt_build(s2p_tok* t, const s2p_config* cfg,
                             const s2p_request_text* req, int64_t** ids,
                             uint8_t** vq_mask, int* n_ids,
-                            s2p_vq_part** parts, int* n_parts);
+                            s2p_vq_part** parts, int* n_parts,
+                            int* n_sys_ids);
 
 #ifdef __cplusplus
 }
