@@ -126,11 +126,12 @@ static s2p_status alloc_scratch(s2p_model* m) {
         int64_t s1[1] = {(int64_t)S2P_NUM_CODEBOOKS * ctx};
         S2P_TRY(s2p_tensor_device_alloc(&m->svq, S2P_DT_I32, 1, s1));
     }
-    /* per-frame upload block (natural alignment by descending size) */
+    /* per-frame upload block (natural alignment by descending size);
+     * pointer table: k, v, then (kv8) k-scale, v-scale planes */
     const size_t B = (size_t)ms;
     s2p_upload_layout* up = &m->up;
     up->off_ptrs = 0;
-    up->off_ids = up->off_ptrs + (size_t)S2P_SLOW_LAYERS * 2 * B * sizeof(void*);
+    up->off_ids = up->off_ptrs + (size_t)S2P_SLOW_LAYERS * 4 * B * sizeof(void*);
     up->off_codes = up->off_ids + B * sizeof(int64_t);
     up->off_pos =
         up->off_codes + (size_t)S2P_NUM_CODEBOOKS * B * sizeof(int32_t);
@@ -179,6 +180,18 @@ s2p_status s2p_model_load(const char* model_dir, const s2p_model_opts* opts,
                 "[s2pro] FP8 gemm requested but fish-scales-ops unavailable; "
                 "falling back to BF16\n");
         m->mode = S2P_GEMM_BF16;
+    }
+    {
+        /* INT8 KV cache: default on for the quantized serving mode, off for
+         * BF16 (keeps the BF16 parity reference pure); S2P_KV8 overrides. */
+        const char* e = getenv("S2P_KV8");
+        if (e && e[0])
+            m->kv8 = (e[0] == '1' && e[1] == '\0');
+        else
+            m->kv8 = (m->mode == S2P_GEMM_INT8);
+        if (m->kv8)
+            fprintf(stderr, "[s2pro] S2P_KV8: INT8 KV cache "
+                            "(g32 per head vector, f16 scales)\n");
     }
 
     s2p_status rc = S2P_OK;
