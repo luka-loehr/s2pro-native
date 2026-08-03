@@ -10,3 +10,4 @@ model/
 # from a single command. voices/README.md stays tracked.
 voices/*.wav
 voices/*.txt
+MONDAY-PLAN.md
