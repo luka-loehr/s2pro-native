@@ -109,3 +109,67 @@ identified levers for a higher cap are cross-session DAC batching,
 chunked prefill (so a joining stream does not stall the tick), captured
 graphs for B > 4, and warm voice caches (the B = 4 worst case includes
 cold-voice prefills).
+
+## 6. The concurrency build-out (chunked prefill, graphs to 16, batched DAC)
+
+All four levers were then built, each individually gated:
+
+1. **Chunked prefill**: a joining request prefills in
+   `S2P_PREFILL_CHUNK`-id slices (default 96), at most one slice per
+   tick round-robin, VQ runs never split; the cacheable prefix
+   snapshots the moment it is resident.
+2. **Captured decode graphs for every batch size** up to the session
+   cap (`S2P_MAX_SESSIONS` 8 → 16). This removed the measured B = 6
+   queueing cliff (2.49 → 1.17). A second wall at B = 10 (worst 4.19)
+   turned out to be `S2P_INT8_GEMV_MAX_M`: beyond M = 8 every decode
+   linear fell back to the full-weight dequant+GEMM path. Raising the
+   cap to 16 with dual kernel instantiation (MM = 8 preserves the
+   single-stream register budget exactly; MM = 16 serves 9…16) fixed
+   B = 10 to 1.99 with single-stream unchanged.
+3. **Pre-warmed voice prefixes**: every registry voice's system block
+   prefills once at startup (`s2p_sched_warm_voices`, cache capacity
+   raised to the roster size); first requests never pay the reference
+   prefill.
+4. **Cross-session batched DAC** (`S2P_DAC_BATCH`, default on): one
+   stage-walk decodes a frame group for all streams. The weight-bearing
+   kernels (convs, transposed convs, depthwise, transformer matmuls)
+   and — after review condition C2 — the element-wise/norm stages run
+   batched over per-session pointer tables with the session index as
+   the fastest-varying grid coordinate; the temporal accumulation
+   (8 frames per flush) composes, so each weight tile is read from DRAM
+   once per 8 frames for ALL streams: 745 MB × 344 frame-decodes/s =
+   256 GB/s unbatched (beyond the ~220 GB/s bus — the original
+   saturation) vs ~2 GB/s batched, a 128× reduction. Pointer tables
+   upload only on roster change (condition C3). Gate: with two
+   concurrent fixed-seed streams, batch-off and batch-on produce
+   byte-identical WAVs per stream; single-stream serving is unchanged
+   (0.60 / 0.58, TTFA 0.14 / 0.20 s). An external design review
+   (batched-inference research pass) approved the architecture —
+   block-mapping choice confirmed, L2-persistence hints explicitly
+   rejected as counterproductive here — with CUDA-graph capture of the
+   DAC stage walk (D1) and an Nsight `dram__bytes` sweep (C4) recorded
+   as the formal follow-ups.
+
+Measured per-stream wall RTF after the build-out (~27 s voiced takes,
+distinct voices, warm prefixes):
+
+| B | before | after |
+| ---: | ---: | ---: |
+| 2 | 0.69 | 0.70 |
+| 4 | 0.99 | 0.91 |
+| 6 | 2.49 | 1.16 |
+| 8 | 3.61 | 1.45 |
+| 10 | — | 1.99 |
+| 12 | — | 2.32 |
+| 16 | — | 2.95 |
+
+**Where the wall lives now.** The DAC batching changes none of these
+numbers (batch-off and batch-on walls are identical at every B) — the
+per-stream marginal cost of ~6.3 ms is not vocoder work. It matches the
+backbone's per-stream KV read: ~1450 prefix tokens × 74 KB (INT8 KV)
+× 16 streams ≈ 1.7 GB per tick ≈ 7.7 ms at bus speed. Concurrency is
+now KV-bandwidth-bound; the cap under the per-stream RTF < 1 rule is
+**5** (B = 4 at 0.91 with margin, B = 6 at 1.16 just over). The next
+structural levers are KV-side: shorter effective contexts, sub-8-bit
+KV, or attention windowing — plus the reviewed D1 (DAC graph capture)
+for launch-gap economy.
