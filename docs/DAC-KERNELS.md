@@ -93,3 +93,24 @@ result table below come from it.
 The vocoder has moved from second-largest cost to noise; the frame budget
 is now backbone-dominated, which is the regime the quantization ladder
 ([QUANT.md](QUANT.md)) addresses.
+
+## 8. FP16 weight storage
+
+The conv/matmul weights (745 MB of the 1.6 GB codec artifact after
+weight-norm folding) store as f16; conversion happens at load, kernels
+convert at the shared-memory staging (or first read), so inner-loop
+arithmetic, accumulation order and activation precision are identical to
+the f32 path — only the rounded weight values differ. Biases, Snake
+alphas, norms, layer scales, the RVQ codebooks and projections stay f32
+(1.4 MB): partly measured insurance, partly because rvq.cu reads the VQ
+projections directly. `S2P_DAC_F32=1` reverts.
+
+Gate (policy fixed before measurement: ≥ 60 dB pass, 55–60 dB escalate
+to envelope + listening, < 60 dB fail): SNR of the f16 decode against
+the f32 decode on identical codes over a 205-frame take = **68.1 dB** —
+pass with headroom. External corroboration: production vocoders
+(NVIDIA Riva, BigVGAN's fused kernels, stable-audio-tools) ship FP16 by
+default; measured FP16 round-trip on DAC-class weights sits ~16 binades
+under the f16 ceiling with strictly positive Snake alphas. Codec weight
+memory 1.6 GB → 0.75 GB; serving RTF unchanged (the DAC was already
+noise in the frame budget).
