@@ -173,10 +173,11 @@ failure of per-token K quantization, documented with its mechanism and
 the calibration-based fix in [QUANT.md §4.8](QUANT.md). INT8 is the KV
 floor for this engine.
 
-**Shorter reference prefixes** (`S2P_REF_MAX_FRAMES`, off by default):
-the registry reference is capped to its last N frames (~46.4 ms each)
-before it becomes the KV prefix. Measured at B = 12 with distinct
-voices (~27 s takes):
+**Shorter reference prefixes: measured, then reverted.** A cap on the
+registry reference (keep the last N frames of ~46.4 ms each before it
+becomes the KV prefix) was implemented and measured at B = 12 with
+distinct voices (~27 s takes), then removed again — the numbers below
+are why. References serve at full length.
 
 | reference | worst per-stream RTF | mean |
 | --- | ---: | ---: |
@@ -189,8 +190,11 @@ improves (0.20 → 0.17 → 0.15 s). But the concurrency gain **saturates at
 about 9 %**: cutting the prefix from ~1450 to 300 frames removes roughly
 2.3× of cached tokens and buys almost nothing beyond the first step.
 
-That result falsifies the KV-bandwidth hypothesis, and the falsification
-is the useful part. If the per-stream marginal cost were KV reads, a
+That result falsifies the KV-bandwidth hypothesis, and the
+falsification is the useful part (which is also why the cap itself was
+reverted: ~9 % of a concurrency term, paid for with a change in
+delivery — the same text ran 149 s at full reference, 165 s at 600
+frames and 141 s at 300 — is not a trade worth carrying). If the per-stream marginal cost were KV reads, a
 2.3× smaller cache would have shown up as a large drop; it did not. The
 remaining candidate is the decode GEMV itself: it amortizes the *weight*
 read across the batch (that is why weights stopped mattering), but its
@@ -201,9 +205,7 @@ crossover, and the fix is a tiled GEMM path for M > 4 (weights and
 activations staged in shared memory, one pass over the weight tile
 serving all rows) rather than any further KV work.
 
-Caveat for the listening gate: a shorter reference changes delivery, not
-just bandwidth — the same text ran 149 s at full reference and 165 s at
-600 frames. The cap ships off until that is judged by ear.
+
 
 **Where the wall lives now.** The DAC batching changes none of these
 numbers (batch-off and batch-on walls are identical at every B) — the
