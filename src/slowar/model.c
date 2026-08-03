@@ -23,6 +23,7 @@
 #include <string.h>
 
 #include "slowar_internal.h"
+#include "s2pro/qcache.h"
 
 #define S2P_GU_ROWS (2 * S2P_FFN_DIM) /* 19456 */
 
@@ -34,23 +35,32 @@ static s2p_status load_norm(s2p_st* st, const char* fmt, int layer, int width,
     return s2p_st_load_device(st, name, S2P_DT_BF16, 1, shape, out, stream);
 }
 
-static s2p_status load_linear(s2p_st* st, const char* fmt, int layer, int in_f,
-                              int out_f, s2p_gemm_mode mode, s2p_linear* lin,
+static s2p_status load_linear(s2p_st* st, s2p_qcache* qc, const char* fmt,
+                              int layer, int in_f, int out_f,
+                              s2p_gemm_mode mode, s2p_linear* lin,
                               cudaStream_t stream) {
     char name[160];
     snprintf(name, sizeof(name), fmt, layer);
+    if (s2p_qcache_try_load(qc, name, in_f, out_f, lin, stream))
+        return S2P_OK;
     S2P_TRY(s2p_linear_from_st(lin, st, name, in_f, out_f, stream));
     if (mode == S2P_GEMM_FP8) S2P_TRY(s2p_linear_prepare_fp8(lin, stream));
     if (mode == S2P_GEMM_INT8)
         S2P_TRY(s2p_linear_prepare_int8_site(lin, S2P_QSITE_BACKBONE, stream));
+    S2P_TRY(s2p_qcache_put_linear(qc, name, lin, stream));
     return S2P_OK;
 }
 
 /* Fuse feed_forward.w1 + w3 into a single [19456, 2560] linear. */
-static s2p_status load_gate_up(s2p_st* st, int layer, s2p_gemm_mode mode,
-                               s2p_linear* lin, cudaStream_t stream) {
+static s2p_status load_gate_up(s2p_st* st, s2p_qcache* qc, int layer,
+                               s2p_gemm_mode mode, s2p_linear* lin,
+                               cudaStream_t stream) {
     char name[160];
     s2p_st_view w1, w3;
+    snprintf(name, sizeof(name),
+             "text_model.model.layers.%d.feed_forward.gate_up.fused", layer);
+    if (s2p_qcache_try_load(qc, name, S2P_DIM, S2P_GU_ROWS, lin, stream))
+        return S2P_OK;
     snprintf(name, sizeof(name),
              "text_model.model.layers.%d.feed_forward.w1.weight", layer);
     S2P_TRY(s2p_st_find(st, name, &w1));
@@ -75,6 +85,9 @@ static s2p_status load_gate_up(s2p_st* st, int layer, s2p_gemm_mode mode,
     if (mode == S2P_GEMM_FP8) S2P_TRY(s2p_linear_prepare_fp8(lin, stream));
     if (mode == S2P_GEMM_INT8)
         S2P_TRY(s2p_linear_prepare_int8_site(lin, S2P_QSITE_BACKBONE, stream));
+    snprintf(name, sizeof(name),
+             "text_model.model.layers.%d.feed_forward.gate_up.fused", layer);
+    S2P_TRY(s2p_qcache_put_linear(qc, name, lin, stream));
     return S2P_OK;
 }
 
@@ -170,10 +183,13 @@ s2p_status s2p_model_load(const char* model_dir, const s2p_model_opts* opts,
 
     s2p_status rc = S2P_OK;
     s2p_st* st = NULL;
+    s2p_qcache* qc = NULL;
     /* cuBLAS/FP8 context must cover prefill M = ctx_len. If the host app
      * already initialized it with a smaller max_m this re-init is expected to
      * be idempotent-or-grow (core contract). */
     rc = s2p_gemm_init(m->ctx_len);
+    if (rc != S2P_OK) goto fail;
+    rc = s2p_qcache_open(model_dir, m->mode, &qc);
     if (rc != S2P_OK) goto fail;
 
     if (cudaStreamCreateWithFlags(&m->stream, cudaStreamNonBlocking) !=
@@ -207,16 +223,18 @@ s2p_status s2p_model_load(const char* model_dir, const s2p_model_opts* opts,
     }
     for (int l = 0; l < S2P_SLOW_LAYERS; l++) {
         s2p_slow_layer* ly = &m->layers[l];
-        rc = load_linear(st, "text_model.model.layers.%d.attention.wqkv.weight",
+        rc = load_linear(st, qc,
+                         "text_model.model.layers.%d.attention.wqkv.weight",
                          l, S2P_DIM, S2P_QKV_WIDTH, m->mode, &ly->wqkv,
                          m->stream);
         if (rc != S2P_OK) goto fail;
-        rc = load_linear(st, "text_model.model.layers.%d.attention.wo.weight",
+        rc = load_linear(st, qc,
+                         "text_model.model.layers.%d.attention.wo.weight",
                          l, S2P_Q_WIDTH, S2P_DIM, m->mode, &ly->wo, m->stream);
         if (rc != S2P_OK) goto fail;
-        rc = load_gate_up(st, l, m->mode, &ly->gate_up, m->stream);
+        rc = load_gate_up(st, qc, l, m->mode, &ly->gate_up, m->stream);
         if (rc != S2P_OK) goto fail;
-        rc = load_linear(st,
+        rc = load_linear(st, qc,
                          "text_model.model.layers.%d.feed_forward.w2.weight",
                          l, S2P_FFN_DIM, S2P_DIM, m->mode, &ly->w2, m->stream);
         if (rc != S2P_OK) goto fail;
@@ -241,18 +259,24 @@ s2p_status s2p_model_load(const char* model_dir, const s2p_model_opts* opts,
         if (rc != S2P_OK) goto fail;
     }
 
-    rc = s2pfa_load(&m->fastar, st, m->mode, m->stream);
+    rc = s2pfa_load(&m->fastar, st, qc, m->mode, m->stream);
     if (rc != S2P_OK) goto fail;
 
     rc = alloc_scratch(m);
     if (rc != S2P_OK) goto fail;
 
-    /* all uploads must land before the mmap goes away */
+    /* all uploads must land before the mmap (and cache buffer) go away */
     if (cudaStreamSynchronize(m->stream) != cudaSuccess) {
         rc = S2P_ERR_CUDA;
         goto fail;
     }
     s2p_st_close(st);
+    rc = s2p_qcache_finish(qc, m->stream);
+    s2p_qcache_free(qc);
+    if (rc != S2P_OK) {
+        s2p_model_free(m);
+        return rc;
+    }
     *out = m;
     return S2P_OK;
 
@@ -261,6 +285,7 @@ fail:
         cudaStreamSynchronize(m->stream);
         s2p_st_close(st);
     }
+    s2p_qcache_free(qc);
     s2p_model_free(m);
     return rc;
 }

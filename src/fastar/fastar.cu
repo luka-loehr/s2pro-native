@@ -181,8 +181,8 @@ static s2p_status fa_alloc_bf16(__nv_bfloat16** p, size_t elems) {
 
 /* ------------------------------------------------------------------ load */
 
-s2p_status s2pfa_load(s2pfa** out, s2p_st* st, s2p_gemm_mode mode,
-                      cudaStream_t stream) {
+s2p_status s2pfa_load(s2pfa** out, s2p_st* st, s2p_qcache* qc,
+                      s2p_gemm_mode mode, cudaStream_t stream) {
     if (!out || !st) return S2P_ERR_INVALID;
     *out = NULL;
     s2pfa* f = (s2pfa*)calloc(1, sizeof(s2pfa));
@@ -196,22 +196,31 @@ s2p_status s2pfa_load(s2pfa** out, s2p_st* st, s2p_gemm_mode mode,
         s2pfa_layer* L = &f->layers[l];
         snprintf(name, sizeof name,
                  "audio_decoder.layers.%d.attention.wqkv.weight", l);
-        rc = s2p_linear_from_st(&L->wqkv, st, name, FA_DIM, FA_QKVW, stream);
+        if (!s2p_qcache_try_load(qc, name, FA_DIM, FA_QKVW, &L->wqkv, stream))
+            rc = s2p_linear_from_st(&L->wqkv, st, name, FA_DIM, FA_QKVW,
+                                    stream);
         if (rc != S2P_OK) break;
         snprintf(name, sizeof name,
                  "audio_decoder.layers.%d.attention.wo.weight", l);
-        rc = s2p_linear_from_st(&L->wo, st, name, FA_QW, FA_DIM, stream);
+        if (!s2p_qcache_try_load(qc, name, FA_QW, FA_DIM, &L->wo, stream))
+            rc = s2p_linear_from_st(&L->wo, st, name, FA_QW, FA_DIM, stream);
         if (rc != S2P_OK) break;
         snprintf(name, sizeof name,
-                 "audio_decoder.layers.%d.feed_forward.w1.weight", l);
-        char name3[128];
-        snprintf(name3, sizeof name3,
-                 "audio_decoder.layers.%d.feed_forward.w3.weight", l);
-        rc = fa_load_fused_w13(&L->w13, st, name, name3, stream);
+                 "audio_decoder.layers.%d.feed_forward.w13.fused", l);
+        if (!s2p_qcache_try_load(qc, name, FA_DIM, 2 * FA_FFN, &L->w13,
+                                 stream)) {
+            snprintf(name, sizeof name,
+                     "audio_decoder.layers.%d.feed_forward.w1.weight", l);
+            char name3[128];
+            snprintf(name3, sizeof name3,
+                     "audio_decoder.layers.%d.feed_forward.w3.weight", l);
+            rc = fa_load_fused_w13(&L->w13, st, name, name3, stream);
+        }
         if (rc != S2P_OK) break;
         snprintf(name, sizeof name,
                  "audio_decoder.layers.%d.feed_forward.w2.weight", l);
-        rc = s2p_linear_from_st(&L->w2, st, name, FA_FFN, FA_DIM, stream);
+        if (!s2p_qcache_try_load(qc, name, FA_FFN, FA_DIM, &L->w2, stream))
+            rc = s2p_linear_from_st(&L->w2, st, name, FA_FFN, FA_DIM, stream);
         if (rc != S2P_OK) break;
         int64_t dsh[1] = { FA_DIM };
         snprintf(name, sizeof name,
@@ -279,6 +288,27 @@ s2p_status s2pfa_load(s2pfa** out, s2p_st* st, s2p_gemm_mode mode,
         if (rc == S2P_OK)
             rc = s2p_linear_prepare_int8_site(&f->output, S2P_QSITE_FASTAR,
                                               stream);
+        for (int l = 0; l < FA_LAYERS && rc == S2P_OK; l++) {
+            s2pfa_layer* L = &f->layers[l];
+            snprintf(name, sizeof name,
+                     "audio_decoder.layers.%d.attention.wqkv.weight", l);
+            rc = s2p_qcache_put_linear(qc, name, &L->wqkv, stream);
+            snprintf(name, sizeof name,
+                     "audio_decoder.layers.%d.attention.wo.weight", l);
+            if (rc == S2P_OK)
+                rc = s2p_qcache_put_linear(qc, name, &L->wo, stream);
+            snprintf(name, sizeof name,
+                     "audio_decoder.layers.%d.feed_forward.w13.fused", l);
+            if (rc == S2P_OK)
+                rc = s2p_qcache_put_linear(qc, name, &L->w13, stream);
+            snprintf(name, sizeof name,
+                     "audio_decoder.layers.%d.feed_forward.w2.weight", l);
+            if (rc == S2P_OK)
+                rc = s2p_qcache_put_linear(qc, name, &L->w2, stream);
+        }
+        if (rc == S2P_OK)
+            rc = s2p_qcache_put_linear(qc, "audio_decoder.output.weight",
+                                       &f->output, stream);
     }
 
     /* decode workspace */
