@@ -189,6 +189,26 @@ cudaError_t s2pdk_tconv1d(const float* in, int cin, int tin,
                           const void* w, const float* b, int cout,
                           int k, int stride, float* out, int tout,
                           cudaStream_t st);
+
+/* Cross-session batched variants: per-session base-pointer tables (device
+ * memory), shared weights, session index fastest-varying for L2 tile
+ * reuse. Bit-identical per stream to the per-session kernels. */
+cudaError_t s2pdk_conv1d_b(const float* const* in_b, int cin, int tin,
+                           const void* w, const float* b, int cout, int k,
+                           int dil, int stride, int leftpad,
+                           float* const* out_b, int tout, int nb,
+                           cudaStream_t st);
+cudaError_t s2pdk_dwconv1d_b(const float* const* in_b, int c, int tin,
+                             const void* w, const float* b, int k,
+                             int leftpad, float* const* out_b, int tout,
+                             int nb, cudaStream_t st);
+cudaError_t s2pdk_tconv1d_b(const float* const* in_b, int cin, int tin,
+                            const void* w, const float* b, int cout, int k,
+                            int stride, float* const* out_b, int tout,
+                            int nb, cudaStream_t st);
+cudaError_t s2pdk_matmul_b(const float* const* a_b, int m, int k,
+                           const void* w, int n, const float* bias,
+                           float* const* out_b, int nb, cudaStream_t st);
 void        s2pdk_weights_f16(int on);
 cudaError_t s2pdk_conv1d_w32(const float* in, int cin, int tin,
                              const void* w, const float* b, int cout, int k,

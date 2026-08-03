@@ -54,6 +54,7 @@ static __global__ void k_quant(int8_t* q, float* scales,
     }
 }
 
+template <int MM>
 static __global__ void k_gemv(__nv_bfloat16* y, const __nv_bfloat16* x,
                               const int8_t* w, const float* scales, int M,
                               int N, int K) {
@@ -63,9 +64,9 @@ static __global__ void k_gemv(__nv_bfloat16* y, const __nv_bfloat16* x,
     if (n >= N) return;
     const int8_t* wrow = w + (size_t)n * K;
 
-    float acc[S2P_INT8_GEMV_MAX_M];
+    float acc[MM];
 #pragma unroll
-    for (int m = 0; m < S2P_INT8_GEMV_MAX_M; m++) acc[m] = 0.0f;
+    for (int m = 0; m < MM; m++) acc[m] = 0.0f;
 
     for (int k0 = lane * 16; k0 < K; k0 += 32 * 16) {
         const int4 wv = *(const int4*)(wrow + k0);
@@ -88,7 +89,7 @@ static __global__ void k_gemv(__nv_bfloat16* y, const __nv_bfloat16* x,
     }
 
 #pragma unroll
-    for (int m = 0; m < S2P_INT8_GEMV_MAX_M; m++)
+    for (int m = 0; m < MM; m++)
         for (int off = 16; off > 0; off >>= 1)
             acc[m] += __shfl_down_sync(0xffffffffu, acc[m], off);
 
@@ -190,6 +191,7 @@ static __global__ void k_quant_g(int8_t* q, __half* scales,
     }
 }
 
+template <int MM>
 static __global__ void k_gemv_g(__nv_bfloat16* y, const __nv_bfloat16* x,
                                 const int8_t* w, const __half* scales, int M,
                                 int N, int K, int gshift) {
@@ -200,9 +202,9 @@ static __global__ void k_gemv_g(__nv_bfloat16* y, const __nv_bfloat16* x,
     const int8_t* wrow = w + (size_t)n * K;
     const __half* srow = scales + (size_t)n * (K >> gshift);
 
-    float acc[S2P_INT8_GEMV_MAX_M];
+    float acc[MM];
 #pragma unroll
-    for (int m = 0; m < S2P_INT8_GEMV_MAX_M; m++) acc[m] = 0.0f;
+    for (int m = 0; m < MM; m++) acc[m] = 0.0f;
 
     for (int k0 = lane * 16; k0 < K; k0 += 32 * 16) {
         const int4 wv = *(const int4*)(wrow + k0);
@@ -227,7 +229,7 @@ static __global__ void k_gemv_g(__nv_bfloat16* y, const __nv_bfloat16* x,
     }
 
 #pragma unroll
-    for (int m = 0; m < S2P_INT8_GEMV_MAX_M; m++)
+    for (int m = 0; m < MM; m++)
         for (int off = 16; off > 0; off >>= 1)
             acc[m] += __shfl_down_sync(0xffffffffu, acc[m], off);
 
@@ -271,6 +273,7 @@ static __device__ __forceinline__ void unpack16(int8_t* w16, const uint8_t* b) {
     }
 }
 
+template <int MM>
 static __global__ void k_gemv_p(__nv_bfloat16* y, const __nv_bfloat16* x,
                                 const uint8_t* w, const __half* scales, int M,
                                 int N, int K, int gshift) {
@@ -281,9 +284,9 @@ static __global__ void k_gemv_p(__nv_bfloat16* y, const __nv_bfloat16* x,
     const uint8_t* wrow = w + (size_t)n * (K >> 1);
     const __half* srow = scales + (size_t)n * (K >> gshift);
 
-    float acc[S2P_INT8_GEMV_MAX_M];
+    float acc[MM];
 #pragma unroll
-    for (int m = 0; m < S2P_INT8_GEMV_MAX_M; m++) acc[m] = 0.0f;
+    for (int m = 0; m < MM; m++) acc[m] = 0.0f;
 
     for (int k0 = lane * 16; k0 < K; k0 += 32 * 16) {
         const uint2 wv = *(const uint2*)(wrow + (k0 >> 1));
@@ -308,7 +311,7 @@ static __global__ void k_gemv_p(__nv_bfloat16* y, const __nv_bfloat16* x,
     }
 
 #pragma unroll
-    for (int m = 0; m < S2P_INT8_GEMV_MAX_M; m++)
+    for (int m = 0; m < MM; m++)
         for (int off = 16; off > 0; off >>= 1)
             acc[m] += __shfl_down_sync(0xffffffffu, acc[m], off);
 
@@ -370,7 +373,12 @@ extern "C" s2p_status s2p_intq_gemv(void* y_bf16, const void* x_bf16,
     if (M > S2P_INT8_GEMV_MAX_M || K % 512 != 0 || gs < 0 || K % G != 0)
         return S2P_ERR_INVALID;
     const int blocks = (N + GEMV_WARPS - 1) / GEMV_WARPS;
-    k_gemv_g<<<blocks, GEMV_WARPS * 32, 0, stream>>>(
+    if (M <= 8)
+        k_gemv_g<8><<<blocks, GEMV_WARPS * 32, 0, stream>>>(
+        (__nv_bfloat16*)y_bf16, (const __nv_bfloat16*)x_bf16,
+        (const int8_t*)w_i8, (const __half*)scales_f16, M, N, K, gs);
+    else
+        k_gemv_g<S2P_INT8_GEMV_MAX_M><<<blocks, GEMV_WARPS * 32, 0, stream>>>(
         (__nv_bfloat16*)y_bf16, (const __nv_bfloat16*)x_bf16,
         (const int8_t*)w_i8, (const __half*)scales_f16, M, N, K, gs);
     cudaError_t ce = cudaGetLastError();
@@ -428,7 +436,12 @@ extern "C" s2p_status s2p_int4p_gemv(void* y_bf16, const void* x_bf16,
     if (M > S2P_INT8_GEMV_MAX_M || K % 512 != 0 || gs < 0 || K % G != 0)
         return S2P_ERR_INVALID;
     const int blocks = (N + GEMV_WARPS - 1) / GEMV_WARPS;
-    k_gemv_p<<<blocks, GEMV_WARPS * 32, 0, stream>>>(
+    if (M <= 8)
+        k_gemv_p<8><<<blocks, GEMV_WARPS * 32, 0, stream>>>(
+        (__nv_bfloat16*)y_bf16, (const __nv_bfloat16*)x_bf16,
+        (const uint8_t*)w_pack, (const __half*)scales_f16, M, N, K, gs);
+    else
+        k_gemv_p<S2P_INT8_GEMV_MAX_M><<<blocks, GEMV_WARPS * 32, 0, stream>>>(
         (__nv_bfloat16*)y_bf16, (const __nv_bfloat16*)x_bf16,
         (const uint8_t*)w_pack, (const __half*)scales_f16, M, N, K, gs);
     cudaError_t ce = cudaGetLastError();
@@ -481,7 +494,12 @@ extern "C" s2p_status s2p_int8_gemv(void* y_bf16, const void* x_bf16,
         return S2P_ERR_INVALID;
     if (M > S2P_INT8_GEMV_MAX_M || K % 512 != 0) return S2P_ERR_INVALID;
     const int blocks = (N + GEMV_WARPS - 1) / GEMV_WARPS;
-    k_gemv<<<blocks, GEMV_WARPS * 32, 0, stream>>>(
+    if (M <= 8)
+        k_gemv<8><<<blocks, GEMV_WARPS * 32, 0, stream>>>(
+        (__nv_bfloat16*)y_bf16, (const __nv_bfloat16*)x_bf16,
+        (const int8_t*)w_i8, scales, M, N, K);
+    else
+        k_gemv<S2P_INT8_GEMV_MAX_M><<<blocks, GEMV_WARPS * 32, 0, stream>>>(
         (__nv_bfloat16*)y_bf16, (const __nv_bfloat16*)x_bf16,
         (const int8_t*)w_i8, scales, M, N, K);
     cudaError_t ce = cudaGetLastError();
