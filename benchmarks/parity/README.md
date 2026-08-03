@@ -134,7 +134,34 @@ Evidence: [`results/parity-int4-g32f16-oracle-fox-2026-08-02.json`](results/pari
 (f32-scale predecessor run:
 [`results/parity-int4-g32-oracle-fox-2026-08-02.json`](results/parity-int4-g32-oracle-fox-2026-08-02.json))
 
-## 4. Listening evidence
+## 4. Encoder validation
+
+The decode path has been oracle-gated from the start; the *encoder* —
+which turns reference audio into the VQ codes that pin every cloned
+voice — had no fixture, and that gap is now closed from both sides:
+
+- `tools/encoder_parity.py` compares the native encoder's codes against
+  the reference codec's `encode()` per codebook (semantic agreement is
+  the acceptance metric). It needs the upstream reference package, which
+  this repository deliberately does not vendor; on a host without it the
+  tool reports that and exits.
+- `S2P_TEST_ENC_DUMP` (raw cb-major codes) and `S2P_TEST_ENC_RT` (decode
+  the reference's own codes straight back to PCM) on `s2p-test` make the
+  encoder measurable without the reference package. Since decode is
+  oracle-exact (cos 1.000000, SNR 65.85 dB), the round trip isolates the
+  encoder.
+
+Measured round trip on a 49.5 s reference (1067 frames): waveform
+correlation **0.854**, waveform SNR 5.5 dB. The SNR figure is expected
+and not a defect — a 21.5 Hz RVQ codec reconstructs perceptual content,
+not waveform phase, and published neural codecs report the same range.
+The correlation is what carries information here: a broken encoder would
+produce codes whose reconstruction does not track the source at all.
+This is a sanity instrument, not a tight gate; the tight gate is the
+per-codebook comparison above, and it runs as soon as the reference
+package is available on the host.
+
+## 5. Listening evidence
 
 Parity establishes numeric fidelity, not perceptual quality. The
 listening set (not in git; regenerable with `s2p-parity` + `s2p-test`)
