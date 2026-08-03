@@ -31,6 +31,13 @@ typedef struct {
 typedef int (*s2p_audio_cb)(void* user, const int16_t* pcm, int64_t n,
                             int final);
 
+/* Pre-warm the KV-prefix cache for every registry voice (call after
+ * create, before serving traffic). Declared here; voices type from
+ * s2pro/voices.h. */
+struct s2p_voices;
+s2p_status s2p_sched_warm_voices(s2p_sched* s,
+                                 const struct s2p_voices* v);
+
 s2p_status s2p_sched_create(s2p_model* m, s2p_dac* d, s2p_tok* t,
                             const s2p_config* cfg, const s2p_sched_opts* opts,
                             s2p_sched** out);

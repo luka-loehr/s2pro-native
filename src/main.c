@@ -173,6 +173,15 @@ int main(int argc, char** argv) {
         goto out;
     }
 
+    /* warm every voice's KV prefix so first requests never pay the
+     * system-block prefill (S2P_KV_WARM=0 skips) */
+    {
+        const char* wv = getenv("S2P_KV_WARM");
+        if (!(wv && wv[0] == '0' && wv[1] == '\0') &&
+            s2p_voices_count(voices) > 0)
+            (void)s2p_sched_warm_voices(sched, voices);
+    }
+
     /* 7. HTTP server (blocks until SIGINT/SIGTERM). */
     s2p_server_opts srvopts;
     memset(&srvopts, 0, sizeof(srvopts));

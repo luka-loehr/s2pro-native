@@ -268,9 +268,14 @@ s2p_status s2p_session_prefill(s2p_session* s, const int64_t* ids,
     if (n_parts > 0 && (parts == NULL || vq_mask == NULL))
         return S2P_ERR_INVALID;
     s2p_model* m = s->m;
-    if (s->state != S2P_SESS_NEW) return S2P_ERR_STATE;
-    /* pos0 > 0 when s2p_session_kv_load seeded a cached prompt prefix; the
-     * remaining ids then prefill at that offset. */
+    /* NEW: first (or cache-seeded) prefill. PREFILLED: chunked prefill —
+     * the scheduler appends the prompt in slices; every call extends the
+     * KV at kv_len and refreshes pending_hidden, so the LAST slice leaves
+     * exactly the full-prefill state (identical math: causal attention
+     * over the cache is position-wise the same whether the rows arrived
+     * in one call or many). */
+    if (s->state != S2P_SESS_NEW && s->state != S2P_SESS_PREFILLED)
+        return S2P_ERR_STATE;
     const int pos0 = s->kv_len;
     /* reference clamps max_new_tokens to ctx-1-prompt: need >= 1 decode slot */
     if (pos0 + n_ids > m->ctx_len - 1) return S2P_ERR_INVALID;
@@ -670,7 +675,7 @@ s2p_status s2p_model_batch_next_frame(s2p_model* m, s2p_session** sess, int n,
         for (int b = 0; b < bd; b++)
             if (hpos[b] + 1 > max_len) max_len = hpos[b] + 1;
     }
-    const int steady = bd == nact && bd >= 1 && bd <= 4 &&
+    const int steady = bd == nact && bd >= 1 && bd <= m->max_sessions &&
                        s2psl_dump_dir() == NULL && nruns == 1 &&
                        runs[0].a == 0 && runs[0].t == bd &&
                        !graphs_disabled();
