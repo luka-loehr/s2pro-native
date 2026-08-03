@@ -111,6 +111,29 @@ s2p_status s2p_voices_load(const char* dir, s2p_dac* dac, s2p_voices** out) {
             continue;
         }
         reg->v = grown;
+        /* S2P_REF_MAX_FRAMES caps the reference block that enters the
+         * prompt (and therefore every session's KV prefix). Each frame is
+         * ~46.4 ms of reference audio and ~78 KB of INT8 KV that every
+         * decode step of every stream re-reads, so this is the direct
+         * knob on concurrency headroom. Keeping the TAIL preserves the
+         * reference's natural ending; the transcript stays whole (it is
+         * prompt text, not KV). 0 or unset = no cap. */
+        {
+            static int cap = -1;
+            if (cap < 0) {
+                const char* e = getenv("S2P_REF_MAX_FRAMES");
+                cap = e ? atoi(e) : 0;
+                if (cap < 0) cap = 0;
+            }
+            if (cap > 0 && T > cap) {
+                const int drop = T - cap;
+                for (int q = 0; q < S2P_NUM_CODEBOOKS; q++)
+                    memmove(codes + (size_t)q * cap,
+                            codes + (size_t)q * T + drop,
+                            (size_t)cap * sizeof(int32_t));
+                T = cap;
+            }
+        }
         s2p_voice* vo = &reg->v[reg->n++];
         vo->name = strdup(name);
         vo->transcript = transcript;
