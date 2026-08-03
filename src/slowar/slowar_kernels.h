@@ -73,6 +73,52 @@ cudaError_t s2pk_attention_decode(const __nv_bfloat16* q,
                                   const int32_t* pos, int max_seq,
                                   int max_len, float* part, cudaStream_t st);
 
+/* ---- INT8 KV cache (S2P_KV8=1, default in INT8 weight mode) -------------
+ * Payload i8 [kv_heads, max_seq, head_dim] + scales f16 [kv_heads, max_seq,
+ * head_dim/32]: one scale per 32-element group of the post-RoPE head vector
+ * (absmax/127, rounded through f16 so dequant uses exactly the stored
+ * scale). Halves KV read traffic and session/prefix-cache memory. Scale
+ * pointers cross the C ABI as void* (f16 has no C-side type here). */
+
+/* Quantize-on-append; scalar pos (prefill, rows at pos0..pos0+rows-1). */
+cudaError_t s2pk_kv_append8(const __nv_bfloat16* k, const __nv_bfloat16* v,
+                            int8_t* k_cache, int8_t* v_cache, void* k_scale,
+                            void* v_scale, int rows, int kv_heads,
+                            int head_dim, int pos, int max_seq,
+                            cudaStream_t st);
+
+/* Per-row caches + positions (lockstep decode). */
+cudaError_t s2pk_kv_append8_ptrs(const __nv_bfloat16* k,
+                                 const __nv_bfloat16* v,
+                                 int8_t* const* k_caches,
+                                 int8_t* const* v_caches,
+                                 void* const* k_scales, void* const* v_scales,
+                                 int rows, int kv_heads, int head_dim,
+                                 const int32_t* pos, int max_seq,
+                                 cudaStream_t st);
+
+/* Single-pass causal GQA attention over the INT8 cache (prefill and the
+ * single-session path); same online-softmax structure and f32 accumulation
+ * as s2pk_attention, K/V dequantized group-wise in registers. */
+cudaError_t s2pk_attention8(const __nv_bfloat16* q, const int8_t* k_cache,
+                            const int8_t* v_cache, const void* k_scale,
+                            const void* v_scale, __nv_bfloat16* out, int rows,
+                            int q_heads, int kv_heads, int head_dim, int pos,
+                            int max_seq, cudaStream_t st);
+
+/* Split-K flash-decode over the INT8 cache (batched decode path); K/V tiles
+ * staged in shared memory as int8 + f16 scales, combine kernel shared with
+ * the bf16 path. */
+cudaError_t s2pk_attention8_decode(const __nv_bfloat16* q,
+                                   const int8_t* const* k_caches,
+                                   const int8_t* const* v_caches,
+                                   const void* const* k_scales,
+                                   const void* const* v_scales,
+                                   __nv_bfloat16* out, int rows, int q_heads,
+                                   int kv_heads, int head_dim,
+                                   const int32_t* pos, int max_seq,
+                                   int max_len, float* part, cudaStream_t st);
+
 /* ---- device-side semantic sampler (kernels.cu, exact port of sampling.c) */
 
 /* Per-session sampler state, DEVICE-resident. Field semantics identical to
