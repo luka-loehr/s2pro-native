@@ -163,6 +163,52 @@ int main(int argc, char** argv) {
             double tr = now_ms();
             CHECK(s2p_dac_encode(dac, rpcm, rn, &rc32, &refT, 0),
                   "dac encode (reference)");
+            {
+                /* S2P_TEST_ENC_DUMP=path: raw int32 cb-major [10][T] of
+                 * the FIRST reference, for tools/encoder_parity.py */
+                const char* ed = getenv("S2P_TEST_ENC_DUMP");
+                if (ed && ed[0] && n_refwavs == 0) {
+                    FILE* f = fopen(ed, "wb");
+                    if (f) {
+                        fwrite(rc32, sizeof(int32_t),
+                               (size_t)S2P_NUM_CODEBOOKS * refT, f);
+                        fclose(f);
+                        fprintf(stderr, "[test] encoder dump -> %s "
+                                "(%d frames)\n", ed, refT);
+                    }
+                }
+            }
+            {
+                /* S2P_TEST_ENC_RT=path: decode the reference's OWN codes
+                 * back to PCM. The decode path is oracle-gated (cos
+                 * 1.000000, SNR 65.85 dB on reference frames), so the
+                 * round-trip SNR against the input wav measures the
+                 * encoder — the last stage without its own oracle. */
+                const char* rt = getenv("S2P_TEST_ENC_RT");
+                if (rt && rt[0] && n_refwavs == 0) {
+                    float* rpcm2 = NULL;
+                    int64_t rn2 = 0;
+                    if (s2p_dac_decode(dac, rc32, refT, &rpcm2, &rn2, 0) ==
+                            S2P_OK && rpcm2) {
+                        int16_t* s16rt =
+                            (int16_t*)malloc((size_t)rn2 * sizeof(int16_t));
+                        if (s16rt) {
+                            for (int64_t i = 0; i < rn2; i++) {
+                                float v = rpcm2[i];
+                                if (v > 1.f) v = 1.f;
+                                if (v < -1.f) v = -1.f;
+                                s16rt[i] = (int16_t)(v * 32767.f);
+                            }
+                            s2p_wav_write_file(rt, s16rt, rn2,
+                                               S2P_SAMPLE_RATE);
+                            free(s16rt);
+                            fprintf(stderr, "[test] encode round-trip -> %s "
+                                    "(%lld samples)\n", rt, (long long)rn2);
+                        }
+                        free(rpcm2);
+                    }
+                }
+            }
             fprintf(stderr,
                     "[test] reference[%d]: %s  %.2f s -> %d frames (%.0f ms)\n",
                     n_refwavs, tokp, (double)rn / S2P_SAMPLE_RATE, refT,
