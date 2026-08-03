@@ -11,3 +11,4 @@ model/
 voices/*.wav
 voices/*.txt
 MONDAY-PLAN.md
+voices/*.codes
