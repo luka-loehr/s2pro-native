@@ -50,10 +50,21 @@ s2p_status s2p_session_create(s2p_model* m, const s2p_sampling_cfg* cfg,
 
     int64_t kv_shape[4] = {S2P_SLOW_LAYERS, 2 * S2P_SLOW_KV_HEADS, m->ctx_len,
                            S2P_HEAD_DIM};
-    s2p_status rc = s2p_tensor_device_alloc(&s->kv, S2P_DT_BF16, 4, kv_shape);
+    s2p_status rc = s2p_tensor_device_alloc(
+        &s->kv, m->kv8 ? S2P_DT_I8 : S2P_DT_BF16, 4, kv_shape);
     if (rc != S2P_OK) {
         free(s);
         return rc;
+    }
+    if (m->kv8) {
+        int64_t sc_shape[4] = {S2P_SLOW_LAYERS, 2 * S2P_SLOW_KV_HEADS,
+                               m->ctx_len, S2P_HEAD_DIM / 32};
+        rc = s2p_tensor_device_alloc(&s->kvs, S2P_DT_F16, 4, sc_shape);
+        if (rc != S2P_OK) {
+            s2p_tensor_free(&s->kv);
+            free(s);
+            return rc;
+        }
     }
     int64_t h_shape[1] = {S2P_DIM};
     rc = s2p_tensor_device_alloc(&s->pending_hidden, S2P_DT_BF16, 1, h_shape);
@@ -99,6 +110,7 @@ void s2p_session_destroy(s2p_session* s) {
         s->m->n_sessions--;
     }
     s2p_tensor_free(&s->kv);
+    s2p_tensor_free(&s->kvs);
     s2p_tensor_free(&s->pending_hidden);
     if (s->dsamp) cudaFree(s->dsamp);
     free(s);
@@ -112,8 +124,11 @@ void s2p_session_destroy(s2p_session* s) {
  * uploaded pointer table. */
 typedef struct {
     const int32_t* pos_dev;              /* [rows] */
-    __nv_bfloat16* const* kptr;          /* [layers*rows] */
-    __nv_bfloat16* const* vptr;
+    void* const* kptr;                   /* [layers*rows] plane pointers
+                                          * (bf16, or i8 when m->kv8) */
+    void* const* vptr;
+    void* const* ksptr;                  /* m->kv8: f16 scale planes */
+    void* const* vsptr;
     int max_len;                         /* max over rows of pos+1 */
 } s2p_batch_refs;
 
@@ -158,40 +173,74 @@ static s2p_status run_layer(s2p_model* m, int l, int rows, int pos0,
                               S2P_SLOW_KV_HEADS, S2P_HEAD_DIM, S2P_NORM_EPS,
                               st));
     if (batch != NULL) {
-        __nv_bfloat16* const* kp = batch->kptr + (size_t)l * rows;
-        __nv_bfloat16* const* vp = batch->vptr + (size_t)l * rows;
+        void* const* kp = batch->kptr + (size_t)l * rows;
+        void* const* vp = batch->vptr + (size_t)l * rows;
         S2P_CUDA_TRY(s2pk_rope_pos(BF(m->sq), BF(m->sk), rows,
                                    S2P_SLOW_Q_HEADS, S2P_SLOW_KV_HEADS,
                                    S2P_HEAD_DIM, batch->pos_dev, S2P_ROPE_BASE,
                                    st));
-        S2P_CUDA_TRY(s2pk_kv_append_ptrs(BF(m->sk), BF(m->sv), kp, vp, rows,
-                                         S2P_SLOW_KV_HEADS, S2P_HEAD_DIM,
-                                         batch->pos_dev, m->ctx_len, st));
-        if (!attn_legacy())
+        if (m->kv8) {
+            void* const* ksp = batch->ksptr + (size_t)l * rows;
+            void* const* vsp = batch->vsptr + (size_t)l * rows;
+            S2P_CUDA_TRY(s2pk_kv_append8_ptrs(
+                BF(m->sk), BF(m->sv), (int8_t* const*)kp, (int8_t* const*)vp,
+                ksp, vsp, rows, S2P_SLOW_KV_HEADS, S2P_HEAD_DIM,
+                batch->pos_dev, m->ctx_len, st));
+            /* S2P_ATTN_LEGACY has no INT8 variant: split-K serves both */
+            S2P_CUDA_TRY(s2pk_attention8_decode(
+                BF(m->sq), (const int8_t* const*)kp, (const int8_t* const*)vp,
+                (const void* const*)ksp, (const void* const*)vsp,
+                BF(m->sattn), rows, S2P_SLOW_Q_HEADS, S2P_SLOW_KV_HEADS,
+                S2P_HEAD_DIM, batch->pos_dev, m->ctx_len, batch->max_len,
+                (float*)m->sattn_part.data, st));
+        } else if (!attn_legacy()) {
+            S2P_CUDA_TRY(s2pk_kv_append_ptrs(
+                BF(m->sk), BF(m->sv), (__nv_bfloat16* const*)kp,
+                (__nv_bfloat16* const*)vp, rows, S2P_SLOW_KV_HEADS,
+                S2P_HEAD_DIM, batch->pos_dev, m->ctx_len, st));
             S2P_CUDA_TRY(s2pk_attention_decode(
                 BF(m->sq), (const __nv_bfloat16* const*)kp,
                 (const __nv_bfloat16* const*)vp, BF(m->sattn), rows,
                 S2P_SLOW_Q_HEADS, S2P_SLOW_KV_HEADS, S2P_HEAD_DIM,
                 batch->pos_dev, m->ctx_len, batch->max_len,
                 (float*)m->sattn_part.data, st));
-        else
+        } else {
+            S2P_CUDA_TRY(s2pk_kv_append_ptrs(
+                BF(m->sk), BF(m->sv), (__nv_bfloat16* const*)kp,
+                (__nv_bfloat16* const*)vp, rows, S2P_SLOW_KV_HEADS,
+                S2P_HEAD_DIM, batch->pos_dev, m->ctx_len, st));
             S2P_CUDA_TRY(s2pk_attention_ptrs(
                 BF(m->sq), (const __nv_bfloat16* const*)kp,
                 (const __nv_bfloat16* const*)vp, BF(m->sattn), rows,
                 S2P_SLOW_Q_HEADS, S2P_SLOW_KV_HEADS, S2P_HEAD_DIM,
                 batch->pos_dev, m->ctx_len, st));
+        }
     } else {
-        __nv_bfloat16* kc = s2p_kv_k(single, l);
-        __nv_bfloat16* vc = s2p_kv_v(single, l);
         S2P_CUDA_TRY(s2pk_rope(BF(m->sq), BF(m->sk), rows, S2P_SLOW_Q_HEADS,
                                S2P_SLOW_KV_HEADS, S2P_HEAD_DIM, pos0,
                                S2P_ROPE_BASE, st));
-        S2P_CUDA_TRY(s2pk_kv_append(BF(m->sk), BF(m->sv), kc, vc, rows,
-                                    S2P_SLOW_KV_HEADS, S2P_HEAD_DIM, pos0,
-                                    m->ctx_len, st));
-        S2P_CUDA_TRY(s2pk_attention(BF(m->sq), kc, vc, BF(m->sattn), rows,
-                                    S2P_SLOW_Q_HEADS, S2P_SLOW_KV_HEADS,
-                                    S2P_HEAD_DIM, pos0, m->ctx_len, st));
+        if (m->kv8) {
+            int8_t* kc = s2p_kv8_k(single, l);
+            int8_t* vc = s2p_kv8_v(single, l);
+            void* ks = s2p_kv8_ks(single, l);
+            void* vs = s2p_kv8_vs(single, l);
+            S2P_CUDA_TRY(s2pk_kv_append8(BF(m->sk), BF(m->sv), kc, vc, ks, vs,
+                                         rows, S2P_SLOW_KV_HEADS, S2P_HEAD_DIM,
+                                         pos0, m->ctx_len, st));
+            S2P_CUDA_TRY(s2pk_attention8(BF(m->sq), kc, vc, ks, vs,
+                                         BF(m->sattn), rows, S2P_SLOW_Q_HEADS,
+                                         S2P_SLOW_KV_HEADS, S2P_HEAD_DIM, pos0,
+                                         m->ctx_len, st));
+        } else {
+            __nv_bfloat16* kc = s2p_kv_k(single, l);
+            __nv_bfloat16* vc = s2p_kv_v(single, l);
+            S2P_CUDA_TRY(s2pk_kv_append(BF(m->sk), BF(m->sv), kc, vc, rows,
+                                        S2P_SLOW_KV_HEADS, S2P_HEAD_DIM, pos0,
+                                        m->ctx_len, st));
+            S2P_CUDA_TRY(s2pk_attention(BF(m->sq), kc, vc, BF(m->sattn), rows,
+                                        S2P_SLOW_Q_HEADS, S2P_SLOW_KV_HEADS,
+                                        S2P_HEAD_DIM, pos0, m->ctx_len, st));
+        }
     }
     S2P_TRY(s2p_linear_forward(&ly->wo, m->sattn.data, m->sproj.data, rows,
                                m->mode, st));
@@ -318,20 +367,38 @@ s2p_status s2p_session_prefill(s2p_session* s, const int64_t* ids,
  * so save/load are single strided 2D copies. */
 #define S2P_KV_PLANES (S2P_SLOW_LAYERS * 2 * S2P_SLOW_KV_HEADS)
 
+/* Payload elem size: bf16 (2 B) or i8 (1 B under m->kv8); INT8 blobs carry
+ * the payload planes first, then the f16 scale planes (4 per position). */
+static size_t kv_elem_bytes(const s2p_model* m) {
+    return m->kv8 ? sizeof(int8_t) : sizeof(uint16_t);
+}
+static size_t kv_scale_width(const s2p_model* m, int n_tokens) {
+    return m->kv8 ? (size_t)n_tokens * (S2P_HEAD_DIM / 32) * 2 : 0;
+}
+
 size_t s2p_session_kv_bytes(const s2p_model* m, int n_tokens) {
     if (m == NULL || n_tokens <= 0) return 0;
-    return (size_t)S2P_KV_PLANES * n_tokens * S2P_HEAD_DIM * sizeof(uint16_t);
+    return (size_t)S2P_KV_PLANES * n_tokens * S2P_HEAD_DIM * kv_elem_bytes(m) +
+           (size_t)S2P_KV_PLANES * kv_scale_width(m, n_tokens);
 }
 
 s2p_status s2p_session_kv_save(s2p_session* s, int n_tokens, void* blob_dev) {
     if (s == NULL || blob_dev == NULL || n_tokens <= 0) return S2P_ERR_INVALID;
     if (n_tokens > s->kv_len) return S2P_ERR_INVALID;
     s2p_model* m = s->m;
-    const size_t width = (size_t)n_tokens * S2P_HEAD_DIM * sizeof(uint16_t);
-    const size_t pitch = (size_t)m->ctx_len * S2P_HEAD_DIM * sizeof(uint16_t);
+    const size_t width = (size_t)n_tokens * S2P_HEAD_DIM * kv_elem_bytes(m);
+    const size_t pitch = (size_t)m->ctx_len * S2P_HEAD_DIM * kv_elem_bytes(m);
     S2P_CUDA_TRY(cudaMemcpy2DAsync(blob_dev, width, s->kv.data, pitch, width,
                                    S2P_KV_PLANES, cudaMemcpyDeviceToDevice,
                                    m->stream));
+    if (m->kv8) {
+        char* sblob = (char*)blob_dev + (size_t)S2P_KV_PLANES * width;
+        const size_t swidth = kv_scale_width(m, n_tokens);
+        const size_t spitch = kv_scale_width(m, m->ctx_len);
+        S2P_CUDA_TRY(cudaMemcpy2DAsync(sblob, swidth, s->kvs.data, spitch,
+                                       swidth, S2P_KV_PLANES,
+                                       cudaMemcpyDeviceToDevice, m->stream));
+    }
     S2P_CUDA_TRY(cudaStreamSynchronize(m->stream));
     return S2P_OK;
 }
@@ -342,11 +409,20 @@ s2p_status s2p_session_kv_load(s2p_session* s, const void* blob_dev,
     s2p_model* m = s->m;
     if (s->state != S2P_SESS_NEW || s->kv_len != 0) return S2P_ERR_STATE;
     if (n_tokens > m->ctx_len - 1) return S2P_ERR_INVALID;
-    const size_t width = (size_t)n_tokens * S2P_HEAD_DIM * sizeof(uint16_t);
-    const size_t pitch = (size_t)m->ctx_len * S2P_HEAD_DIM * sizeof(uint16_t);
+    const size_t width = (size_t)n_tokens * S2P_HEAD_DIM * kv_elem_bytes(m);
+    const size_t pitch = (size_t)m->ctx_len * S2P_HEAD_DIM * kv_elem_bytes(m);
     S2P_CUDA_TRY(cudaMemcpy2DAsync(s->kv.data, pitch, blob_dev, width, width,
                                    S2P_KV_PLANES, cudaMemcpyDeviceToDevice,
                                    m->stream));
+    if (m->kv8) {
+        const char* sblob =
+            (const char*)blob_dev + (size_t)S2P_KV_PLANES * width;
+        const size_t swidth = kv_scale_width(m, n_tokens);
+        const size_t spitch = kv_scale_width(m, m->ctx_len);
+        S2P_CUDA_TRY(cudaMemcpy2DAsync(s->kvs.data, spitch, sblob, swidth,
+                                       swidth, S2P_KV_PLANES,
+                                       cudaMemcpyDeviceToDevice, m->stream));
+    }
     S2P_CUDA_TRY(cudaStreamSynchronize(m->stream));
     s->kv_len = n_tokens;
     return S2P_OK;
@@ -376,8 +452,10 @@ static s2p_status decode_tick_enqueue(s2p_model* m, s2p_session* const* act,
                                      cudaMemcpyHostToDevice, st));
         s2p_batch_refs refs;
         refs.pos_dev = (const int32_t*)(d + m->up.off_pos);
-        refs.kptr = (__nv_bfloat16* const*)(d + m->up.off_ptrs);
+        refs.kptr = (void* const*)(d + m->up.off_ptrs);
         refs.vptr = refs.kptr + (size_t)S2P_SLOW_LAYERS * B;
+        refs.ksptr = refs.kptr + (size_t)2 * S2P_SLOW_LAYERS * B;
+        refs.vsptr = refs.kptr + (size_t)3 * S2P_SLOW_LAYERS * B;
         refs.max_len = max_len;
 
         /* embed fed-back token + previous-frame VQ sum, * 1/sqrt(11) */
@@ -512,9 +590,19 @@ s2p_status s2p_model_batch_next_frame(s2p_model* m, s2p_session** sess, int n,
             hpos[b] = s->kv_len;
             hmask[b] = (uint8_t)is_semantic(s->prev_token);
             for (int l = 0; l < S2P_SLOW_LAYERS; l++) {
-                hptr[(size_t)l * bd + b] = s2p_kv_k(s, l);
-                hptr[(size_t)S2P_SLOW_LAYERS * B + (size_t)l * bd + b] =
-                    s2p_kv_v(s, l);
+                if (m->kv8) {
+                    hptr[(size_t)l * bd + b] = s2p_kv8_k(s, l);
+                    hptr[(size_t)S2P_SLOW_LAYERS * B + (size_t)l * bd + b] =
+                        s2p_kv8_v(s, l);
+                    hptr[(size_t)2 * S2P_SLOW_LAYERS * B + (size_t)l * bd +
+                         b] = s2p_kv8_ks(s, l);
+                    hptr[(size_t)3 * S2P_SLOW_LAYERS * B + (size_t)l * bd +
+                         b] = s2p_kv8_vs(s, l);
+                } else {
+                    hptr[(size_t)l * bd + b] = s2p_kv_k(s, l);
+                    hptr[(size_t)S2P_SLOW_LAYERS * B + (size_t)l * bd + b] =
+                        s2p_kv_v(s, l);
+                }
             }
         }
         /* previous-frame codes, cb-major per contiguous masked run so each

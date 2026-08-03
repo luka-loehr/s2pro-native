@@ -96,6 +96,7 @@ typedef struct {
 
 struct s2p_model {
     s2p_gemm_mode mode;
+    int kv8; /* INT8 KV cache (S2P_KV8; default on in INT8 weight mode) */
     int ctx_len;
     int max_sessions;
     int n_sessions;
@@ -165,7 +166,9 @@ struct s2p_session {
     s2p_model* m;
     s2p_sess_state state;
     int kv_len; /* tokens resident in the KV cache */
-    s2p_tensor kv; /* [36][2*8][ctx][128] bf16: per layer k then v planes */
+    s2p_tensor kv; /* [36][2*8][ctx][128]: per layer k then v planes.
+                    * bf16, or i8 payload when m->kv8 */
+    s2p_tensor kvs; /* m->kv8 only: [36][2*8][ctx][4] f16 group scales */
     s2p_tensor pending_hidden; /* [2560] final-normed prefill hidden */
     int64_t prev_token;    /* raw sampled vocab id fed back next frame */
     int32_t prev_codes[S2P_NUM_CODEBOOKS]; /* [sem_id, resid1..9] */
@@ -189,6 +192,27 @@ static inline __nv_bfloat16* s2p_kv_k(const s2p_session* s, int layer) {
 static inline __nv_bfloat16* s2p_kv_v(const s2p_session* s, int layer) {
     return s2p_kv_k(s, layer) +
            (size_t)S2P_SLOW_KV_HEADS * s->m->ctx_len * S2P_HEAD_DIM;
+}
+
+/* INT8-KV variants (m->kv8): i8 payload planes + f16 scale planes
+ * (head_dim/32 = 4 scales per position). Scale pointers stay void* on the
+ * C side. */
+static inline int8_t* s2p_kv8_k(const s2p_session* s, int layer) {
+    return (int8_t*)s->kv.data +
+           (size_t)layer * 2 * S2P_SLOW_KV_HEADS * s->m->ctx_len * S2P_HEAD_DIM;
+}
+static inline int8_t* s2p_kv8_v(const s2p_session* s, int layer) {
+    return s2p_kv8_k(s, layer) +
+           (size_t)S2P_SLOW_KV_HEADS * s->m->ctx_len * S2P_HEAD_DIM;
+}
+static inline void* s2p_kv8_ks(const s2p_session* s, int layer) {
+    return (char*)s->kvs.data +
+           (size_t)layer * 2 * S2P_SLOW_KV_HEADS * s->m->ctx_len *
+               (S2P_HEAD_DIM / 32) * 2;
+}
+static inline void* s2p_kv8_vs(const s2p_session* s, int layer) {
+    return (char*)s2p_kv8_ks(s, layer) +
+           (size_t)S2P_SLOW_KV_HEADS * s->m->ctx_len * (S2P_HEAD_DIM / 32) * 2;
 }
 
 #ifdef __cplusplus
