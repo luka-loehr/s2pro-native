@@ -514,6 +514,11 @@ extern "C" cudaError_t s2pk_attention_decode(
  * multiplies by exactly the stored f16 scale. Warp == group when
  * head_dim == 128 and blockDim == 128 (the only served shape). */
 
+/* Bit width is a template parameter: BW==8 stores one int8 per element,
+ * BW==4 packs two 4-bit values per byte (element 2b in the low nibble,
+ * 2b+1 in the high). Scales stay f16 per 32-element group either way, so
+ * only the payload plane halves. */
+template <int BW>
 static __global__ void k_kv_append8(const __nv_bfloat16* k,
                                     const __nv_bfloat16* v, int8_t* kc0,
                                     int8_t* vc0, __half* ks0, __half* vs0,
@@ -534,26 +539,44 @@ static __global__ void k_kv_append8(const __nv_bfloat16* k,
     const size_t dst = ((size_t)h * max_seq + p) * head_dim + d;
     const size_t sdst = ((size_t)h * max_seq + p) * (head_dim >> 5) + g;
 
+    const int QMAX = (BW == 8) ? 127 : 7;
+    const size_t pdst = (BW == 8) ? dst
+                                  : ((size_t)h * max_seq + p) * (head_dim / 2)
+                                        + (d >> 1);
+
     float kx = s2pk_b2f(k[src]);
     float a = fabsf(kx);
     for (int off = 16; off > 0; off >>= 1)
         a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-    __half hsc = __float2half_rn(a / 127.f);
+    __half hsc = __float2half_rn(a / (float)QMAX);
     float sc = __half2float(hsc);
     int q8 = (sc > 0.f) ? __float2int_rn(kx / sc) : 0;
-    q8 = max(-127, min(127, q8));
-    kc[dst] = (int8_t)q8;
+    q8 = max(-QMAX, min(QMAX, q8));
+    if (BW == 8) {
+        kc[dst] = (int8_t)q8;
+    } else {
+        /* thread d (even) owns the byte holding d and d+1 */
+        int hi = __shfl_down_sync(0xffffffffu, q8, 1);
+        if ((d & 1) == 0)
+            kc[pdst] = (int8_t)((q8 & 0xF) | ((hi & 0xF) << 4));
+    }
     if ((d & 31) == 0) ks[sdst] = hsc;
 
     float vx = s2pk_b2f(v[src]);
     a = fabsf(vx);
     for (int off = 16; off > 0; off >>= 1)
         a = fmaxf(a, __shfl_xor_sync(0xffffffffu, a, off));
-    hsc = __float2half_rn(a / 127.f);
+    hsc = __float2half_rn(a / (float)QMAX);
     sc = __half2float(hsc);
     q8 = (sc > 0.f) ? __float2int_rn(vx / sc) : 0;
-    q8 = max(-127, min(127, q8));
-    vc[dst] = (int8_t)q8;
+    q8 = max(-QMAX, min(QMAX, q8));
+    if (BW == 8) {
+        vc[dst] = (int8_t)q8;
+    } else {
+        int hi = __shfl_down_sync(0xffffffffu, q8, 1);
+        if ((d & 1) == 0)
+            vc[pdst] = (int8_t)((q8 & 0xF) | ((hi & 0xF) << 4));
+    }
     if ((d & 31) == 0) vs[sdst] = hsc;
 }
 
@@ -562,12 +585,17 @@ extern "C" cudaError_t s2pk_kv_append8(const __nv_bfloat16* k,
                                        int8_t* v_cache, void* k_scale,
                                        void* v_scale, int rows, int kv_heads,
                                        int head_dim, int pos, int max_seq,
-                                       cudaStream_t st) {
+                                       int bw, cudaStream_t st) {
     if (rows <= 0) return cudaSuccess;
     if (head_dim != 128) return cudaErrorInvalidValue;
-    k_kv_append8<<<rows * kv_heads, head_dim, 0, st>>>(
-        k, v, k_cache, v_cache, (__half*)k_scale, (__half*)v_scale, NULL,
-        NULL, NULL, NULL, kv_heads, head_dim, pos, NULL, max_seq);
+    if (bw == 4)
+        k_kv_append8<4><<<rows * kv_heads, head_dim, 0, st>>>(
+            k, v, k_cache, v_cache, (__half*)k_scale, (__half*)v_scale, NULL,
+            NULL, NULL, NULL, kv_heads, head_dim, pos, NULL, max_seq);
+    else
+        k_kv_append8<8><<<rows * kv_heads, head_dim, 0, st>>>(
+            k, v, k_cache, v_cache, (__half*)k_scale, (__half*)v_scale, NULL,
+            NULL, NULL, NULL, kv_heads, head_dim, pos, NULL, max_seq);
     return cudaGetLastError();
 }
 
@@ -575,19 +603,26 @@ extern "C" cudaError_t s2pk_kv_append8_ptrs(
     const __nv_bfloat16* k, const __nv_bfloat16* v, int8_t* const* k_caches,
     int8_t* const* v_caches, void* const* k_scales, void* const* v_scales,
     int rows, int kv_heads, int head_dim, const int32_t* pos, int max_seq,
-    cudaStream_t st) {
+    int bw, cudaStream_t st) {
     if (rows <= 0) return cudaSuccess;
     if (head_dim != 128) return cudaErrorInvalidValue;
-    k_kv_append8<<<rows * kv_heads, head_dim, 0, st>>>(
-        k, v, NULL, NULL, NULL, NULL, k_caches, v_caches,
-        (__half* const*)k_scales, (__half* const*)v_scales, kv_heads,
-        head_dim, 0, pos, max_seq);
+    if (bw == 4)
+        k_kv_append8<4><<<rows * kv_heads, head_dim, 0, st>>>(
+            k, v, NULL, NULL, NULL, NULL, k_caches, v_caches,
+            (__half* const*)k_scales, (__half* const*)v_scales, kv_heads,
+            head_dim, 0, pos, max_seq);
+    else
+        k_kv_append8<8><<<rows * kv_heads, head_dim, 0, st>>>(
+            k, v, NULL, NULL, NULL, NULL, k_caches, v_caches,
+            (__half* const*)k_scales, (__half* const*)v_scales, kv_heads,
+            head_dim, 0, pos, max_seq);
     return cudaGetLastError();
 }
 
 /* Single-pass online-softmax attention over the INT8 cache; structure and
  * f32 accumulation order identical to k_attention, K/V dequantized in
  * registers (per-group partial dot x f16 scale). */
+template <int BW>
 static __global__ void k_attention8(const __nv_bfloat16* q,
                                     const int8_t* kc0, const int8_t* vc0,
                                     const __half* ks0, const __half* vs0,
@@ -606,8 +641,9 @@ static __global__ void k_attention8(const __nv_bfloat16* q,
     const int kvh = h / (q_heads / kv_heads);
     const int ng = head_dim >> 5;
 
-    const int8_t* kc = kc0 + (size_t)kvh * max_seq * head_dim;
-    const int8_t* vc = vc0 + (size_t)kvh * max_seq * head_dim;
+    const int elems = (BW == 8) ? head_dim : head_dim / 2; /* bytes/vector */
+    const int8_t* kc = kc0 + (size_t)kvh * max_seq * elems;
+    const int8_t* vc = vc0 + (size_t)kvh * max_seq * elems;
     const __half* ks = ks0 + (size_t)kvh * max_seq * ng;
     const __half* vs = vs0 + (size_t)kvh * max_seq * ng;
 
@@ -622,14 +658,24 @@ static __global__ void k_attention8(const __nv_bfloat16* q,
         const int j = t0 + tid;
         float s = -INFINITY;
         if (j < len) {
-            const int8_t* kr = kc + (size_t)j * head_dim;
+            const int8_t* kr = kc + (size_t)j * elems;
             const __half* kr_s = ks + (size_t)j * ng;
             float d = 0.f;
             for (int gi = 0; gi < ng; gi++) {
                 float pp = 0.f;
                 const int base = gi << 5;
-                for (int e = 0; e < 32; e++)
-                    pp = fmaf(sq[base + e], (float)kr[base + e], pp);
+                for (int e = 0; e < 32; e++) {
+                    float kv;
+                    if (BW == 8) {
+                        kv = (float)kr[base + e];
+                    } else {
+                        const int idx = base + e;
+                        const int8_t byte = kr[idx >> 1];
+                        const int nib = (idx & 1) ? (byte >> 4) : (byte & 0xF);
+                        kv = (float)(int8_t)((nib << 4) >> 4);
+                    }
+                    pp = fmaf(sq[base + e], kv, pp);
+                }
                 d = fmaf(pp, __half2float(kr_s[gi]), d);
             }
             s = d;
@@ -658,12 +704,21 @@ static __global__ void k_attention8(const __nv_bfloat16* q,
         if (tid < head_dim) {
             acc *= corr;
             const int lim = min(S2PK_ATTN_TILE, len - t0);
-            const int8_t* vb = vc + (size_t)t0 * head_dim;
+            const int8_t* vb = vc + (size_t)t0 * elems;
             const __half* vbs = vs + (size_t)t0 * ng;
             const int vg = tid >> 5;
-            for (int j2 = 0; j2 < lim; j2++)
+            for (int j2 = 0; j2 < lim; j2++) {
+                float vv;
+                if (BW == 8) {
+                    vv = (float)vb[(size_t)j2 * elems + tid];
+                } else {
+                    const int8_t byte = vb[(size_t)j2 * elems + (tid >> 1)];
+                    const int nib = (tid & 1) ? (byte >> 4) : (byte & 0xF);
+                    vv = (float)(int8_t)((nib << 4) >> 4);
+                }
                 acc = fmaf(sp[j2] * __half2float(vbs[(size_t)j2 * ng + vg]),
-                           (float)vb[(size_t)j2 * head_dim + tid], acc);
+                           vv, acc);
+            }
         }
         m = m_new;
         __syncthreads();
@@ -680,20 +735,28 @@ extern "C" cudaError_t s2pk_attention8(const __nv_bfloat16* q,
                                        __nv_bfloat16* out, int rows,
                                        int q_heads, int kv_heads,
                                        int head_dim, int pos, int max_seq,
-                                       cudaStream_t st) {
+                                       int bw, cudaStream_t st) {
     if (rows <= 0) return cudaSuccess;
     if (head_dim > S2PK_ATTN_TILE || (head_dim & 31) != 0)
         return cudaErrorInvalidValue;
     dim3 grid(rows, q_heads);
-    k_attention8<<<grid, S2PK_ATTN_TILE, 0, st>>>(
-        q, k_cache, v_cache, (const __half*)k_scale, (const __half*)v_scale,
-        out, q_heads, kv_heads, head_dim, pos, max_seq);
+    if (bw == 4)
+        k_attention8<4><<<grid, S2PK_ATTN_TILE, 0, st>>>(
+            q, k_cache, v_cache, (const __half*)k_scale,
+            (const __half*)v_scale, out, q_heads, kv_heads, head_dim, pos,
+            max_seq);
+    else
+        k_attention8<8><<<grid, S2PK_ATTN_TILE, 0, st>>>(
+            q, k_cache, v_cache, (const __half*)k_scale,
+            (const __half*)v_scale, out, q_heads, kv_heads, head_dim, pos,
+            max_seq);
     return cudaGetLastError();
 }
 
 /* Split-K flash decode over the INT8 cache: K/V tiles staged in shared
  * memory as int8 + f16 scales (half the bf16 tile traffic); partial layout
  * and the combine kernel are shared with the bf16 path. */
+template <int BW>
 static __global__ void k_attn_split8(const __nv_bfloat16* __restrict__ q,
                                      const int8_t* const* k_caches,
                                      const int8_t* const* v_caches,
@@ -726,6 +789,7 @@ static __global__ void k_attn_split8(const __nv_bfloat16* __restrict__ q,
 
     /* u32-typed shared arrays so the coalesced u32 tile copies are aligned;
      * aliased as int8/f16 for the compute reads. */
+    const int EL = (BW == 8) ? S2PK_HD : S2PK_HD / 2; /* bytes per vector */
     __shared__ uint32_t tile8_u[S2PK_SPLIT * S2PK_HD / 4]; /* 8 KB payload */
     __shared__ uint32_t stile_u[S2PK_SPLIT * (S2PK_HD >> 5) / 2]; /* scales */
     int8_t* tile8 = (int8_t*)tile8_u;
@@ -743,11 +807,11 @@ static __global__ void k_attn_split8(const __nv_bfloat16* __restrict__ q,
             scale;
 
     /* K tile + K scales, coalesced as u32 words */
-    const int8_t* kc = k_caches[row] + ((size_t)kvh * max_seq + start) * S2PK_HD;
+    const int8_t* kc = k_caches[row] + ((size_t)kvh * max_seq + start) * EL;
     const __half* ksrow = k_scales[row] + ((size_t)kvh * max_seq + start) * NG;
     {
         const uint32_t* src = (const uint32_t*)kc;
-        for (int i = tid; i < cnt * S2PK_HD / 4; i += blockDim.x)
+        for (int i = tid; i < cnt * EL / 4; i += blockDim.x)
             tile8_u[i] = src[i];
         const uint32_t* ssrc = (const uint32_t*)ksrow;
         for (int i = tid; i < cnt * NG / 2; i += blockDim.x)
@@ -756,7 +820,7 @@ static __global__ void k_attn_split8(const __nv_bfloat16* __restrict__ q,
     __syncthreads();
 
     if (tid < cnt) {
-        const int8_t* kr = tile8 + (size_t)tid * S2PK_HD;
+        const int8_t* kr = tile8 + (size_t)tid * EL;
         const __half* krs = stile + (size_t)tid * NG;
         for (int g = 0; g < S2PK_GROUP; g++) {
             const float* qv = sq[g];
@@ -764,8 +828,18 @@ static __global__ void k_attn_split8(const __nv_bfloat16* __restrict__ q,
             for (int gi = 0; gi < NG; gi++) {
                 float pp = 0.f;
                 const int base = gi << 5;
-                for (int e = 0; e < 32; e++)
-                    pp = fmaf(qv[base + e], (float)kr[base + e], pp);
+                for (int e = 0; e < 32; e++) {
+                    float kv;
+                    if (BW == 8) {
+                        kv = (float)kr[base + e];
+                    } else {
+                        const int idx = base + e;
+                        const int8_t byte = kr[idx >> 1];
+                        const int nib = (idx & 1) ? (byte >> 4) : (byte & 0xF);
+                        kv = (float)(int8_t)((nib << 4) >> 4);
+                    }
+                    pp = fmaf(qv[base + e], kv, pp);
+                }
                 d = fmaf(pp, __half2float(krs[gi]), d);
             }
             sc[g][tid] = d;
@@ -799,12 +873,12 @@ static __global__ void k_attn_split8(const __nv_bfloat16* __restrict__ q,
     }
 
     /* V tile + V scales replace K in shared memory */
-    const int8_t* vc = v_caches[row] + ((size_t)kvh * max_seq + start) * S2PK_HD;
+    const int8_t* vc = v_caches[row] + ((size_t)kvh * max_seq + start) * EL;
     const __half* vsrow = v_scales[row] + ((size_t)kvh * max_seq + start) * NG;
     __syncthreads();
     {
         const uint32_t* src = (const uint32_t*)vc;
-        for (int i = tid; i < cnt * S2PK_HD / 4; i += blockDim.x)
+        for (int i = tid; i < cnt * EL / 4; i += blockDim.x)
             tile8_u[i] = src[i];
         const uint32_t* ssrc = (const uint32_t*)vsrow;
         for (int i = tid; i < cnt * NG / 2; i += blockDim.x)
@@ -815,9 +889,18 @@ static __global__ void k_attn_split8(const __nv_bfloat16* __restrict__ q,
     for (int g = 0; g < S2PK_GROUP; g++) {
         float acc = 0.f;
         const int vg = tid >> 5;
-        for (int j = 0; j < cnt; j++)
+        for (int j = 0; j < cnt; j++) {
+            float vv;
+            if (BW == 8) {
+                vv = (float)tile8[(size_t)j * EL + tid];
+            } else {
+                const int8_t byte = tile8[(size_t)j * EL + (tid >> 1)];
+                const int nib = (tid & 1) ? (byte >> 4) : (byte & 0xF);
+                vv = (float)(int8_t)((nib << 4) >> 4);
+            }
             acc = fmaf(sc[g][j] * __half2float(stile[(size_t)j * NG + vg]),
-                       (float)tile8[(size_t)j * S2PK_HD + tid], acc);
+                       vv, acc);
+        }
         float* ph = pbase + (size_t)g * n_splits * (S2PK_HD + 2);
         if (tid == 0) {
             ph[0] = hm[g];
@@ -832,16 +915,22 @@ extern "C" cudaError_t s2pk_attention8_decode(
     const int8_t* const* v_caches, const void* const* k_scales,
     const void* const* v_scales, __nv_bfloat16* out, int rows, int q_heads,
     int kv_heads, int head_dim, const int32_t* pos, int max_seq, int max_len,
-    float* part, cudaStream_t st) {
+    float* part, int bw, cudaStream_t st) {
     if (rows <= 0) return cudaSuccess;
     if (head_dim != S2PK_HD || q_heads != kv_heads * S2PK_GROUP || !part)
         return cudaErrorInvalidValue;
     const int n_splits = (max_len + S2PK_SPLIT - 1) / S2PK_SPLIT;
     dim3 g1((unsigned)rows, (unsigned)kv_heads, (unsigned)n_splits);
-    k_attn_split8<<<g1, 128, 0, st>>>(q, k_caches, v_caches,
-                                      (const __half* const*)k_scales,
-                                      (const __half* const*)v_scales, q_heads,
-                                      pos, max_seq, n_splits, part);
+    if (bw == 4)
+        k_attn_split8<4><<<g1, 128, 0, st>>>(
+            q, k_caches, v_caches, (const __half* const*)k_scales,
+            (const __half* const*)v_scales, q_heads, pos, max_seq, n_splits,
+            part);
+    else
+        k_attn_split8<8><<<g1, 128, 0, st>>>(
+            q, k_caches, v_caches, (const __half* const*)k_scales,
+            (const __half* const*)v_scales, q_heads, pos, max_seq, n_splits,
+            part);
     cudaError_t ce = cudaGetLastError();
     if (ce != cudaSuccess) return ce;
     dim3 g2((unsigned)rows, (unsigned)q_heads);

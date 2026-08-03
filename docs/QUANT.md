@@ -135,6 +135,27 @@ embeddings cost ~0.0008 backbone cosine and flip nothing: parity of the
 full serving numerics (INT4 weights + INT8 KV + INT8 embed) holds
 prefill/step-1 argmax and fast-AR 8/9. Process memory −0.8 GB.
 
+### 4.8 INT4 KV cache — measured failure
+
+The same group-wise scheme at 4 bits (one f16 scale per 32-element group
+of the post-RoPE head vector, two nibbles per byte) destroys the model:
+backbone cosine collapses from 0.9919 to **0.0107**, prefill and step-1
+argmax are wrong, fast-AR 0/9 (`S2P_KV4=1`, kept in the tree behind the
+flag as the reproduction path). This is not a marginal loss — it is the
+documented outlier-channel failure of per-token K quantization. The key
+vectors carry a small number of channels with far larger magnitude than
+the rest; a per-token group of 32 must then spend its 15 levels covering
+that range, and every ordinary channel in the group quantizes to zero.
+At 8 bits the 255 levels absorb the spread; at 4 bits they do not.
+
+The published fix (KIVI, KVQuant, SageAttention's "smooth K") is a
+*static per-channel* component: subtract a per-channel mean and divide by
+a per-channel scale calibrated offline, folding both into the query at
+kernel entry, where the mean cancels exactly in the softmax and the
+scale costs nothing in the inner loop. That requires a calibration pass
+and is a separate project; until it exists, **INT8 is the KV floor** for
+this engine.
+
 ## 5. Mixed precision is measured, not precautionary
 
 Every attempt to put any part of the fast-AR at 4 bits without training
