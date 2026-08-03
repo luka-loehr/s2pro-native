@@ -76,12 +76,13 @@ distinguish "file missing" from "file unreadable".
 
 Sustained mixed load (batch inference for corpus generation, then dense
 training) is logged at 60 s resolution: GPU temperature, package power,
-SM clock, hottest ACPI zone (trip point 104 °C). Representative values
-under continuous training: GPU 76–85 °C at the full 2444 MHz SM clock;
-one transient zone peak of 97 °C coincided with a load transition that
-doubled package power (37 → 87 W); the SM clock dipped at most
-2444 → 2418 MHz. No thermal throttling episode has been observed. The
-full night trace is summarized in §4 when the run set completes.
+SM clock, hottest ACPI zone (trip point 104 °C). Full-night summary
+(717 samples, ~12 h): GPU maximum 86 °C, hottest zone maximum 97 °C
+(coinciding with a load transition that doubled package power,
+37 → 87 W), SM clock at its full 2444 MHz throughout the loaded phases
+— zero thermal-throttling episodes. The only clock-drop event in the
+trace (208 MHz at GPU 57 °C) is the idle transition at training exit,
+not throttling.
 
 ## 3. Runs
 
@@ -89,7 +90,7 @@ full night trace is summarized in §4 when the run set completes.
 | --- | ---: | --- | --- | --- | --- | --- |
 | 1 | aborted | v1 | cold | 2e-5 | 50 % | — (trainer too slow; fixed, see §2.2) |
 | 2 | 2000 | v1 | cold | 3e-5 | 50 % | see table below |
-| 3 | 3000 | v2 | run 2 | 1.5e-5 → 1e-6 | 35 % | pending |
+| 3 | 3000 | v2 | run 2 | 1.5e-5 → 1e-6 | 35 % | **0.6711** (best, step 2500) |
 
 ### 3.1 Run 2 (v1 corpus, cold start)
 
@@ -131,21 +132,66 @@ The catastrophic failure mode of untrained INT4 (progressive muffling
 from ~10 s) is absent at 0.6690 agreement — the audio gates pass well
 below the INT8 bar on the proxy metric.
 
-### 3.2 Run 3 (v2 corpus, warm start) — in progress
+### 3.2 Run 3 (v2 corpus, warm start)
 
-Warm start from run 2's exported patch; holdout drawn only from v2
-frames (`--holdout-from 60222`); evaluation and best/last checkpoints
-every 500 steps; cosine floor 1e-6. The run executes without a
-wall-clock limit and is followed automatically by deployment of the
-best-by-holdout artifact and the full gate battery.
+Corpus v2 final size: 308,424 frames (590 v2 takes, 205 min of audio,
+generated in 185 min of wall time). Warm start from run 2's exported
+patch; holdout 8,192 frames drawn only from v2 frames
+(`--holdout-from 60222`); evaluation and best/last checkpoints every
+500 steps; cosine floor 1e-6; no wall-clock limit.
+
+| checkpoint | teacher-forced | free-run |
+| --- | ---: | ---: |
+| INT8 deployment bar (v2 holdout) | 0.9645 | 0.8935 |
+| warm start (run 2's weights) | 0.8139 | 0.5959 |
+| step 500 | 0.8168 | 0.5999 |
+| step 1000 | 0.8271 | 0.6163 |
+| step 1500 | 0.8356 | 0.6274 |
+| step 2000 | 0.8527 | 0.6540 |
+| step 2500 (**best**) | 0.8613 | 0.6711 |
+| step 3000 (final) | 0.8615 | 0.6698 |
+
+Two observations. First, run 2's weights score 0.5959 on the v2
+holdout against 0.6690 on their own — the v2 holdout contains voices
+and texts run 2 never saw, so this quantifies the earlier run's
+generalization gap and validates drawing the holdout from unseen
+material. Second, the best checkpoint precedes the schedule end
+(0.6711 at step 2500 vs 0.6698 at 3000); best-by-holdout selection,
+not the final export, supplies the deployed artifact.
 
 ## 4. Results
 
-Pending completion of run 3. This section will record: final held-out
-agreement against the recomputed INT8 bar, HF-envelope trajectories on
-long takes, the EOS probe, wall RTF of the all-INT4 configuration
-(expected decode floor ~20 ms/frame at 4.37 GB/frame), the thermal
-summary of the run set, and the listening verdict.
+The best artifact (step 2500, free-run 0.6711 = 75 % of the INT8 bar)
+was deployed automatically via checkpoint patch and served with
+`S2P_INT4=1 S2P_INT4_ALL=1` — the full all-INT4 weight stream
+(4.37 GB/frame).
+
+**Audio gates — all pass:**
+
+- *HF envelope*, 144/148 s takes on the held-out long text: no
+  muffling collapse; trajectories fluctuate with content (deeper-male
+  median 0.046, buckets 0.041–0.135; neutral-female flat
+  0.013 → 0.012).
+- *EOS probe*, 24 utterance pairs vs INT8 on an otherwise idle GPU:
+  0 flags, length ratios 0.88–1.38, mean 3.5 s vs 3.4 s.
+- Long takes terminate at 144.1 s / 148.0 s — the INT8 reference class.
+
+**Wall RTF (idle GPU, streamed serving):**
+
+| take | audio | wall | RTF |
+| --- | ---: | ---: | ---: |
+| long-form, deeper-male voice | 144.1 s | 89.8 s | **0.62** |
+| long-form, neutral-female voice | 148.0 s | 92.6 s | **0.63** |
+| short multilingual, 3 voices | 48.1–48.8 s | 29.2–30.0 s | **0.60–0.62** |
+
+The INT8-fast-AR configuration measured 0.75–0.76 on the same paths;
+the all-INT4 stream delivers the predicted further ~20 % (weight bytes
+6.17 → 4.37 GB/frame).
+
+**Listening verdict: pending.** The proxy metric sits at 75 % of the
+INT8 bar while every objective audio gate passes; the acceptance
+decision on the deployed artifact — and on whether a further training
+round is warranted — is made by ear.
 
 ## 5. Reproduction
 
