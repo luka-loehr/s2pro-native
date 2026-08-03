@@ -27,6 +27,7 @@
 #include "s2pro/status.h"
 #include "s2pro/config.h"
 #include "s2pro/gemm.h"
+#include "s2pro/qcache.h"
 #include "s2pro/safetensors.h"
 
 #ifdef __cplusplus
@@ -39,8 +40,8 @@ typedef struct s2pfa s2pfa;
  * decode workspace for up to S2P_MAX_SESSIONS batch rows. mode selects the
  * GEMM path for every linear (FP8 weights are prepared once here).
  * Synchronizes stream before returning (uploads read the st mmap). */
-s2p_status s2pfa_load(s2pfa** out, s2p_st* st, s2p_gemm_mode mode,
-                      cudaStream_t stream);
+s2p_status s2pfa_load(s2pfa** out, s2p_st* st, s2p_qcache* qc,
+                      s2p_gemm_mode mode, cudaStream_t stream);
 void s2pfa_free(s2pfa* f);
 
 /* codes [10*T] cb-major (HOST; codes[cb*T + t]); adds the summed 10-codebook

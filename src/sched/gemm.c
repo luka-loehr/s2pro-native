@@ -265,8 +265,9 @@ static int int4_wanted(s2p_qsite site) {
 }
 
 s2p_status s2p_linear_prepare_int8(s2p_linear* lin, cudaStream_t stream) {
-    if (!lin || !lin->w_bf16.data) return S2P_ERR_INVALID;
-    if (lin->int8_ready) return S2P_OK;
+    if (!lin) return S2P_ERR_INVALID;
+    if (lin->int8_ready) return S2P_OK; /* incl. qcache-loaded linears */
+    if (!lin->w_bf16.data) return S2P_ERR_INVALID;
     int N = lin->out_features, K = lin->in_features;
     if (K % 512 != 0) {
         /* GEMV tile requirement; no such layer exists in S2-Pro. */
@@ -305,8 +306,9 @@ s2p_status s2p_linear_prepare_int8(s2p_linear* lin, cudaStream_t stream) {
 /* Group-wise INT4 variant of prepare_int8; same lifecycle (frees the BF16
  * source unless S2P_INT8_KEEP_BF16=1). */
 static s2p_status prepare_int4_group(s2p_linear* lin, cudaStream_t stream) {
-    if (!lin || !lin->w_bf16.data) return S2P_ERR_INVALID;
-    if (lin->int8_ready) return S2P_OK;
+    if (!lin) return S2P_ERR_INVALID;
+    if (lin->int8_ready) return S2P_OK; /* incl. qcache-loaded linears */
+    if (!lin->w_bf16.data) return S2P_ERR_INVALID;
     int N = lin->out_features, K = lin->in_features;
     const int G = int4_group();
     if (K % 512 != 0 || K % G != 0) {
