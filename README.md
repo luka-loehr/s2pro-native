@@ -25,13 +25,17 @@ is compute ÷ audio; below 1.0 means synthesis outruns playback.
 
 | serving path | wall RTF | TTFA |
 | --- | ---: | ---: |
-| zero-shot | **0.76** | 0.15 s |
-| 60 s voice reference (warm voice cache) | **0.76** | 0.21 s |
-| ~147 s chunked long-form | **0.75** | 0.21 s |
+| zero-shot | **0.60** | 0.14 s |
+| 60 s voice reference (warm voice cache) | **0.61** | 0.20 s |
+| ~148 s chunked long-form | **0.62–0.63** | 0.20 s |
 
-Starting point of the same stack: wall RTF 2.05. The complete measured
-path from 2.05 to 0.75 — including the negative results — is recorded in
-the technical reports (§7).
+Configuration: all-INT4 weight stream (packed group-wise INT4 backbone +
+QAT-distilled INT4 fast-AR and lm-head, `S2P_INT4_ALL=1` on a
+QAT-patched checkpoint), accepted by critical listening on 2026-08-03.
+An unpatched checkpoint serves the INT8-fast-AR configuration at
+0.75–0.76. Starting point of the same stack: wall RTF 2.05. The complete
+measured path from 2.05 to 0.60 — including the negative results — is
+recorded in the technical reports (§7).
 
 > **Status: functional pre-release.** BF16, INT8, and the packed
 > group-wise INT4 backbone pass the layer-parity gate against the PyTorch
@@ -209,13 +213,15 @@ Engine-level decode (single stream, 67-token prompt, 60 frames):
 | BF16 cuBLAS (default) | 306.6 ms | 93.3 ms | 2.41 |
 | INT8 weight-only (`S2P_INT8=1`) | 353.4 ms | **39.7 ms** | **1.27** |
 
-Serving configuration (`S2P_INT8=1 S2P_INT4=1`): packed group-wise INT4
-backbone (4.5 bits per weight, bit-identical to the unpacked container),
-per-channel INT8 fast-AR and lm-head (measured necessity — untrained
-4-bit collapses the fast-AR's argmax cascade), GEMM-grade DAC kernels
-(2.1 ms/frame, bit-identical PCM), per-voice KV-prefix cache (~189 MB per
-voice, LRU). Result: the wall-RTF table in §1. Process memory: ~8.5 GB
-(INT8) vs ~12 GB (BF16); backbone weights 2.04 GB packed.
+Serving configuration (`S2P_INT8=1 S2P_INT4=1 S2P_INT4_ALL=1`, QAT-
+patched checkpoint): packed group-wise INT4 backbone (4.5 bits per
+weight, bit-identical to the unpacked container), QAT-distilled INT4
+fast-AR and lm-head (untrained 4-bit collapses the fast-AR's argmax
+cascade — the distillation is what makes this tier possible), GEMM-grade
+DAC kernels (2.1 ms/frame, bit-identical PCM), per-voice KV-prefix cache
+(~189 MB per voice, LRU). Result: the wall-RTF table in §1. Process
+memory: ~8.5 GB (INT8) vs ~12 GB (BF16); backbone weights 2.04 GB
+packed.
 
 Numeric fidelity is gated by the layer-parity protocol
 ([benchmarks/parity](benchmarks/parity/README.md)): BF16 and INT8 pass at
@@ -243,15 +249,14 @@ audio battery); the reports own the details, including what lost.
 | sentence chunking + join normalization | long-form prosody holds through 130+ s (was flattening at ~40 s) |
 | per-voice KV-prefix cache | voice-ref TTFA 1.58 → 0.23 s; every path below realtime |
 | GEMM-grade DAC conv kernels | DAC 15.1 → 2.1 ms/frame; wall RTF 0.75–0.76 |
+| QAT self-distillation of the fast-AR → all-INT4 | weight stream 6.17 → 4.37 GB/frame; wall RTF 0.60–0.63; accepted by listening |
 
-Open: perceptual acceptance of the QAT all-INT4 configuration. The
-training runs are complete (best held-out free-run agreement 0.6711 vs
-the 0.8935 INT8 bar), every objective audio gate passes (envelope, EOS,
-length), and the measured wall RTF is **0.60–0.63** across all serving
-paths — the predicted gain of the 6.17 → 4.37 GB/frame weight stream.
-The §1 table advances to these numbers once the artifact passes critical
-listening. Method in [docs/QUANT.md §6](docs/QUANT.md); runs, gates, and
-telemetry in [docs/QAT-RUNS.md](docs/QAT-RUNS.md).
+The precision ladder is complete: every module now serves at 4 bits
+(backbone by construction, fast-AR and lm-head by overnight
+self-distillation — runs, gates, and telemetry in
+[docs/QAT-RUNS.md](docs/QAT-RUNS.md)). Remaining engineering is
+incremental: fast-AR kernel fusion, further distillation rounds if
+listening ever demands them, and a published release line.
 
 ## 8. Documentation map
 
