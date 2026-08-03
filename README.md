@@ -37,12 +37,11 @@ An unpatched checkpoint serves the INT8-fast-AR configuration at
 measured path from 2.05 to 0.60 — including the negative results — is
 recorded in the technical reports (§7).
 
-> **Status: functional pre-release.** BF16, INT8, and the packed
-> group-wise INT4 backbone pass the layer-parity gate against the PyTorch
-> reference; voice cloning, the multilingual voice registry, and the HTTP
-> streaming server are exercised end to end on real hardware. There is no
-> published release line yet; deploy from a reviewed, pinned `main`
-> commit.
+> **Status: v0.1.0, the first tagged release.** BF16, INT8, and the
+> packed group-wise INT4 backbone pass the layer-parity gate against the
+> PyTorch reference; voice cloning, the multilingual voice registry, and
+> the HTTP streaming server are exercised end to end on real hardware.
+> Deploy from the tag or a reviewed, pinned commit.
 
 ## 2. System
 
@@ -51,7 +50,7 @@ recorded in the technical reports (§7).
 - Weight-precision ladder under a strict quality gate: per-channel INT8
   (the workhorse), packed group-wise INT4 backbone (4.5 bits per weight),
   an FP8 path kept for measurement after failing parity, and QAT
-  self-distillation toward all-INT4 in progress
+  self-distillation to all-INT4 (shipped)
   ([docs/QUANT.md](docs/QUANT.md), [docs/QAT-RUNS.md](docs/QAT-RUNS.md)).
 - Bit-exact incremental streaming vocoder — streamed PCM equals the
   whole-buffer decode bit for bit — with GEMM-grade convolution kernels

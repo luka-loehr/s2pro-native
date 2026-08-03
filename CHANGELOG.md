@@ -8,7 +8,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 for published releases.
 
-## [Unreleased]
+## [0.1.0] — 2026-08-03
+
+First tagged release. Everything below this heading is the state that
+`v0.1.0` points at: the complete native serving stack at wall RTF
+0.58–0.60 single-stream (TTFA 0.13–0.20 s), the all-INT4 weight stream
+accepted by listening, INT8 KV and embeddings, FP16 vocoder weights,
+prequantized-weight and encoded-voice caches (start ~78 s), chunked
+prefill, captured decode graphs to batch 16, cross-session batched DAC,
+and the reports in `docs/` — including every measured negative result.
+
+Deployment notes: quantized serving is
+`S2P_INT8=1 S2P_INT4=1 S2P_INT4_ALL=1` against a QAT-patched checkpoint
+(`tools/apply_qat_patch.py`); an unpatched checkpoint serves the
+INT8-fast-AR configuration at 0.75–0.76. Concurrency is capped at 4
+sessions under the per-stream RTF < 1 rule (5 measured, 4 with margin);
+`docs/SERVING.md` records where the remaining wall is.
 
 ### Removed
 
