@@ -163,6 +163,31 @@ distinct voices, warm prefixes):
 | 12 | — | 2.32 |
 | 16 | — | 2.95 |
 
+## 9. DAC CUDA-graph capture: resolved by measurement, not built
+
+The design review's largest open item (D1) was capturing the vocoder
+stage walk as a CUDA graph, on the strength of a comparable production
+system that measured 1.6–2.2× from it. That system was launch-bound:
+its streaming codec decode sat flat at ~66 ms regardless of frame count,
+the signature of overhead dominating work.
+
+Ours is not, and the profiler says so directly: a whole-buffer decode
+issues **34 weight-bearing conv/tconv launches** total, and the
+streaming path walks the same structure once per push — where a push
+carries 8 accumulated frames for every active stream. Counting the
+element-wise and history stages generously (~90 launches per push, ~300
+at B = 12 where stateful ops still loop per session) at ~2.1 µs of
+launch latency gives 0.2–0.6 ms per push against 371 ms of audio per
+stream per push: **under 0.2 % of the budget.** Graph capture would also
+force the per-frame position and history length device-side, since both
+are baked into kernel arguments today.
+
+The item is therefore closed as *not worth building in this
+configuration* — the temporal accumulation and cross-session batching
+that §6 added are exactly what removed the condition graphs would fix.
+It would return as a live question if the accumulation were dropped for
+latency (§6's F-knob discussion).
+
 ## 8. Batch GEMV with staged activations: measured out
 
 The GEMV's O(M) activation re-read (§7) has an obvious remedy: stage the
