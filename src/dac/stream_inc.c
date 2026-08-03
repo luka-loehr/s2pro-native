@@ -455,6 +455,7 @@ static s2p_status btab_ensure(s2p_dac* d, int nb) {
     S2P_CUDA_TRY(cudaMallocHost((void**)&d->btab_pin, bytes));
     S2P_CUDA_TRY(cudaMalloc((void**)&d->btab_dev, bytes));
     d->btab_cap = nb;
+    d->btab_nb = 0; /* fresh allocation: roster cache invalid */
     return S2P_OK;
 }
 
@@ -481,6 +482,15 @@ s2p_status s2pd_inc_push_batch(s2pd_inc* const* ss, int nb, int tn,
     S2P_TRY(s2pd_rope_ensure(d, (int)max_pos + tn));
 
     S2P_TRY(btab_ensure(d, nb));
+    /* upload the tables only when the session roster changed (research
+     * condition C3): contents are fixed per inc, so steady state pays
+     * zero H2D here */
+    int roster_same = (d->btab_nb == nb);
+    for (int i = 0; roster_same && i < nb; i++)
+        if (d->btab_pin[(size_t)TB_BX * nb + i] != ss[i]->bx)
+            roster_same = 0;
+    if (roster_same) goto tables_ready;
+    d->btab_nb = nb;
     for (int i = 0; i < nb; i++) {
         s2pd_inc* c = ss[i];
         d->btab_pin[(size_t)TB_BX * nb + i] = c->bx;
@@ -499,6 +509,7 @@ s2p_status s2pd_inc_push_batch(s2pd_inc* const* ss, int nb, int tn,
     S2P_CUDA_TRY(cudaMemcpyAsync(d->btab_dev, d->btab_pin,
                                  (size_t)TB_N * nb * sizeof(void*),
                                  cudaMemcpyHostToDevice, st));
+tables_ready:;
 
     /* codes upload + RVQ + transpose, per session (lookups, no weights) */
     s2pdk_rvq_tabs tabs;
@@ -537,9 +548,8 @@ s2p_status s2pd_inc_push_batch(s2pd_inc* const* ss, int nb, int tn,
     const s2pd_tf* tf = &d->post;
     for (int l = 0; l < tf->n_layers; l++) {
         const s2pd_tl* ly = &tf->l[l];
-        for (int i = 0; i < nb; i++)
-            S2P_CUDA_TRY(s2pdk_rmsnorm(ss[i]->brow, ly->attn_norm, 1e-5f, tn,
-                                       INC_C, ss[i]->at1, st));
+        S2P_CUDA_TRY(s2pdk_rmsnorm_b(TB(TB_BROW), ly->attn_norm, 1e-5f,
+                                     tn, INC_C, TBO(TB_AT1), nb, st));
         S2P_CUDA_TRY(s2pdk_matmul_b(TB(TB_AT1), tn, INC_C, ly->wqkv, 3072,
                                     NULL, TBO(TB_AQ), nb, st));
         for (int i = 0; i < nb; i++) {
@@ -572,25 +582,22 @@ s2p_status s2pd_inc_push_batch(s2pd_inc* const* ss, int nb, int tn,
         }
         S2P_CUDA_TRY(s2pdk_matmul_b(TB(TB_AT1), tn, INC_C, ly->wo, INC_C,
                                     NULL, TBO(TB_AT3), nb, st));
-        for (int i = 0; i < nb; i++) {
-            S2P_CUDA_TRY(s2pdk_scale_add_ip(ss[i]->brow, ss[i]->at3,
-                                            ly->g_attn, tn, INC_C, st));
-            S2P_CUDA_TRY(s2pdk_rmsnorm(ss[i]->brow, ly->ffn_norm, 1e-5f, tn,
-                                       INC_C, ss[i]->at1, st));
-        }
+        S2P_CUDA_TRY(s2pdk_scale_add_ip_b(TBO(TB_BROW), TB(TB_AT3),
+                                          ly->g_attn, tn, INC_C, nb, st));
+        S2P_CUDA_TRY(s2pdk_rmsnorm_b(TB(TB_BROW), ly->ffn_norm, 1e-5f, tn,
+                                     INC_C, TBO(TB_AT1), nb, st));
         S2P_CUDA_TRY(s2pdk_matmul_b(TB(TB_AT1), tn, INC_C, ly->w1, 3072,
                                     NULL, TBO(TB_AF1), nb, st));
         S2P_CUDA_TRY(s2pdk_matmul_b(TB(TB_AT1), tn, INC_C, ly->w3, 3072,
                                     NULL, TBO(TB_AF2), nb, st));
-        for (int i = 0; i < nb; i++)
-            S2P_CUDA_TRY(s2pdk_silu_mul_ip(ss[i]->af1, ss[i]->af2,
-                                           (int64_t)tn * 3072, st));
+        S2P_CUDA_TRY(s2pdk_silu_mul_ip_b(TBO(TB_AF1), TB(TB_AF2),
+                                         (int64_t)tn * 3072, nb, st));
         S2P_CUDA_TRY(s2pdk_matmul_b(TB(TB_AF1), tn, 3072, ly->w2, INC_C,
                                     NULL, TBO(TB_AT1), nb, st));
+        S2P_CUDA_TRY(s2pdk_scale_add_ip_b(TBO(TB_BROW), TB(TB_AT1),
+                                          ly->g_ffn, tn, INC_C, nb, st));
         for (int i = 0; i < nb; i++) {
             s2pd_inc* c = ss[i];
-            S2P_CUDA_TRY(s2pdk_scale_add_ip(c->brow, c->at1, ly->g_ffn, tn,
-                                            INC_C, st));
             const int hl = c->kv_len;
             int keep = hl + tn < INC_KVHIST ? hl + tn : INC_KVHIST;
             int from = hl + tn - keep;
@@ -604,11 +611,10 @@ s2p_status s2pd_inc_push_batch(s2pd_inc* const* ss, int nb, int tn,
                 cudaMemcpyDeviceToDevice, st));
         }
     }
-    for (int i = 0; i < nb; i++) {
-        S2P_CUDA_TRY(s2pdk_rmsnorm(ss[i]->brow, tf->norm, 1e-5f, tn, INC_C,
-                                   ss[i]->brow, st));
-        S2P_CUDA_TRY(s2pdk_transpose(ss[i]->brow, tn, INC_C, ss[i]->bx, st));
-    }
+    S2P_CUDA_TRY(s2pdk_rmsnorm_b(TB(TB_BROW), tf->norm, 1e-5f, tn, INC_C,
+                                 TBO(TB_BROW), nb, st));
+    S2P_CUDA_TRY(s2pdk_transpose_b(TB(TB_BROW), tn, INC_C, TBO(TB_BX), nb,
+                                   st));
 
     /* upsample x2 (tconv k2 s2 column-local) + ConvNeXt */
     S2P_CUDA_TRY(s2pdk_tconv1d_b(TB(TB_BX), INC_C, tn, d->up_t[0].w,
@@ -625,28 +631,24 @@ s2p_status s2pd_inc_push_batch(s2pd_inc* const* ss, int nb, int tn,
                                       ss[0]->cnx_h[0].len + T, c0->dw.w,
                                       c0->dw.b, 7, 0, TBO(TB_BT1), T, nb,
                                       st));
-        for (int i = 0; i < nb; i++) {
+        for (int i = 0; i < nb; i++)
             S2P_TRY(hist_update(&ss[i]->cnx_h[0], ss[i]->bext, T, st));
-            S2P_CUDA_TRY(s2pdk_transpose(ss[i]->bt1, INC_C, T, ss[i]->bt2,
-                                         st));
-            S2P_CUDA_TRY(s2pdk_layernorm_ip(ss[i]->bt2, c0->ln_w, c0->ln_b,
-                                            1e-6f, T, INC_C, st));
-        }
+        S2P_CUDA_TRY(s2pdk_transpose_b(TB(TB_BT1), INC_C, T, TBO(TB_BT2),
+                                       nb, st));
+        S2P_CUDA_TRY(s2pdk_layernorm_ip_b(TBO(TB_BT2), c0->ln_w, c0->ln_b,
+                                          1e-6f, T, INC_C, nb, st));
         S2P_CUDA_TRY(s2pdk_matmul_b(TB(TB_BT2), T, INC_C, c0->pw1_w, 4096,
                                     c0->pw1_b, TBO(TB_B32K), nb, st));
-        for (int i = 0; i < nb; i++)
-            S2P_CUDA_TRY(s2pdk_gelu_ip(ss[i]->bext + 32768,
-                                       (int64_t)T * 4096, st));
+        S2P_CUDA_TRY(s2pdk_gelu_ip_b(TBO(TB_B32K), (int64_t)T * 4096, nb,
+                                     st));
         S2P_CUDA_TRY(s2pdk_matmul_b(TB(TB_B32K), T, 4096, c0->pw2_w, INC_C,
                                     c0->pw2_b, TBO(TB_BT1), nb, st));
-        for (int i = 0; i < nb; i++) {
-            S2P_CUDA_TRY(s2pdk_colscale_ip(ss[i]->bt1, c0->gamma, T, INC_C,
-                                           st));
-            S2P_CUDA_TRY(s2pdk_transpose(ss[i]->bt1, T, INC_C, ss[i]->bt2,
-                                         st));
-            S2P_CUDA_TRY(s2pdk_add_ip(ss[i]->by, ss[i]->bt2,
-                                      (int64_t)INC_C * T, st));
-        }
+        S2P_CUDA_TRY(s2pdk_colscale_ip_b(TBO(TB_BT1), c0->gamma, T, INC_C,
+                                         nb, st));
+        S2P_CUDA_TRY(s2pdk_transpose_b(TB(TB_BT1), T, INC_C, TBO(TB_BT2),
+                                       nb, st));
+        S2P_CUDA_TRY(s2pdk_add_ip_b(TBO(TB_BY), TB(TB_BT2),
+                                    (int64_t)INC_C * T, nb, st));
     }
     S2P_CUDA_TRY(s2pdk_tconv1d_b(TB(TB_BY), INC_C, 2 * tn, d->up_t[1].w,
                                  d->up_t[1].b, INC_C, 2, 2, TBO(TB_BX),
@@ -661,28 +663,24 @@ s2p_status s2pd_inc_push_batch(s2pd_inc* const* ss, int nb, int tn,
                                       ss[0]->cnx_h[1].len + T, c1->dw.w,
                                       c1->dw.b, 7, 0, TBO(TB_BT1), T, nb,
                                       st));
-        for (int i = 0; i < nb; i++) {
+        for (int i = 0; i < nb; i++)
             S2P_TRY(hist_update(&ss[i]->cnx_h[1], ss[i]->bext, T, st));
-            S2P_CUDA_TRY(s2pdk_transpose(ss[i]->bt1, INC_C, T, ss[i]->bt2,
-                                         st));
-            S2P_CUDA_TRY(s2pdk_layernorm_ip(ss[i]->bt2, c1->ln_w, c1->ln_b,
-                                            1e-6f, T, INC_C, st));
-        }
+        S2P_CUDA_TRY(s2pdk_transpose_b(TB(TB_BT1), INC_C, T, TBO(TB_BT2),
+                                       nb, st));
+        S2P_CUDA_TRY(s2pdk_layernorm_ip_b(TBO(TB_BT2), c1->ln_w, c1->ln_b,
+                                          1e-6f, T, INC_C, nb, st));
         S2P_CUDA_TRY(s2pdk_matmul_b(TB(TB_BT2), T, INC_C, c1->pw1_w, 4096,
                                     c1->pw1_b, TBO(TB_B32K), nb, st));
-        for (int i = 0; i < nb; i++)
-            S2P_CUDA_TRY(s2pdk_gelu_ip(ss[i]->bext + 32768,
-                                       (int64_t)T * 4096, st));
+        S2P_CUDA_TRY(s2pdk_gelu_ip_b(TBO(TB_B32K), (int64_t)T * 4096, nb,
+                                     st));
         S2P_CUDA_TRY(s2pdk_matmul_b(TB(TB_B32K), T, 4096, c1->pw2_w, INC_C,
                                     c1->pw2_b, TBO(TB_BT1), nb, st));
-        for (int i = 0; i < nb; i++) {
-            S2P_CUDA_TRY(s2pdk_colscale_ip(ss[i]->bt1, c1->gamma, T, INC_C,
-                                           st));
-            S2P_CUDA_TRY(s2pdk_transpose(ss[i]->bt1, T, INC_C, ss[i]->bt2,
-                                         st));
-            S2P_CUDA_TRY(s2pdk_add_ip(ss[i]->bx, ss[i]->bt2,
-                                      (int64_t)INC_C * T, st));
-        }
+        S2P_CUDA_TRY(s2pdk_colscale_ip_b(TBO(TB_BT1), c1->gamma, T, INC_C,
+                                         nb, st));
+        S2P_CUDA_TRY(s2pdk_transpose_b(TB(TB_BT1), T, INC_C, TBO(TB_BT2),
+                                       nb, st));
+        S2P_CUDA_TRY(s2pdk_add_ip_b(TBO(TB_BX), TB(TB_BT2),
+                                    (int64_t)INC_C * T, nb, st));
     }
 
     /* decoder conv0 over [hist | new] */
@@ -699,10 +697,14 @@ s2p_status s2pd_inc_push_batch(s2pd_inc* const* ss, int nb, int tn,
     int Lc = 4 * tn;
     int par = 0; /* 0: y = TB_BY holds input, x = TB_BX is scratch */
     for (int blk = 0; blk < 4; blk++) {
+        {
+            int t_y = par ? TB_BX : TB_BY;
+            S2P_CUDA_TRY(s2pdk_snake_b(TB(t_y), TBO(t_y),
+                                       d->dec_b[blk].alpha, IDEC_CIN[blk],
+                                       Lc, nb, st));
+        }
         for (int i = 0; i < nb; i++) {
             float* yin = par ? ss[i]->bx : ss[i]->by;
-            S2P_CUDA_TRY(s2pdk_snake(yin, yin, d->dec_b[blk].alpha,
-                                     IDEC_CIN[blk], Lc, st));
             S2P_TRY(ext_build(&ss[i]->up_h[blk], yin, Lc, ss[i]->bext, st));
         }
         int Lo = Lc * IDEC_S[blk];
@@ -723,32 +725,33 @@ s2p_status s2pd_inc_push_batch(s2pd_inc* const* ss, int nb, int tn,
         Lc = Lo;
         for (int r = 0; r < 3; r++) {
             const s2pd_ru* ru = &d->dec_b[blk].ru[r];
-            for (int i = 0; i < nb; i++) {
-                float* xb = par ? ss[i]->by : ss[i]->bx;
-                S2P_CUDA_TRY(s2pdk_snake(xb, ss[i]->bt1, ru->alpha0,
-                                         IDEC_COUT[blk], Lc, st));
+            {
+                int t_x = par ? TB_BY : TB_BX;
+                S2P_CUDA_TRY(s2pdk_snake_b(TB(t_x), TBO(TB_BT1), ru->alpha0,
+                                           IDEC_COUT[blk], Lc, nb, st));
+            }
+            for (int i = 0; i < nb; i++)
                 S2P_TRY(ext_build(&ss[i]->ru_h[blk][r], ss[i]->bt1, Lc,
                                   ss[i]->bext, st));
-            }
             S2P_CUDA_TRY(s2pdk_conv1d_b(
                 TB(TB_BEXT), IDEC_COUT[blk],
                 ss[0]->ru_h[blk][r].len + Lc, ru->c7.w, ru->c7.b,
                 IDEC_COUT[blk], 7, IRU_DIL[r], 1, 0, TBO(TB_BT2), Lc, nb,
                 st));
-            for (int i = 0; i < nb; i++) {
+            for (int i = 0; i < nb; i++)
                 S2P_TRY(hist_update(&ss[i]->ru_h[blk][r], ss[i]->bext, Lc,
                                     st));
-                S2P_CUDA_TRY(s2pdk_snake(ss[i]->bt2, ss[i]->bt2, ru->alpha1,
-                                         IDEC_COUT[blk], Lc, st));
-            }
+            S2P_CUDA_TRY(s2pdk_snake_b(TB(TB_BT2), TBO(TB_BT2), ru->alpha1,
+                                       IDEC_COUT[blk], Lc, nb, st));
             S2P_CUDA_TRY(s2pdk_conv1d_b(TB(TB_BT2), IDEC_COUT[blk], Lc,
                                         ru->c1.w, ru->c1.b, IDEC_COUT[blk],
                                         1, 1, 1, 0, TBO(TB_BT1), Lc, nb,
                                         st));
-            for (int i = 0; i < nb; i++) {
-                float* xb = par ? ss[i]->by : ss[i]->bx;
-                S2P_CUDA_TRY(s2pdk_add_ip(xb, ss[i]->bt1,
-                                          (int64_t)IDEC_COUT[blk] * Lc, st));
+            {
+                int t_x = par ? TB_BY : TB_BX;
+                S2P_CUDA_TRY(s2pdk_add_ip_b(TBO(t_x), TB(TB_BT1),
+                                            (int64_t)IDEC_COUT[blk] * Lc,
+                                            nb, st));
             }
         }
         par ^= 1;
@@ -756,18 +759,17 @@ s2p_status s2pd_inc_push_batch(s2pd_inc* const* ss, int nb, int tn,
     /* buffer roles traced against push_async's x/y swaps: block 3 wrote
      * its output into the by role, so `by` holds [96, 2048*tn] here —
      * exactly push_async's final `y`. */
-    for (int i = 0; i < nb; i++) {
-        float* yfin = ss[i]->by;
-        S2P_CUDA_TRY(s2pdk_snake(yfin, yfin, d->dec_alpha, 96, Lc, st));
-        S2P_TRY(ext_build(&ss[i]->cf_h, yfin, Lc, ss[i]->bext, st));
-    }
+    S2P_CUDA_TRY(s2pdk_snake_b(TB(TB_BY), TBO(TB_BY), d->dec_alpha, 96, Lc,
+                               nb, st));
+    for (int i = 0; i < nb; i++)
+        S2P_TRY(ext_build(&ss[i]->cf_h, ss[i]->by, Lc, ss[i]->bext, st));
     S2P_CUDA_TRY(s2pdk_conv1d_b(TB(TB_BEXT), 96, ss[0]->cf_h.len + Lc,
                                 d->dec_convf.w, d->dec_convf.b, 1, 7, 1, 1,
                                 0, TBO(TB_BT1), Lc, nb, st));
+    S2P_CUDA_TRY(s2pdk_tanh_ip_b(TBO(TB_BT1), Lc, nb, st));
     for (int i = 0; i < nb; i++) {
         s2pd_inc* c = ss[i];
         S2P_TRY(hist_update(&c->cf_h, c->bext, Lc, st));
-        S2P_CUDA_TRY(s2pdk_tanh_ip(c->bt1, Lc, st));
         S2P_CUDA_TRY(cudaMemcpyAsync(c->pcm_pin, c->bt1,
                                      (size_t)tn * S2P_FRAME_SAMPLES *
                                          sizeof(float),
