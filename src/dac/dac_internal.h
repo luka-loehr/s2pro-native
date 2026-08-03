@@ -140,6 +140,10 @@ struct s2p_dac {
     size_t   ws_buf_floats;      /* floats per buffer (ws_bytes / 4 bufs / 4B) */
     int32_t* codes_dev;
     int      codes_cap;          /* frames */
+    /* cross-session batched push: pinned+device pointer-table block */
+    void**   btab_pin;
+    void**   btab_dev;
+    int      btab_cap;           /* sessions the tables are sized for */
 };
 
 /* Decoder-only entry: latent [1024, Tlat] host f32 (post-upsample, i.e. the
@@ -167,6 +171,13 @@ s2p_status s2pd_inc_push(s2pd_inc* s,
 /* Pipelined pair: push_async enqueues tn frames (frame-major [tn][10]; no
  * sync; one push in flight, tn <= 4), collect syncs and copies the samples
  * out (n_out 0 if none pending; pcm_host must hold tn*2048 floats). */
+/* Cross-session batched push: one frame (tn == 1) for nb sessions in one
+ * stage-walk; weight-bearing kernels run batched (per-session pointer
+ * tables, weights read once), stateful and element-wise ops loop per
+ * session. Output is bit-identical per stream to sequential pushes. */
+s2p_status s2pd_inc_push_batch(s2pd_inc* const* ss, int nb,
+                               const int32_t* frame_codes /* [nb][10] */,
+                               cudaStream_t st);
 s2p_status s2pd_inc_push_async(s2pd_inc* s, const int32_t* frame_codes,
                                int tn, cudaStream_t stream);
 s2p_status s2pd_inc_collect(s2pd_inc* s, float* pcm_host, int64_t* n_out,
