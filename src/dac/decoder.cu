@@ -973,6 +973,198 @@ extern "C" cudaError_t s2pdk_matmul_b(const float* const* a_b, int m, int k,
     return cudaPeekAtLastError();
 }
 
+
+/* ---- batched element-wise / norm variants (research condition C2):
+ * per-session kernels on one stream serialize 16 underfilled launches per
+ * stage; these run all sessions in one grid (session fastest-varying).
+ * No weights involved — identical arithmetic per element. */
+
+__global__ void k_snake_b(const float* const* __restrict__ in_b,
+                          float* const* __restrict__ out_b,
+                          const float* __restrict__ alpha, int c, int t,
+                          int nb) {
+    const int sess = blockIdx.x % nb;
+    int64_t i = (int64_t)(blockIdx.x / nb) * blockDim.x + threadIdx.x;
+    int64_t n = (int64_t)c * t;
+    if (i >= n) return;
+    const float* in = in_b[sess];
+    float* out = out_b[sess];
+    int ch = (int)(i / t);
+    float a = alpha[ch];
+    float x = in[i];
+    float sn = sinf(a * x);
+    out[i] = x + (1.0f / (a + 1e-9f)) * sn * sn;
+}
+extern "C" cudaError_t s2pdk_snake_b(const float* const* in_b,
+                                     float* const* out_b, const float* alpha,
+                                     int c, int t, int nb, cudaStream_t st) {
+    int64_t n = (int64_t)c * t;
+    k_snake_b<<<(unsigned)(nb * ((n + 255) / 256)), 256, 0, st>>>(
+        in_b, out_b, alpha, c, t, nb);
+    return cudaPeekAtLastError();
+}
+
+__global__ void k_ew_b(float* const* __restrict__ x_b,
+                       const float* const* __restrict__ y_b,
+                       const float* __restrict__ g, int64_t n, int c,
+                       int op, int nb) {
+    const int sess = blockIdx.x % nb;
+    int64_t i = (int64_t)(blockIdx.x / nb) * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float* x = x_b[sess];
+    switch (op) {
+    case 0: x[i] += y_b[sess][i]; break;                      /* add_ip */
+    case 1: {                                                  /* silu_mul */
+        float v = x[i];
+        x[i] = v / (1.0f + expf(-v)) * y_b[sess][i];
+        break;
+    }
+    case 2: {                                                  /* gelu */
+        float v = x[i];
+        x[i] = 0.5f * v * (1.0f + erff(v * 0.70710678118654752440f));
+        break;
+    }
+    case 3: x[i] *= g[i % c]; break;                           /* colscale */
+    case 4: x[i] += g[i % c] * y_b[sess][i]; break;            /* scale_add */
+    case 5: x[i] = tanhf(x[i]); break;                         /* tanh */
+    }
+}
+static cudaError_t ew_b(float* const* x_b, const float* const* y_b,
+                        const float* g, int64_t n, int c, int op, int nb,
+                        cudaStream_t st) {
+    k_ew_b<<<(unsigned)(nb * ((n + 255) / 256)), 256, 0, st>>>(x_b, y_b, g,
+                                                              n, c, op, nb);
+    return cudaPeekAtLastError();
+}
+extern "C" cudaError_t s2pdk_add_ip_b(float* const* x_b,
+                                      const float* const* y_b, int64_t n,
+                                      int nb, cudaStream_t st) {
+    return ew_b(x_b, y_b, NULL, n, 1, 0, nb, st);
+}
+extern "C" cudaError_t s2pdk_silu_mul_ip_b(float* const* x_b,
+                                           const float* const* y_b,
+                                           int64_t n, int nb,
+                                           cudaStream_t st) {
+    return ew_b(x_b, y_b, NULL, n, 1, 1, nb, st);
+}
+extern "C" cudaError_t s2pdk_gelu_ip_b(float* const* x_b, int64_t n, int nb,
+                                       cudaStream_t st) {
+    return ew_b(x_b, NULL, NULL, n, 1, 2, nb, st);
+}
+extern "C" cudaError_t s2pdk_colscale_ip_b(float* const* x_b, const float* g,
+                                           int t, int c, int nb,
+                                           cudaStream_t st) {
+    return ew_b(x_b, NULL, g, (int64_t)t * c, c, 3, nb, st);
+}
+extern "C" cudaError_t s2pdk_scale_add_ip_b(float* const* x_b,
+                                            const float* const* y_b,
+                                            const float* g, int t, int c,
+                                            int nb, cudaStream_t st) {
+    return ew_b(x_b, y_b, g, (int64_t)t * c, c, 4, nb, st);
+}
+extern "C" cudaError_t s2pdk_tanh_ip_b(float* const* x_b, int64_t n, int nb,
+                                       cudaStream_t st) {
+    return ew_b(x_b, NULL, NULL, n, 1, 5, nb, st);
+}
+
+__global__ void k_transpose_b(const float* const* __restrict__ in_b,
+                              int rows, int cols,
+                              float* const* __restrict__ out_b, int nb) {
+    __shared__ float tile[32][33];
+    const int sess = blockIdx.x % nb;
+    const int cb = blockIdx.x / nb;
+    const float* in = in_b[sess];
+    float* out = out_b[sess];
+    int r0 = blockIdx.y * 32, c0 = cb * 32;
+    int r = r0 + threadIdx.y, c = c0 + threadIdx.x;
+    if (r < rows && c < cols)
+        tile[threadIdx.y][threadIdx.x] = in[(size_t)r * cols + c];
+    __syncthreads();
+    int rr = c0 + threadIdx.y, cc = r0 + threadIdx.x;
+    if (rr < cols && cc < rows)
+        out[(size_t)rr * rows + cc] = tile[threadIdx.x][threadIdx.y];
+}
+extern "C" cudaError_t s2pdk_transpose_b(const float* const* in_b, int rows,
+                                         int cols, float* const* out_b,
+                                         int nb, cudaStream_t st) {
+    dim3 grid((unsigned)(nb * ((cols + 31) / 32)), (rows + 31) / 32);
+    dim3 blk(32, 32);
+    k_transpose_b<<<grid, blk, 0, st>>>(in_b, rows, cols, out_b, nb);
+    return cudaPeekAtLastError();
+}
+
+__global__ void k_rmsnorm_b(const float* const* __restrict__ in_b,
+                            const float* __restrict__ w, float eps, int c,
+                            float* const* __restrict__ out_b, int nb) {
+    const int sess = blockIdx.x % nb;
+    const int row = blockIdx.x / nb;
+    const float* xr = in_b[sess] + (size_t)row * c;
+    float* yr = out_b[sess] + (size_t)row * c;
+    __shared__ float red[256];
+    float s = 0.f;
+    for (int i = threadIdx.x; i < c; i += blockDim.x) {
+        float v = xr[i];
+        s += v * v;
+    }
+    red[threadIdx.x] = s;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if (threadIdx.x < o) red[threadIdx.x] += red[threadIdx.x + o];
+        __syncthreads();
+    }
+    float inv = rsqrtf(red[0] / (float)c + eps);
+    for (int i = threadIdx.x; i < c; i += blockDim.x)
+        yr[i] = xr[i] * inv * w[i];
+}
+extern "C" cudaError_t s2pdk_rmsnorm_b(const float* const* in_b,
+                                       const float* w, float eps, int t,
+                                       int c, float* const* out_b, int nb,
+                                       cudaStream_t st) {
+    k_rmsnorm_b<<<(unsigned)(nb * t), 256, 0, st>>>(in_b, w, eps, c, out_b,
+                                                    nb);
+    return cudaPeekAtLastError();
+}
+
+__global__ void k_layernorm_ip_b(float* const* __restrict__ x_b,
+                                 const float* __restrict__ w,
+                                 const float* __restrict__ b, float eps,
+                                 int c, int nb) {
+    const int sess = blockIdx.x % nb;
+    const int row = blockIdx.x / nb;
+    float* xr = x_b[sess] + (size_t)row * c;
+    __shared__ float red[256];
+    __shared__ float red2[256];
+    float s = 0.f, s2 = 0.f;
+    for (int i = threadIdx.x; i < c; i += blockDim.x) {
+        float v = xr[i];
+        s += v;
+        s2 += v * v;
+    }
+    red[threadIdx.x] = s;
+    red2[threadIdx.x] = s2;
+    __syncthreads();
+    for (int o = blockDim.x / 2; o > 0; o >>= 1) {
+        if (threadIdx.x < o) {
+            red[threadIdx.x] += red[threadIdx.x + o];
+            red2[threadIdx.x] += red2[threadIdx.x + o];
+        }
+        __syncthreads();
+    }
+    float mean = red[0] / (float)c;
+    float var = red2[0] / (float)c - mean * mean;
+    float inv = rsqrtf(var + eps);
+    for (int i = threadIdx.x; i < c; i += blockDim.x)
+        xr[i] = (xr[i] - mean) * inv * w[i] + b[i];
+}
+extern "C" cudaError_t s2pdk_layernorm_ip_b(float* const* x_b,
+                                            const float* w, const float* b,
+                                            float eps, int t, int c, int nb,
+                                            cudaStream_t st) {
+    k_layernorm_ip_b<<<(unsigned)(nb * t), 256, 0, st>>>(x_b, w, b, eps, c,
+                                                         nb);
+    return cudaPeekAtLastError();
+}
+
 /* ------------------------------ RoPE ------------------------------------- */
 
 /* Interleaved (gpt-fast) RoPE, adjacent pairs (2i,2i+1), NOT rotate-half.

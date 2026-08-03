@@ -144,6 +144,7 @@ struct s2p_dac {
     void**   btab_pin;
     void**   btab_dev;
     int      btab_cap;           /* sessions the tables are sized for */
+    int      btab_nb;            /* roster the uploaded tables describe */
 };
 
 /* Decoder-only entry: latent [1024, Tlat] host f32 (post-upsample, i.e. the
@@ -220,6 +221,32 @@ cudaError_t s2pdk_tconv1d_b(const float* const* in_b, int cin, int tin,
 cudaError_t s2pdk_matmul_b(const float* const* a_b, int m, int k,
                            const void* w, int n, const float* bias,
                            float* const* out_b, int nb, cudaStream_t st);
+
+/* batched element-wise / norm variants (research condition C2) */
+cudaError_t s2pdk_snake_b(const float* const* in_b, float* const* out_b,
+                          const float* alpha, int c, int t, int nb,
+                          cudaStream_t st);
+cudaError_t s2pdk_add_ip_b(float* const* x_b, const float* const* y_b,
+                           int64_t n, int nb, cudaStream_t st);
+cudaError_t s2pdk_silu_mul_ip_b(float* const* x_b, const float* const* y_b,
+                                int64_t n, int nb, cudaStream_t st);
+cudaError_t s2pdk_gelu_ip_b(float* const* x_b, int64_t n, int nb,
+                            cudaStream_t st);
+cudaError_t s2pdk_colscale_ip_b(float* const* x_b, const float* g, int t,
+                                int c, int nb, cudaStream_t st);
+cudaError_t s2pdk_scale_add_ip_b(float* const* x_b, const float* const* y_b,
+                                 const float* g, int t, int c, int nb,
+                                 cudaStream_t st);
+cudaError_t s2pdk_tanh_ip_b(float* const* x_b, int64_t n, int nb,
+                            cudaStream_t st);
+cudaError_t s2pdk_transpose_b(const float* const* in_b, int rows, int cols,
+                              float* const* out_b, int nb, cudaStream_t st);
+cudaError_t s2pdk_rmsnorm_b(const float* const* in_b, const float* w,
+                            float eps, int t, int c, float* const* out_b,
+                            int nb, cudaStream_t st);
+cudaError_t s2pdk_layernorm_ip_b(float* const* x_b, const float* w,
+                                 const float* b, float eps, int t, int c,
+                                 int nb, cudaStream_t st);
 void        s2pdk_weights_f16(int on);
 cudaError_t s2pdk_conv1d_w32(const float* in, int cin, int tin,
                              const void* w, const float* b, int cout, int k,
