@@ -189,9 +189,12 @@ s2p_status s2p_model_load(const char* model_dir, const s2p_model_opts* opts,
             m->kv8 = (e[0] == '1' && e[1] == '\0');
         else
             m->kv8 = (m->mode == S2P_GEMM_INT8);
+        const char* e4 = getenv("S2P_KV4");
+        m->kv_bits = (m->kv8 && e4 && e4[0] == '1' && e4[1] == '\0') ? 4 : 8;
         if (m->kv8)
-            fprintf(stderr, "[s2pro] S2P_KV8: INT8 KV cache "
-                            "(g32 per head vector, f16 scales)\n");
+            fprintf(stderr, "[s2pro] S2P_KV8: INT%d KV cache "
+                            "(g32 per head vector, f16 scales)\n",
+                    m->kv_bits);
     }
 
     s2p_status rc = S2P_OK;

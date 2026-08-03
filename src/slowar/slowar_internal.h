@@ -97,6 +97,7 @@ typedef struct {
 struct s2p_model {
     s2p_gemm_mode mode;
     int kv8; /* INT8 KV cache (S2P_KV8; default on in INT8 weight mode) */
+    int kv_bits; /* 8 or 4 (S2P_KV4=1): payload width of the KV cache */
     int embed_i8_only; /* bf16 embed table dropped; sidecar serves lookups
                         * and the chunked M>8 head (S2P_EMBED_BF16=1 keeps) */
     int ctx_len;
@@ -200,12 +201,17 @@ static inline __nv_bfloat16* s2p_kv_v(const s2p_session* s, int layer) {
  * (head_dim/32 = 4 scales per position). Scale pointers stay void* on the
  * C side. */
 static inline int8_t* s2p_kv8_k(const s2p_session* s, int layer) {
+    const int el = s->m->kv_bits == 4 ? S2P_HEAD_DIM / 2 : S2P_HEAD_DIM;
     return (int8_t*)s->kv.data +
-           (size_t)layer * 2 * S2P_SLOW_KV_HEADS * s->m->ctx_len * S2P_HEAD_DIM;
+           (size_t)layer * 2 * S2P_SLOW_KV_HEADS * s->m->ctx_len * el;
 }
 static inline int8_t* s2p_kv8_v(const s2p_session* s, int layer) {
+    const int el = s->m->kv_bits == 4 ? S2P_HEAD_DIM / 2 : S2P_HEAD_DIM;
     return s2p_kv8_k(s, layer) +
-           (size_t)S2P_SLOW_KV_HEADS * s->m->ctx_len * S2P_HEAD_DIM;
+           (size_t)S2P_SLOW_KV_HEADS * s->m->ctx_len * el;
+}
+static inline int s2p_kv_elems(const s2p_model* m) {
+    return m->kv_bits == 4 ? S2P_HEAD_DIM / 2 : S2P_HEAD_DIM;
 }
 static inline void* s2p_kv8_ks(const s2p_session* s, int layer) {
     return (char*)s->kvs.data +

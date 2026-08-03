@@ -84,7 +84,7 @@ cudaError_t s2pk_attention_decode(const __nv_bfloat16* q,
 cudaError_t s2pk_kv_append8(const __nv_bfloat16* k, const __nv_bfloat16* v,
                             int8_t* k_cache, int8_t* v_cache, void* k_scale,
                             void* v_scale, int rows, int kv_heads,
-                            int head_dim, int pos, int max_seq,
+                            int head_dim, int pos, int max_seq, int bw,
                             cudaStream_t st);
 
 /* Per-row caches + positions (lockstep decode). */
@@ -94,7 +94,7 @@ cudaError_t s2pk_kv_append8_ptrs(const __nv_bfloat16* k,
                                  int8_t* const* v_caches,
                                  void* const* k_scales, void* const* v_scales,
                                  int rows, int kv_heads, int head_dim,
-                                 const int32_t* pos, int max_seq,
+                                 const int32_t* pos, int max_seq, int bw,
                                  cudaStream_t st);
 
 /* Single-pass causal GQA attention over the INT8 cache (prefill and the
@@ -104,7 +104,7 @@ cudaError_t s2pk_attention8(const __nv_bfloat16* q, const int8_t* k_cache,
                             const int8_t* v_cache, const void* k_scale,
                             const void* v_scale, __nv_bfloat16* out, int rows,
                             int q_heads, int kv_heads, int head_dim, int pos,
-                            int max_seq, cudaStream_t st);
+                            int max_seq, int bw, cudaStream_t st);
 
 /* Split-K flash-decode over the INT8 cache (batched decode path); K/V tiles
  * staged in shared memory as int8 + f16 scales, combine kernel shared with
@@ -117,7 +117,8 @@ cudaError_t s2pk_attention8_decode(const __nv_bfloat16* q,
                                    __nv_bfloat16* out, int rows, int q_heads,
                                    int kv_heads, int head_dim,
                                    const int32_t* pos, int max_seq,
-                                   int max_len, float* part, cudaStream_t st);
+                                   int max_len, float* part, int bw,
+                                   cudaStream_t st);
 
 /* INT8-sidecar embedding lookup: the per-row-quantized tied-head sidecar
  * serves input-embedding lookups when the bf16 table is dropped
