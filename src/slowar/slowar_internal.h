@@ -97,6 +97,8 @@ typedef struct {
 struct s2p_model {
     s2p_gemm_mode mode;
     int kv8; /* INT8 KV cache (S2P_KV8; default on in INT8 weight mode) */
+    int embed_i8_only; /* bf16 embed table dropped; sidecar serves lookups
+                        * and the chunked M>8 head (S2P_EMBED_BF16=1 keeps) */
     int ctx_len;
     int max_sessions;
     int n_sessions;

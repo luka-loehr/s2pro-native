@@ -119,6 +119,13 @@ cudaError_t s2pk_attention8_decode(const __nv_bfloat16* q,
                                    const int32_t* pos, int max_seq,
                                    int max_len, float* part, cudaStream_t st);
 
+/* INT8-sidecar embedding lookup: the per-row-quantized tied-head sidecar
+ * serves input-embedding lookups when the bf16 table is dropped
+ * (m->embed_i8_only). */
+cudaError_t s2pk_embed_i8(const int8_t* table, const float* scales,
+                          const int64_t* ids, __nv_bfloat16* out, int rows,
+                          int dim, cudaStream_t st);
+
 /* ---- device-side semantic sampler (kernels.cu, exact port of sampling.c) */
 
 /* Per-session sampler state, DEVICE-resident. Field semantics identical to

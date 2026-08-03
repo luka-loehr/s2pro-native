@@ -233,6 +233,21 @@ s2p_status s2p_model_load(const char* model_dir, const s2p_model_opts* opts,
                                 (float*)m->embed_scale.data, m->embed.data,
                                 S2P_TEXT_VOCAB, S2P_DIM, m->stream);
         if (rc != S2P_OK) goto fail;
+        {
+            /* drop the 0.8 GB bf16 table: the sidecar serves embedding
+             * lookups (s2pk_embed_i8) and the chunked M>8 head. */
+            const char* keep = getenv("S2P_EMBED_BF16");
+            if (!(keep && keep[0] == '1' && keep[1] == '\0')) {
+                if (cudaStreamSynchronize(m->stream) != cudaSuccess) {
+                    rc = S2P_ERR_CUDA;
+                    goto fail;
+                }
+                s2p_tensor_free(&m->embed);
+                m->embed_i8_only = 1;
+                fprintf(stderr, "[s2pro] embed: bf16 table dropped, "
+                                "int8 sidecar serves lookups\n");
+            }
+        }
     }
     for (int l = 0; l < S2P_SLOW_LAYERS; l++) {
         s2p_slow_layer* ly = &m->layers[l];
