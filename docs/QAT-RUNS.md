@@ -183,15 +183,21 @@ was deployed automatically via checkpoint patch and served with
 | long-form, deeper-male voice | 144.1 s | 89.8 s | **0.62** |
 | long-form, neutral-female voice | 148.0 s | 92.6 s | **0.63** |
 | short multilingual, 3 voices | 48.1–48.8 s | 29.2–30.0 s | **0.60–0.62** |
+| zero-shot, ~22 s | 21.6 s | 13.0 s | **0.60** (TTFA 0.14 s) |
+| voice reference (warm cache), ~22 s | 22.0 s | 13.4 s | **0.61** (TTFA 0.20 s) |
 
 The INT8-fast-AR configuration measured 0.75–0.76 on the same paths;
 the all-INT4 stream delivers the predicted further ~20 % (weight bytes
 6.17 → 4.37 GB/frame).
 
-**Listening verdict: pending.** The proxy metric sits at 75 % of the
-INT8 bar while every objective audio gate passes; the acceptance
-decision on the deployed artifact — and on whether a further training
-round is warranted — is made by ear.
+**Listening verdict: ACCEPTED (2026-08-03).** I listened to the five
+final takes (two 144/148 s long-form, three 48 s short multilingual)
+and accepted the artifact without reservation. The acceptance
+calibrates the proxy metric: at 0.6711 free-run agreement — 75 % of
+the INT8 bar — the artifact is perceptually clean, confirming that
+near-tie codebook divergence well below the bar is inaudible. The
+all-INT4 configuration is therefore the serving configuration, and the
+README headline numbers advance to 0.60–0.63.
 
 ## 5. Reproduction
 

@@ -43,9 +43,10 @@ for published releases.
   2500). The best artifact, deployed all-INT4 (`S2P_INT4_ALL=1`),
   passes every objective audio gate (stable HF envelope over 148 s,
   EOS probe 0/24 flags, reference-class take lengths) and serves at
-  wall RTF 0.60–0.63 on an idle GPU (long-form and short, voiced) —
-  down from 0.75–0.76 with the INT8 fast-AR. Perceptual acceptance
-  pending; README headline numbers advance only after it.
+  wall RTF 0.60–0.63 on an idle GPU (zero-shot TTFA 0.14 s, voice-ref
+  0.20 s) — down from 0.75–0.76 with the INT8 fast-AR. Accepted by
+  critical listening 2026-08-03; the all-INT4 stream is now the serving
+  configuration and the README headline carries its numbers.
 - QAT self-distillation tooling for the all-INT4 fast-AR
   (tools/qat_fastar.py + tools/apply_qat_patch.py, S2P_DUMP_FRAMES
   engine hook): the BF16 fast-AR trains its own 4-bit copy with the
