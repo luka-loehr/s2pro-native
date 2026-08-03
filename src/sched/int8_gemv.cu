@@ -16,6 +16,7 @@
  * any K.
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -320,6 +321,88 @@ static __global__ void k_gemv_p(__nv_bfloat16* y, const __nv_bfloat16* x,
             y[(size_t)m * N + n] = __float2bfloat16(acc[m]);
 }
 
+
+/* Batch path (M >= 2): identical arithmetic to k_gemv_p, but the block
+ * stages the activation slice of the current 512-element K chunk in
+ * shared memory once and all GEMV_WARPS output rows read it from there.
+ * The unstaged kernel re-reads x once PER OUTPUT ROW — N*M*K bf16 of L2
+ * traffic per layer (100 MB at gate_up, M=12), which is what made tick
+ * time grow with the batch even though DRAM weight bytes did not. Chunk
+ * order, per-row j order and the acc[m] += s*gs sequence are unchanged,
+ * so outputs are bit-identical. */
+/* S2P_GEMV_STAGED=1 selects the shared-memory-staged batch GEMV
+ * (k_gemv_ps). Measured OUT and kept only for reproduction: staging the
+ * activation chunk cuts its L2 re-reads 4-fold (one load per block of
+ * GEMV_WARPS rows instead of one per row), but the two block barriers
+ * per 512-element chunk cost more than they save at 4 warps per block —
+ * B=4/8/12 worst-stream RTF 0.91/1.45/2.31 unstaged vs 1.37/2.44/3.88
+ * staged. A win would need wider blocks plus double-buffered async
+ * copies so the staging overlaps compute. Bit-identical either way
+ * (two-stream MD5s unchanged). */
+static int gemv_staged(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("S2P_GEMV_STAGED");
+        v = (e && e[0] == '1' && e[1] == '\0') ? 1 : 0;
+    }
+    return v;
+}
+
+template <int MM>
+static __global__ void k_gemv_ps(__nv_bfloat16* y, const __nv_bfloat16* x,
+                                 const uint8_t* w, const __half* scales,
+                                 int M, int N, int K, int gshift) {
+    extern __shared__ __nv_bfloat16 sx[];   /* [M][512] */
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int n = blockIdx.x * GEMV_WARPS + warp;
+    const int active = (n < N);
+    const uint8_t* wrow = active ? w + (size_t)n * (K >> 1) : w;
+    const __half* srow = active ? scales + (size_t)n * (K >> gshift) : scales;
+
+    float acc[MM];
+#pragma unroll
+    for (int m = 0; m < MM; m++) acc[m] = 0.0f;
+
+    for (int c0 = 0; c0 < K; c0 += 512) {
+        __syncthreads();
+        for (int i = threadIdx.x; i < M * 512; i += blockDim.x)
+            sx[i] = x[(size_t)(i >> 9) * K + c0 + (i & 511)];
+        __syncthreads();
+        if (!active) continue;
+        const int k0 = c0 + lane * 16;
+        const uint2 wv = *(const uint2*)(wrow + (k0 >> 1));
+        int8_t w16[16];
+        unpack16(w16, (const uint8_t*)&wv);
+        const float gs = __half2float(srow[k0 >> gshift]);
+        for (int m = 0; m < M; m++) {
+            const __nv_bfloat16* xp = sx + (size_t)m * 512 + lane * 16;
+            const int4 xa = *(const int4*)xp;
+            const int4 xb = *(const int4*)(xp + 8);
+            const __nv_bfloat16* x16a = (const __nv_bfloat16*)&xa;
+            const __nv_bfloat16* x16b = (const __nv_bfloat16*)&xb;
+            float s = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 8; j++)
+                s += (float)w16[j] * __bfloat162float(x16a[j]);
+#pragma unroll
+            for (int j = 0; j < 8; j++)
+                s += (float)w16[8 + j] * __bfloat162float(x16b[j]);
+            acc[m] += s * gs;
+        }
+    }
+    if (!active) return;
+
+#pragma unroll
+    for (int m = 0; m < MM; m++)
+        for (int off = 16; off > 0; off >>= 1)
+            acc[m] += __shfl_down_sync(0xffffffffu, acc[m], off);
+
+    if (lane == 0)
+        for (int m = 0; m < M; m++)
+            y[(size_t)m * N + n] = __float2bfloat16(acc[m]);
+}
+
 static __global__ void k_dequant_p(__nv_bfloat16* o, const uint8_t* w,
                                    const __half* scales, int K, int gshift) {
     const int n = blockIdx.x;
@@ -436,14 +519,22 @@ extern "C" s2p_status s2p_int4p_gemv(void* y_bf16, const void* x_bf16,
     if (M > S2P_INT8_GEMV_MAX_M || K % 512 != 0 || gs < 0 || K % G != 0)
         return S2P_ERR_INVALID;
     const int blocks = (N + GEMV_WARPS - 1) / GEMV_WARPS;
-    if (M <= 8)
+    if (gemv_staged() && M >= 2) {
+        const size_t smem = (size_t)M * 512 * sizeof(__nv_bfloat16);
+        if (M <= 8)
+            k_gemv_ps<8><<<blocks, GEMV_WARPS * 32, smem, stream>>>(
+        (__nv_bfloat16*)y_bf16, (const __nv_bfloat16*)x_bf16,
+        (const uint8_t*)w_pack, (const __half*)scales_f16, M, N, K, gs);
+        else
+            k_gemv_ps<S2P_INT8_GEMV_MAX_M>
+                <<<blocks, GEMV_WARPS * 32, smem, stream>>>(
+        (__nv_bfloat16*)y_bf16, (const __nv_bfloat16*)x_bf16,
+        (const uint8_t*)w_pack, (const __half*)scales_f16, M, N, K, gs);
+    } else {
         k_gemv_p<8><<<blocks, GEMV_WARPS * 32, 0, stream>>>(
         (__nv_bfloat16*)y_bf16, (const __nv_bfloat16*)x_bf16,
         (const uint8_t*)w_pack, (const __half*)scales_f16, M, N, K, gs);
-    else
-        k_gemv_p<S2P_INT8_GEMV_MAX_M><<<blocks, GEMV_WARPS * 32, 0, stream>>>(
-        (__nv_bfloat16*)y_bf16, (const __nv_bfloat16*)x_bf16,
-        (const uint8_t*)w_pack, (const __half*)scales_f16, M, N, K, gs);
+    }
     cudaError_t ce = cudaGetLastError();
     if (ce != cudaSuccess) {
         fprintf(stderr, "[s2pro] int4p gemv launch (M=%d,N=%d,K=%d): %s\n", M,

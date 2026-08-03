@@ -163,6 +163,23 @@ distinct voices, warm prefixes):
 | 12 | — | 2.32 |
 | 16 | — | 2.95 |
 
+## 8. Batch GEMV with staged activations: measured out
+
+The GEMV's O(M) activation re-read (§7) has an obvious remedy: stage the
+current 512-element K chunk of every session row in shared memory once
+per block, so the block's GEMV_WARPS output rows read it from there
+instead of each row re-reading it from L2. Implemented as `k_gemv_ps`
+(`S2P_GEMV_STAGED=1`, default off).
+
+Result: worse at every batch size — worst-stream RTF 0.91 / 1.45 / 2.31
+(unstaged) vs **1.37 / 2.44 / 3.88** (staged) at B = 4 / 8 / 12. With
+only four warps per block the two barriers per chunk cost more than the
+4× reduction in activation traffic saves, and the staging loads do not
+overlap compute. Outputs are bit-identical either way (two-stream MD5s
+unchanged), so this is purely a scheduling result: a win needs wider
+blocks *and* double-buffered async copies, i.e. a real GEMM pipeline
+rather than a staged GEMV. That remains the open item for concurrency.
+
 ## 7. KV-side levers (the wall's owner)
 
 Two attacks on the per-stream KV read, both measured:
