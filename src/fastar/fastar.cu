@@ -430,6 +430,155 @@ s2p_status s2pfa_vq_embed_add_dev(s2pfa* f, const int32_t* codes_dev, int T,
 
 /* ------------------------------------------------------------ decode loop */
 
+/* Fused RoPE + KV-append + causal GQA attention for one fast-AR step
+ * (S2P_FA_FUSED=1, EXPERIMENTAL, default OFF — a measured negative
+ * result kept in the record): one block per (row, kv_head) replaces the
+ * per-row s2pk_rope / s2pk_kv_append / s2pk_attention launch triple; the
+ * <= 10-deep cache lives in shared memory and the softmax is the
+ * reference kernel's single-tile body.
+ *
+ * Measured 2026-08-03 (all-INT4 + KV8, 60-frame smoke): decode
+ * 24.4 -> 24.3 ms/frame — no meaningful win, because CUDA-graph replay
+ * already amortizes the launch overhead the fusion removes; the fast-AR
+ * cost is GEMV weight bandwidth, which fusion cannot touch. Parity:
+ * argmax-equivalent on every first-frame residual step (cos delta
+ * ~1e-5 vs the unfused kernels — a not-yet-located rounding-order
+ * difference), so the fused path also fails the bit-exactness gate and
+ * is NOT the default. Kept for future work: the same shape would carry
+ * a norm+GEMV megakernel, which is where the remaining margin lives. */
+static __device__ inline float fa_b2f(__nv_bfloat16 v) {
+    return __bfloat162float(v);
+}
+static __device__ inline __nv_bfloat16 fa_f2b(float v) {
+    return __float2bfloat16(v);
+}
+
+static __global__ void k_fa_step(const __nv_bfloat16* __restrict__ q,
+                                 const __nv_bfloat16* __restrict__ k,
+                                 const __nv_bfloat16* __restrict__ v,
+                                 __nv_bfloat16* kbase, __nv_bfloat16* vbase,
+                                 size_t bstride, __nv_bfloat16* out,
+                                 int cb_idx, float rope_base) {
+    const int b = blockIdx.x;
+    const int kvh = blockIdx.y;
+    const int tid = threadIdx.x; /* == head_dim 128 */
+    const int len = cb_idx + 1;  /* <= 10 */
+
+    __shared__ __nv_bfloat16 kh[10][128 + 4]; /* +4: bank-conflict pad */
+    __shared__ __nv_bfloat16 vh[10][128 + 4];
+    __shared__ float sq[128];
+    __shared__ float sp[128];
+    __shared__ float red[128];
+    __shared__ float s_tile[2];
+
+    __nv_bfloat16* kc = kbase + (size_t)b * bstride +
+                        ((size_t)kvh * FA_SEQ + cb_idx) * FA_HD;
+    __nv_bfloat16* vc = vbase + (size_t)b * bstride +
+                        ((size_t)kvh * FA_SEQ + cb_idx) * FA_HD;
+
+    /* prior history rows from the global cache (written by earlier steps) */
+    for (int j = 0; j < cb_idx; j++) {
+        const __nv_bfloat16* kr = kc - (size_t)(cb_idx - j) * FA_HD;
+        const __nv_bfloat16* vr = vc - (size_t)(cb_idx - j) * FA_HD;
+        kh[j][tid] = kr[tid];
+        vh[j][tid] = vr[tid];
+    }
+
+    /* current k: RoPE exactly like k_rope, then bf16 store (cache + smem) */
+    {
+        const int i = tid >> 1;
+        const float ex = __fdiv_rn((float)(2 * i), (float)FA_HD);
+        const float inv = __fdiv_rn(1.0f, powf(rope_base, ex));
+        const float ang = __fmul_rn((float)cb_idx, inv);
+        const float c = fa_b2f(fa_f2b(cosf(ang)));
+        const float s = fa_b2f(fa_f2b(sinf(ang)));
+        const size_t o = (size_t)b * (FA_KVH * FA_HD) + (size_t)kvh * FA_HD +
+                         (size_t)(2 * i);
+        const float x0 = fa_b2f(k[o]);
+        const float x1 = fa_b2f(k[o + 1]);
+        const float rv = (tid & 1)
+                             ? __fadd_rn(__fmul_rn(x1, c), __fmul_rn(x0, s))
+                             : __fsub_rn(__fmul_rn(x0, c), __fmul_rn(x1, s));
+        const __nv_bfloat16 rb = fa_f2b(rv);
+        kc[tid] = rb;
+        kh[cb_idx][tid] = rb;
+        const __nv_bfloat16 vb16 =
+            v[(size_t)b * (FA_KVH * FA_HD) + (size_t)kvh * FA_HD + tid];
+        vc[tid] = vb16;
+        vh[cb_idx][tid] = vb16;
+    }
+    __syncthreads();
+
+    const float scale = rsqrtf((float)FA_HD);
+    for (int g = 0; g < FA_QH / FA_KVH; g++) {
+        const int h = kvh * (FA_QH / FA_KVH) + g;
+        /* q RoPE in registers (k_rope math), bf16-rounded like the
+         * in-place reference write, then the k_attention load+scale */
+        {
+            const int i = tid >> 1;
+            const float ex = __fdiv_rn((float)(2 * i), (float)FA_HD);
+            const float inv = __fdiv_rn(1.0f, powf(rope_base, ex));
+            const float ang = __fmul_rn((float)cb_idx, inv);
+            const float c = fa_b2f(fa_f2b(cosf(ang)));
+            const float s = fa_b2f(fa_f2b(sinf(ang)));
+            const size_t o = (size_t)b * (FA_QH * FA_HD) + (size_t)h * FA_HD +
+                             (size_t)(2 * i);
+            const float x0 = fa_b2f(q[o]);
+            const float x1 = fa_b2f(q[o + 1]);
+            const float rv =
+                (tid & 1) ? __fadd_rn(__fmul_rn(x1, c), __fmul_rn(x0, s))
+                          : __fsub_rn(__fmul_rn(x0, c), __fmul_rn(x1, s));
+            sq[tid] = fa_b2f(fa_f2b(rv)) * scale;
+        }
+        __syncthreads();
+
+        /* single-tile online-softmax body, verbatim k_attention order */
+        float s = -INFINITY;
+        if (tid < len) {
+            const __nv_bfloat16* kr = kh[tid];
+            float d = 0.f;
+            for (int e = 0; e < FA_HD; e++)
+                d = fmaf(sq[e], fa_b2f(kr[e]), d);
+            s = d;
+        }
+        red[tid] = s;
+        __syncthreads();
+        for (int off = 128 >> 1; off > 0; off >>= 1) {
+            if (tid < off) red[tid] = fmaxf(red[tid], red[tid + off]);
+            __syncthreads();
+        }
+        if (tid == 0) s_tile[0] = red[0];
+        __syncthreads();
+        const float m_new = fmaxf(-INFINITY, s_tile[0]);
+        const float p = (s == -INFINITY) ? 0.f : expf(s - m_new);
+        sp[tid] = p;
+        red[tid] = p;
+        __syncthreads();
+        for (int off = 128 >> 1; off > 0; off >>= 1) {
+            if (tid < off) red[tid] += red[tid + off];
+            __syncthreads();
+        }
+        if (tid == 0) s_tile[1] = red[0];
+        __syncthreads();
+        const float l = s_tile[1];
+        float acc = 0.f;
+        for (int j2 = 0; j2 < len; j2++)
+            acc = fmaf(sp[j2], fa_b2f(vh[j2][tid]), acc);
+        out[(size_t)b * (FA_QH * FA_HD) + (size_t)h * FA_HD + tid] =
+            fa_f2b(acc / l);
+        __syncthreads(); /* sq/sp/red reuse for the next q head */
+    }
+}
+
+static int fa_fused(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("S2P_FA_FUSED");
+        v = (e && e[0] == '1' && e[1] == '\0') ? 1 : 0; /* default OFF */
+    }
+    return v;
+}
+
 static inline __nv_bfloat16* fa_kcache(s2pfa* f, int l, int b) {
     return f->kv_slab + ((size_t)(l * f->max_b + b) * 2 + 0) * FA_KVSZ;
 }
@@ -459,21 +608,28 @@ static s2p_status fa_run_layers(s2pfa* f, int B, int cb_idx,
             S2P_CUDA_TRY(cudaGetLastError());
         }
         /* NO qk-norm (attention_qk_norm=false — PORTING pitfall 8). */
-        for (int b = 0; b < B; b++) {
-            S2P_CUDA_TRY(s2pk_rope(f->q + (size_t)b * FA_QW,
-                                   f->k + (size_t)b * FA_KVW, 1, FA_QH,
-                                   FA_KVH, FA_HD, cb_idx, S2P_ROPE_BASE,
-                                   stream));
-            S2P_CUDA_TRY(s2pk_kv_append(f->k + (size_t)b * FA_KVW,
-                                        f->v + (size_t)b * FA_KVW,
-                                        fa_kcache(f, l, b), fa_vcache(f, l, b),
-                                        1, FA_KVH, FA_HD, cb_idx, FA_SEQ,
-                                        stream));
-            S2P_CUDA_TRY(s2pk_attention(f->q + (size_t)b * FA_QW,
-                                        fa_kcache(f, l, b), fa_vcache(f, l, b),
-                                        f->attn + (size_t)b * FA_QW, 1, FA_QH,
-                                        FA_KVH, FA_HD, cb_idx, FA_SEQ,
-                                        stream));
+        if (fa_fused()) {
+            /* one launch replaces the rope/append/attention triple per row */
+            dim3 g((unsigned)B, FA_KVH);
+            k_fa_step<<<g, FA_HD, 0, stream>>>(
+                f->q, f->k, f->v, fa_kcache(f, l, 0), fa_vcache(f, l, 0),
+                (size_t)2 * FA_KVSZ, f->attn, cb_idx, S2P_ROPE_BASE);
+            S2P_CUDA_TRY(cudaGetLastError());
+        } else {
+            for (int b = 0; b < B; b++) {
+                S2P_CUDA_TRY(s2pk_rope(f->q + (size_t)b * FA_QW,
+                                       f->k + (size_t)b * FA_KVW, 1, FA_QH,
+                                       FA_KVH, FA_HD, cb_idx, S2P_ROPE_BASE,
+                                       stream));
+                S2P_CUDA_TRY(s2pk_kv_append(
+                    f->k + (size_t)b * FA_KVW, f->v + (size_t)b * FA_KVW,
+                    fa_kcache(f, l, b), fa_vcache(f, l, b), 1, FA_KVH, FA_HD,
+                    cb_idx, FA_SEQ, stream));
+                S2P_CUDA_TRY(s2pk_attention(
+                    f->q + (size_t)b * FA_QW, fa_kcache(f, l, b),
+                    fa_vcache(f, l, b), f->attn + (size_t)b * FA_QW, 1, FA_QH,
+                    FA_KVH, FA_HD, cb_idx, FA_SEQ, stream));
+            }
         }
         S2P_TRY(s2p_linear_forward(&L->wo, f->attn, f->proj, B, f->mode,
                                    stream));
