@@ -1166,6 +1166,31 @@ extern "C" cudaError_t s2pk_embed(const __nv_bfloat16* table,
     return cudaGetLastError();
 }
 
+/* INT8-sidecar embedding lookup (S2P_EMBED_BF16=0 default in INT8 mode):
+ * out = bf16(i8[id][d] * row_scale[id]) — the bf16 table is dropped and
+ * the per-row-quantized tied-head sidecar serves lookups too. */
+static __global__ void k_embed_i8(const int8_t* table, const float* scales,
+                                  const int64_t* ids, __nv_bfloat16* out,
+                                  int64_t total, int dim) {
+    for (int64_t idx = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+         idx < total; idx += (int64_t)gridDim.x * blockDim.x) {
+        const int64_t r = idx / dim;
+        const int d = (int)(idx % dim);
+        const int64_t id = ids[r];
+        out[idx] = s2pk_f2b((float)table[(size_t)id * dim + d] * scales[id]);
+    }
+}
+
+extern "C" cudaError_t s2pk_embed_i8(const int8_t* table, const float* scales,
+                                     const int64_t* ids, __nv_bfloat16* out,
+                                     int rows, int dim, cudaStream_t st) {
+    if (rows <= 0) return cudaSuccess;
+    int64_t total = (int64_t)rows * dim;
+    k_embed_i8<<<s2pk_blocks(total, S2PK_THREADS), S2PK_THREADS, 0, st>>>(
+        table, scales, ids, out, total, dim);
+    return cudaGetLastError();
+}
+
 /* ---------------------------------------------------------- sample_prepare */
 
 /* Widen bf16 logits to fp32 device scratch. The v1 sampler downloads the
