@@ -29,7 +29,9 @@ typedef enum {
 
 /* Largest M served by the INT8 GEMV kernel; beyond this the INT8 path
  * dequantizes to BF16 scratch + cuBLAS (prefill / big lockstep batches). */
-#define S2P_INT8_GEMV_MAX_M 8
+#define S2P_INT8_GEMV_MAX_M 16 /* == session cap: beyond this M every
+ * decode linear would fall back to the full-weight dequant+GEMM path
+ * (measured RTF collapse at B=10) */
 
 /* Global gemm context (cublas handle + fp8 scratch). One per process. */
 s2p_status    s2p_gemm_init(int max_m);
