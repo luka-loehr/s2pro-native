@@ -58,6 +58,13 @@ static const float* dacw_get(s2p_dac* d, int* ok, int quiet, int64_t elems,
                 name, (long long)e->nbytes, (long long)(elems * 4));
         return NULL;
     }
+    if (d->w.f16) {
+        /* f16 blob for w-class tensors (punned; consumers pass them into
+         * the void* launcher params), f32 keeper arena for the rest */
+        if (e->h_off >= 0)
+            return (const float*)((const char*)d->w.base_h + e->h_off);
+        return (const float*)((const char*)d->w.base_f + e->f_off);
+    }
     return (const float*)((const char*)d->w.base + e->off);
 }
 
@@ -537,7 +544,7 @@ static s2p_status run_vq_step(const s2pd_vq* vq, float* resid, int T,
                               0, ze8, T, st));
     S2P_CUDA_TRY(s2pdk_vq_nearest(ze8, T, vq->cb, vq->n, codes_row, st));
     S2P_CUDA_TRY(s2pdk_vq_dequant(ze8, codes_row, vq->cb, T, zq8, st));
-    S2P_CUDA_TRY(s2pdk_conv1d(zq8, 8, T, vq->out_w, vq->out_b, 1024, 1, 1, 1,
+    S2P_CUDA_TRY(s2pdk_conv1d_w32(zq8, 8, T, vq->out_w, vq->out_b, 1024, 1, 1, 1,
                               0, zq, T, st));
     S2P_CUDA_TRY(s2pdk_sub_ip(resid, zq, (int64_t)1024 * T, st));
     return S2P_OK;

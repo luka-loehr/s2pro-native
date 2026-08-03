@@ -58,6 +58,7 @@ s2p_status s2p_dacw_load(const char* model_dir, s2p_dacw* w) {
         }
         s2p_dacw_ent* e = &ents[n];
         memset(e, 0, sizeof(*e));
+        e->h_off = e->f_off = -1;
         e->d[0] = e->d[1] = e->d[2] = e->d[3] = 1;
         long long off, nbytes, d0 = 1, d1 = 1, d2 = 1, d3 = 1;
         int ndim = 0;
@@ -137,6 +138,84 @@ s2p_status s2p_dacw_load(const char* model_dir, s2p_dacw* w) {
     w->n_ents = n;
     w->base = dev;
     w->total_bytes = fsz;
+
+    /* ---- FP16 weight conversion (S2P_DAC_F32=1 keeps everything f32) ----
+     * Big conv/matmul weights convert to a half blob; the small keepers
+     * (biases, Snake alphas, norms, layer scales, codebooks, the mono
+     * output conv) copy into a compact f32 arena; the original blob is
+     * freed. Net: roughly half the vocoder weight bytes and traffic. */
+    {
+        const char* keep = getenv("S2P_DAC_F32");
+        if (keep && keep[0] == '1' && keep[1] == '\0') return S2P_OK;
+        int64_t hbytes = 0, fbytes = 0;
+        for (int i = 0; i < n; i++) {
+            s2p_dacw_ent* e = &ents[i];
+            size_t len = strlen(e->name);
+            int wclass = len > 7 &&
+                         strcmp(e->name + len - 7, ".weight") == 0 &&
+                         e->ndim >= 2 &&
+                         strstr(e->name, "codebook") == NULL &&
+                         /* rvq.cu reads out_proj directly as f32 (the
+                          * encode-side conv1d use forces f32 explicitly) */
+                         strstr(e->name, "out_proj") == NULL;
+            if (wclass) {
+                e->h_off = hbytes;
+                hbytes += (e->nbytes / 2 + 255) & ~(int64_t)255;
+            } else {
+                e->f_off = fbytes;
+                fbytes += (e->nbytes + 255) & ~(int64_t)255;
+            }
+        }
+        void* devh = NULL;
+        float* devf = NULL;
+        if (cudaMalloc(&devh, (size_t)hbytes) != cudaSuccess ||
+            cudaMalloc((void**)&devf, (size_t)fbytes) != cudaSuccess) {
+            if (devh) cudaFree(devh);
+            fprintf(stderr, "[s2pro] dac: f16 arena alloc failed, staying "
+                            "f32\n");
+            for (int i = 0; i < n; i++)
+                ents[i].h_off = ents[i].f_off = -1;
+            return S2P_OK;
+        }
+        for (int i = 0; i < n; i++) {
+            s2p_dacw_ent* e = &ents[i];
+            const char* src = (const char*)dev + e->off;
+            cudaError_t c2;
+            if (e->h_off >= 0)
+                c2 = s2pdk_f32_to_f16((const float*)src,
+                                      (char*)devh + e->h_off, e->nbytes / 4,
+                                      0);
+            else
+                c2 = cudaMemcpyAsync((char*)devf + e->f_off, src,
+                                     (size_t)e->nbytes,
+                                     cudaMemcpyDeviceToDevice, 0);
+            if (c2 != cudaSuccess) {
+                fprintf(stderr, "[s2pro] dac: f16 convert failed (%s), "
+                                "staying f32\n", cudaGetErrorString(c2));
+                cudaFree(devh);
+                cudaFree(devf);
+                for (int j = 0; j < n; j++)
+                    ents[j].h_off = ents[j].f_off = -1;
+                return S2P_OK;
+            }
+        }
+        if (cudaDeviceSynchronize() != cudaSuccess) {
+            cudaFree(devh);
+            cudaFree(devf);
+            for (int j = 0; j < n; j++)
+                ents[j].h_off = ents[j].f_off = -1;
+            return S2P_OK;
+        }
+        cudaFree(dev);
+        w->base = NULL;
+        w->base_h = devh;
+        w->base_f = devf;
+        w->f16 = 1;
+        s2pdk_weights_f16(1);
+        fprintf(stderr, "[s2pro] dac: weights f16 (%lld MB, keepers %lld "
+                        "KB f32)\n", (long long)(hbytes >> 20),
+                (long long)(fbytes >> 10));
+    }
     return S2P_OK;
 }
 
@@ -144,6 +223,8 @@ void s2p_dacw_free(s2p_dacw* w) {
     if (!w) return;
     free(w->ents);
     if (w->base) cudaFree(w->base);
+    if (w->base_h) cudaFree(w->base_h);
+    if (w->base_f) cudaFree(w->base_f);
     memset(w, 0, sizeof(*w));
 }
 
@@ -162,5 +243,12 @@ const s2p_dacw_ent* s2p_dacw_ent_find(const s2p_dacw* w, const char* name) {
 const float* s2p_dacw_find(const s2p_dacw* w, const char* name) {
     const s2p_dacw_ent* e = s2p_dacw_ent_find(w, name);
     if (!e) return NULL;
+    if (w->f16) {
+        /* w-class tensors live in the half blob (consumers pass them
+         * through the void* launcher params); keepers are real f32 */
+        if (e->h_off >= 0)
+            return (const float*)((const char*)w->base_h + e->h_off);
+        return (const float*)((const char*)w->base_f + e->f_off);
+    }
     return (const float*)((const char*)w->base + e->off);
 }
