@@ -26,8 +26,8 @@ is compute ÷ audio; below 1.0 means synthesis outruns playback.
 | serving path | wall RTF | TTFA |
 | --- | ---: | ---: |
 | zero-shot | **0.60** | 0.14 s |
-| 60 s voice reference (warm voice cache) | **0.61** | 0.20 s |
-| ~148 s chunked long-form | **0.62–0.63** | 0.20 s |
+| 60 s voice reference (warm voice cache) | **0.58** | 0.20 s |
+| ~148 s chunked long-form | **0.58–0.59** | 0.20 s |
 
 Configuration: all-INT4 weight stream (packed group-wise INT4 backbone +
 QAT-distilled INT4 fast-AR and lm-head, `S2P_INT4_ALL=1` on a
@@ -250,13 +250,22 @@ audio battery); the reports own the details, including what lost.
 | per-voice KV-prefix cache | voice-ref TTFA 1.58 → 0.23 s; every path below realtime |
 | GEMM-grade DAC conv kernels | DAC 15.1 → 2.1 ms/frame; wall RTF 0.75–0.76 |
 | QAT self-distillation of the fast-AR → all-INT4 | weight stream 6.17 → 4.37 GB/frame; wall RTF 0.60–0.63; accepted by listening |
+| prequantized-weight sidecar cache | server start 27.7 → 5.1 s, bit-identical by construction |
+| INT8 KV cache (g32 per head vector) | KV memory/traffic halved; parity holds the INT8 class exactly |
+| INT8 embedding lookups (bf16 table dropped) | −0.8 GB; prefill/step-1 argmax unchanged |
+| FP16 vocoder weights | codec memory 1.6 → 0.75 GB; 68.1 dB vs the f32 decode |
+| fast-AR launch fusion | measured OUT: graphs already amortize launches ([docs/SERVING.md](docs/SERVING.md)) |
 
 The precision ladder is complete: every module now serves at 4 bits
 (backbone by construction, fast-AR and lm-head by overnight
 self-distillation — runs, gates, and telemetry in
-[docs/QAT-RUNS.md](docs/QAT-RUNS.md)). Remaining engineering is
-incremental: fast-AR kernel fusion, further distillation rounds if
-listening ever demands them, and a published release line.
+[docs/QAT-RUNS.md](docs/QAT-RUNS.md)), the KV cache and embeddings at
+8, the vocoder at 16. Serving infrastructure and concurrency behavior
+(4 streams under the per-stream RTF < 1 rule; the levers for more) are
+measured in [docs/SERVING.md](docs/SERVING.md). Remaining engineering
+is incremental: cross-session DAC batching, chunked prefill, a
+norm+GEMV megakernel, further distillation rounds if listening ever
+demands them, and a published release line.
 
 ## 8. Documentation map
 
@@ -267,6 +276,7 @@ listening ever demands them, and a published release line.
 | [docs/QUANT.md](docs/QUANT.md) | report | weight-quantization ladder, methods, negative results |
 | [docs/DAC-KERNELS.md](docs/DAC-KERNELS.md) | report | vocoder kernel optimization, winning and losing designs |
 | [docs/QAT-RUNS.md](docs/QAT-RUNS.md) | report | QAT distillation runs: conditions, telemetry, results |
+| [docs/SERVING.md](docs/SERVING.md) | report | startup cache, launch-overhead result, concurrency limits |
 | [benchmarks/parity/README.md](benchmarks/parity/README.md) | report | layer-parity protocol and per-path verdicts |
 | [docs/SPARK.md](docs/SPARK.md) | guide | build and deployment on the DGX Spark |
 | [docs/VOICES.md](docs/VOICES.md) | guide | the voice reference system and the accent constraint |

@@ -36,6 +36,22 @@ for published releases.
 
 ### Added
 
+- Serving-efficiency sprint (docs/SERVING.md, docs/QUANT.md §4.6/4.7,
+  docs/DAC-KERNELS.md §8), each stage individually gated:
+  prequantized-weight sidecar cache (server start 27.7 -> 5.1 s, smoke
+  MD5 identical by construction); INT8 KV cache with g32-per-head-vector
+  f16 scales (KV memory/traffic halved, parity holds the INT8 class
+  exactly incl. the same cb5 near-tie); INT8 embedding lookups with the
+  bf16 table dropped (-0.8 GB, argmax unchanged); FP16 vocoder weights
+  (codec 1.6 -> 0.75 GB, 68.1 dB vs the f32 decode on identical codes,
+  policy fixed before measurement). One measured negative result: fast-AR
+  rope/append/attention launch fusion gains nothing under CUDA-graph
+  replay (24.4 -> 24.3 ms/frame) and stays opt-in (S2P_FA_FUSED=1).
+  Complete-stack serving: zero-shot 0.60 (TTFA 0.14 s), warm voice ref
+  0.58 (TTFA 0.20 s), long-form 0.58/0.59, ~-2.3 GB memory. Batch load
+  test under the per-stream RTF<1 rule: worst 0.69 at B=2, 0.99 at B=4,
+  queueing cliff beyond the 4-slot cap -> cap 4 (3 with margin); levers
+  documented.
 - QAT training runs to completion (docs/QAT-RUNS.md): three runs (one
   aborted for trainer speed, fixed; one cold 2000-step run on the 60 k
   corpus, free-run 0.4550 → 0.6690; one warm-started 3000-step run on

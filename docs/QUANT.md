@@ -108,6 +108,33 @@ takes MD5-identical across storages), so the packing converts value-level
 quality directly into bandwidth: zero-shot wall RTF 1.10 → 0.95 at the
 time of landing.
 
+### 4.6 INT8 KV cache — the last bf16 stream
+
+The KV cache ran bf16 (147.5 KB per token across 36 layers; 604 MB per
+session at ctx 4096, 189 MB per cached voice prefix). `S2P_KV8`
+(default on in the INT8 weight mode) stores payload i8 plus one f16
+scale per 32-element group of the post-RoPE head vector — absmax/127
+rounded through f16, so dequantization multiplies by exactly the stored
+scale. Quantization happens on append; both attention kernels
+dequantize in registers, the split-K decode path from int8+f16
+shared-memory tiles at half the tile traffic. Parity holds the INT8
+class exactly: prefill and step-1 argmax identical, fast-AR 8/9 with
+the same cb5 near-tie as the bf16-KV reference, backbone cos min 0.9922
+(reference 0.9927). Session KV 604 → 321 MB; voice-prefix blobs halve.
+Evidence: `parity-int4-kv8-oracle-fox-2026-08-03.json`.
+
+### 4.7 INT8 embedding lookups — dropping the last bf16 giant
+
+The 155776×2560 bf16 embedding table (0.8 GB) served only embedding
+lookups and the oversize-batch head fallback; the per-row INT8 sidecar
+already carried the same weights for the decode head. Lookups now
+dequantize per element from the sidecar, oversize head batches run the
+GEMV in M ≤ 8 chunks, and the bf16 table is freed after sidecar
+quantization (`S2P_EMBED_BF16=1` keeps it). The int8-rounded input
+embeddings cost ~0.0008 backbone cosine and flip nothing: parity of the
+full serving numerics (INT4 weights + INT8 KV + INT8 embed) holds
+prefill/step-1 argmax and fast-AR 8/9. Process memory −0.8 GB.
+
 ## 5. Mixed precision is measured, not precautionary
 
 Every attempt to put any part of the fast-AR at 4 bits without training
