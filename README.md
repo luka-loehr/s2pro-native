@@ -244,11 +244,14 @@ audio battery); the reports own the details, including what lost.
 | per-voice KV-prefix cache | voice-ref TTFA 1.58 → 0.23 s; every path below realtime |
 | GEMM-grade DAC conv kernels | DAC 15.1 → 2.1 ms/frame; wall RTF 0.75–0.76 |
 
-Open: QAT self-distillation of the fast-AR to INT4 — the last structural
-lever (nine sequential re-reads make the 0.41 B module the largest weight
-stream; all-INT4 puts the decode floor near 20 ms/frame). Method in
-[docs/QUANT.md §6](docs/QUANT.md); runs in
-[docs/QAT-RUNS.md](docs/QAT-RUNS.md).
+Open: perceptual acceptance of the QAT all-INT4 configuration. The
+training runs are complete (best held-out free-run agreement 0.6711 vs
+the 0.8935 INT8 bar), every objective audio gate passes (envelope, EOS,
+length), and the measured wall RTF is **0.60–0.63** across all serving
+paths — the predicted gain of the 6.17 → 4.37 GB/frame weight stream.
+The §1 table advances to these numbers once the artifact passes critical
+listening. Method in [docs/QUANT.md §6](docs/QUANT.md); runs, gates, and
+telemetry in [docs/QAT-RUNS.md](docs/QAT-RUNS.md).
 
 ## 8. Documentation map
 

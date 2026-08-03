@@ -36,6 +36,16 @@ for published releases.
 
 ### Added
 
+- QAT training runs to completion (docs/QAT-RUNS.md): three runs (one
+  aborted for trainer speed, fixed; one cold 2000-step run on the 60 k
+  corpus, free-run 0.4550 → 0.6690; one warm-started 3000-step run on
+  the 308 k corpus v2, best 0.6711 on a strictly-unseen holdout at step
+  2500). The best artifact, deployed all-INT4 (`S2P_INT4_ALL=1`),
+  passes every objective audio gate (stable HF envelope over 148 s,
+  EOS probe 0/24 flags, reference-class take lengths) and serves at
+  wall RTF 0.60–0.63 on an idle GPU (long-form and short, voiced) —
+  down from 0.75–0.76 with the INT8 fast-AR. Perceptual acceptance
+  pending; README headline numbers advance only after it.
 - QAT self-distillation tooling for the all-INT4 fast-AR
   (tools/qat_fastar.py + tools/apply_qat_patch.py, S2P_DUMP_FRAMES
   engine hook): the BF16 fast-AR trains its own 4-bit copy with the
