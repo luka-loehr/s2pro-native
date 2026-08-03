@@ -703,6 +703,276 @@ extern "C" cudaError_t s2pdk_matmul(const float* a, int m, int k,
     return cudaPeekAtLastError();
 }
 
+
+/* ---- cross-session batched variants (S2P_DAC batching) -----------------
+ * Same kernel bodies as the per-session versions, with a batch of
+ * independent sessions addressed through per-session base-pointer tables
+ * (device memory). The session index is the FASTEST-varying grid
+ * coordinate (blockIdx.x % nb), so blocks consuming the same weight tile
+ * across sessions are resident together and the tile is served from L2
+ * instead of DRAM once per session. Per-output accumulation order is the
+ * per-session kernel's exactly — batched output is bit-identical per
+ * stream. */
+
+template <typename WT>
+__global__ void k_conv1d_wide_b(const float* const* __restrict__ in_b,
+                                int cin, int tin, const WT* __restrict__ w,
+                                const float* __restrict__ b, int cout, int k,
+                                int dil, int stride, int leftpad,
+                                float* const* __restrict__ out_b, int tout,
+                                int nb) {
+    __shared__ float sw[S2PDK_CONV_CO * S2PDK_CONV_CI_CHUNK *
+                        S2PDK_CONV_K_MAX];
+    const int sess = blockIdx.x % nb;
+    const int tb = blockIdx.x / nb;
+    const float* __restrict__ in = in_b[sess];
+    float* __restrict__ out = out_b[sess];
+    const int t_a = tb * (blockDim.x * S2PDK_CONV_TSUB) + threadIdx.x;
+    const int t_b = t_a + blockDim.x;
+    const int co0 = blockIdx.y * S2PDK_CONV_CO;
+    const int nc = (cout - co0) < S2PDK_CONV_CO ? (cout - co0)
+                                                : S2PDK_CONV_CO;
+    const int act_a = (t_a < tout), act_b = (t_b < tout);
+
+    float acc_a[S2PDK_CONV_CO], acc_b[S2PDK_CONV_CO];
+    for (int c = 0; c < nc; c++) acc_a[c] = acc_b[c] = b ? b[co0 + c] : 0.f;
+
+    const int t0a = t_a * stride - leftpad;
+    const int t0b = t_b * stride - leftpad;
+    for (int ci0 = 0; ci0 < cin; ci0 += S2PDK_CONV_CI_CHUNK) {
+        const int nci = (cin - ci0) < S2PDK_CONV_CI_CHUNK
+                            ? (cin - ci0)
+                            : S2PDK_CONV_CI_CHUNK;
+        __syncthreads();
+        for (int c = 0; c < nc; c++) {
+            const WT* src = w + ((size_t)(co0 + c) * cin + ci0) * k;
+            for (int idx = threadIdx.x; idx < nci * k; idx += blockDim.x)
+                sw[(size_t)c * S2PDK_CONV_CI_CHUNK * k + idx] =
+                    (float)src[idx];
+        }
+        __syncthreads();
+        if (!act_a) continue;
+        for (int ci = 0; ci < nci; ci++) {
+            const float* inr = in + (size_t)(ci0 + ci) * tin;
+            const float* swc = sw + (size_t)ci * k;
+            for (int kk = 0; kk < k; kk++) {
+                const int tia = t0a + kk * dil;
+                const int tib = t0b + kk * dil;
+                const float va = (tia >= 0 && tia < tin) ? inr[tia] : 0.f;
+                const float vb =
+                    (act_b && tib >= 0 && tib < tin) ? inr[tib] : 0.f;
+#pragma unroll
+                for (int c = 0; c < S2PDK_CONV_CO; c++) {
+                    const float wv =
+                        swc[(size_t)c * S2PDK_CONV_CI_CHUNK * k + kk];
+                    acc_a[c] += wv * va;
+                    acc_b[c] += wv * vb;
+                }
+            }
+        }
+    }
+    for (int c = 0; c < nc; c++) {
+        if (act_a) out[(size_t)(co0 + c) * tout + t_a] = acc_a[c];
+        if (act_b) out[(size_t)(co0 + c) * tout + t_b] = acc_b[c];
+    }
+}
+
+extern "C" cudaError_t s2pdk_conv1d_b(const float* const* in_b, int cin,
+                                      int tin, const void* w, const float* b,
+                                      int cout, int k, int dil, int stride,
+                                      int leftpad, float* const* out_b,
+                                      int tout, int nb, cudaStream_t st) {
+    if (nb <= 0) return cudaSuccess;
+    if (k > S2PDK_CONV_K_MAX) return cudaErrorInvalidValue;
+    dim3 grid((unsigned)(nb * ((tout + 256 * S2PDK_CONV_TSUB - 1) /
+                               (256 * S2PDK_CONV_TSUB))),
+              (cout + S2PDK_CONV_CO - 1) / S2PDK_CONV_CO);
+    if (g_w16)
+        k_conv1d_wide_b<<<grid, 256, 0, st>>>(in_b, cin, tin,
+                                              (const __half*)w, b, cout, k,
+                                              dil, stride, leftpad, out_b,
+                                              tout, nb);
+    else
+        k_conv1d_wide_b<<<grid, 256, 0, st>>>(in_b, cin, tin,
+                                              (const float*)w, b, cout, k,
+                                              dil, stride, leftpad, out_b,
+                                              tout, nb);
+    return cudaPeekAtLastError();
+}
+
+template <typename WT>
+__global__ void k_dwconv1d_b(const float* const* __restrict__ in_b, int c,
+                             int tin, const WT* __restrict__ w,
+                             const float* __restrict__ b, int k, int leftpad,
+                             float* const* __restrict__ out_b, int tout,
+                             int nb) {
+    const int sess = blockIdx.x % nb;
+    const int tb = blockIdx.x / nb;
+    int to = tb * blockDim.x + threadIdx.x;
+    int ch = blockIdx.y;
+    if (to >= tout || ch >= c) return;
+    const float* in = in_b[sess];
+    float* out = out_b[sess];
+    float acc = b ? b[ch] : 0.f;
+    const float* inr = in + (size_t)ch * tin;
+    const WT* wr = w + (size_t)ch * k;
+    int t0 = to - leftpad;
+    for (int kk = 0; kk < k; kk++) {
+        int ti = t0 + kk;
+        if (ti >= 0 && ti < tin) acc += (float)wr[kk] * inr[ti];
+    }
+    out[(size_t)ch * tout + to] = acc;
+}
+
+extern "C" cudaError_t s2pdk_dwconv1d_b(const float* const* in_b, int c,
+                                        int tin, const void* w,
+                                        const float* b, int k, int leftpad,
+                                        float* const* out_b, int tout, int nb,
+                                        cudaStream_t st) {
+    if (nb <= 0) return cudaSuccess;
+    dim3 grid((unsigned)(nb * ((tout + 255) / 256)), c);
+    if (g_w16)
+        k_dwconv1d_b<<<grid, 256, 0, st>>>(in_b, c, tin, (const __half*)w, b,
+                                           k, leftpad, out_b, tout, nb);
+    else
+        k_dwconv1d_b<<<grid, 256, 0, st>>>(in_b, c, tin, (const float*)w, b,
+                                           k, leftpad, out_b, tout, nb);
+    return cudaPeekAtLastError();
+}
+
+template <typename WT>
+__global__ void k_tconv1d_b(const float* const* __restrict__ in_b, int cin,
+                            int tin, const WT* __restrict__ w,
+                            const float* __restrict__ b, int cout, int k,
+                            int stride, float* const* __restrict__ out_b,
+                            int tout, int nb) {
+    __shared__ float sw[S2PDK_TC_CI_CHUNK * S2PDK_CO_TILE];
+    const int sess = blockIdx.x % nb;
+    const int jb = blockIdx.x / nb;
+    const float* __restrict__ in = in_b[sess];
+    float* __restrict__ out = out_b[sess];
+    const int j_a = jb * (blockDim.x * S2PDK_TC_TSUB) + threadIdx.x;
+    const int j_b = j_a + blockDim.x;
+    const int phase = blockIdx.y;
+    const int co0 = blockIdx.z * S2PDK_CO_TILE;
+    const int to_a = j_a * stride + phase;
+    const int to_b = j_b * stride + phase;
+    const int nc =
+        (cout - co0) < S2PDK_CO_TILE ? (cout - co0) : S2PDK_CO_TILE;
+    const int act_a = (to_a < tout), act_b = (to_b < tout);
+
+    float acc_a[S2PDK_CO_TILE], acc_b[S2PDK_CO_TILE];
+    for (int c = 0; c < nc; c++) acc_a[c] = acc_b[c] = b ? b[co0 + c] : 0.f;
+
+    for (int kk = phase, m = 0; kk < k; kk += stride, m++) {
+        const int ti_a = j_a - m, ti_b = j_b - m;
+        const int va_ok = act_a && ti_a >= 0 && ti_a < tin;
+        const int vb_ok = act_b && ti_b >= 0 && ti_b < tin;
+        for (int ci0 = 0; ci0 < cin; ci0 += S2PDK_TC_CI_CHUNK) {
+            const int nci = (cin - ci0) < S2PDK_TC_CI_CHUNK
+                                ? (cin - ci0)
+                                : S2PDK_TC_CI_CHUNK;
+            __syncthreads();
+            for (int idx = threadIdx.x; idx < nci * S2PDK_CO_TILE;
+                 idx += blockDim.x) {
+                const int ci = idx / S2PDK_CO_TILE;
+                const int c = idx % S2PDK_CO_TILE;
+                sw[idx] =
+                    (c < nc)
+                        ? (float)w[((size_t)(ci0 + ci) * cout + co0 + c) * k +
+                                   kk]
+                        : 0.f;
+            }
+            __syncthreads();
+            if (!va_ok && !vb_ok) continue;
+            for (int ci = 0; ci < nci; ci++) {
+                const float* inr = in + (size_t)(ci0 + ci) * tin;
+                const float va = va_ok ? inr[ti_a] : 0.f;
+                const float vb = vb_ok ? inr[ti_b] : 0.f;
+                const float* swc = sw + (size_t)ci * S2PDK_CO_TILE;
+#pragma unroll
+                for (int c = 0; c < S2PDK_CO_TILE; c++) {
+                    acc_a[c] += swc[c] * va;
+                    acc_b[c] += swc[c] * vb;
+                }
+            }
+        }
+    }
+    for (int c = 0; c < nc; c++) {
+        if (act_a) out[(size_t)(co0 + c) * tout + to_a] = acc_a[c];
+        if (act_b) out[(size_t)(co0 + c) * tout + to_b] = acc_b[c];
+    }
+}
+
+extern "C" cudaError_t s2pdk_tconv1d_b(const float* const* in_b, int cin,
+                                       int tin, const void* w, const float* b,
+                                       int cout, int k, int stride,
+                                       float* const* out_b, int tout, int nb,
+                                       cudaStream_t st) {
+    if (nb <= 0) return cudaSuccess;
+    const int tphase = (tout + stride - 1) / stride;
+    dim3 grid((unsigned)(nb * ((tphase + 256 * S2PDK_TC_TSUB - 1) /
+                               (256 * S2PDK_TC_TSUB))),
+              stride, (cout + S2PDK_CO_TILE - 1) / S2PDK_CO_TILE);
+    if (g_w16)
+        k_tconv1d_b<<<grid, 256, 0, st>>>(in_b, cin, tin, (const __half*)w,
+                                          b, cout, k, stride, out_b, tout,
+                                          nb);
+    else
+        k_tconv1d_b<<<grid, 256, 0, st>>>(in_b, cin, tin, (const float*)w, b,
+                                          cout, k, stride, out_b, tout, nb);
+    return cudaPeekAtLastError();
+}
+
+template <typename WT>
+__global__ void k_matmul_b(const float* const* __restrict__ a_b, int m,
+                           int k, const WT* __restrict__ w, int n,
+                           const float* __restrict__ bias,
+                           float* const* __restrict__ out_b, int nb) {
+    __shared__ float As[MM_TILE][MM_TILE];
+    __shared__ float Ws[MM_TILE][MM_TILE + 1];
+    const int sess = blockIdx.x % nb;
+    const int nblk = blockIdx.x / nb;
+    const float* __restrict__ a = a_b[sess];
+    float* __restrict__ out = out_b[sess];
+    int row = blockIdx.y * MM_TILE + threadIdx.y;
+    int col = nblk * MM_TILE + threadIdx.x;
+    float acc = 0.f;
+    for (int k0 = 0; k0 < k; k0 += MM_TILE) {
+        int ka = k0 + threadIdx.x;
+        As[threadIdx.y][threadIdx.x] =
+            (row < m && ka < k) ? a[(size_t)row * k + ka] : 0.f;
+        int kw = k0 + threadIdx.y;
+        int wn = nblk * MM_TILE + threadIdx.x;
+        Ws[threadIdx.y][threadIdx.x] =
+            (wn < n && kw < k) ? (float)w[(size_t)wn * k + kw] : 0.f;
+        __syncthreads();
+#pragma unroll
+        for (int kk = 0; kk < MM_TILE; kk++)
+            acc += As[threadIdx.y][kk] * Ws[kk][threadIdx.x];
+        __syncthreads();
+    }
+    if (row < m && col < n)
+        out[(size_t)row * n + col] = bias ? acc + bias[col] : acc;
+}
+
+extern "C" cudaError_t s2pdk_matmul_b(const float* const* a_b, int m, int k,
+                                      const void* w, int n, const float* bias,
+                                      float* const* out_b, int nb,
+                                      cudaStream_t st) {
+    if (nb <= 0) return cudaSuccess;
+    dim3 grid((unsigned)(nb * ((n + MM_TILE - 1) / MM_TILE)),
+              (m + MM_TILE - 1) / MM_TILE);
+    dim3 blk(MM_TILE, MM_TILE);
+    if (g_w16)
+        k_matmul_b<<<grid, blk, 0, st>>>(a_b, m, k, (const __half*)w, n,
+                                         bias, out_b, nb);
+    else
+        k_matmul_b<<<grid, blk, 0, st>>>(a_b, m, k, (const float*)w, n, bias,
+                                         out_b, nb);
+    return cudaPeekAtLastError();
+}
+
 /* ------------------------------ RoPE ------------------------------------- */
 
 /* Interleaved (gpt-fast) RoPE, adjacent pairs (2i,2i+1), NOT rotate-half.

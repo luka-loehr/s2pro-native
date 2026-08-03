@@ -772,7 +772,9 @@ s2p_status s2p_sched_create(s2p_model* m, s2p_dac* d, s2p_tok* t,
     }
     {
         const char* e = getenv("S2P_DAC_STREAMS");
-        s->n_cust = e ? atoi(e) : 8;
+        s->n_cust = e ? atoi(e) : 16; /* == session cap: a shared stream
+                                       * cross-syncs two sessions' pipelines
+                                       * (measured collapse at B > pool) */
         if (s->n_cust < 1) s->n_cust = 1;
         if (s->n_cust > 16) s->n_cust = 16;
     }
