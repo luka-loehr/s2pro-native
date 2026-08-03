@@ -175,8 +175,8 @@ s2p_status s2pd_inc_push(s2pd_inc* s,
  * stage-walk; weight-bearing kernels run batched (per-session pointer
  * tables, weights read once), stateful and element-wise ops loop per
  * session. Output is bit-identical per stream to sequential pushes. */
-s2p_status s2pd_inc_push_batch(s2pd_inc* const* ss, int nb,
-                               const int32_t* frame_codes /* [nb][10] */,
+s2p_status s2pd_inc_push_batch(s2pd_inc* const* ss, int nb, int tn,
+                               const int32_t* frame_codes /* [nb][tn][10] */,
                                cudaStream_t st);
 s2p_status s2pd_inc_push_async(s2pd_inc* s, const int32_t* frame_codes,
                                int tn, cudaStream_t stream);

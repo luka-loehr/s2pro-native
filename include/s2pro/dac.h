@@ -46,6 +46,10 @@ s2p_status s2p_dac_stream_push_async(s2p_dac_stream* s,
                                      const int32_t
                                          frame_codes[S2P_NUM_CODEBOOKS],
                                      cudaStream_t stream);
+s2p_status s2p_dac_stream_push_batch(s2p_dac_stream* const* strs, int nb,
+                                     const int32_t* frame_codes
+                                     /* [nb][S2P_NUM_CODEBOOKS] */,
+                                     cudaStream_t stream);
 s2p_status s2p_dac_stream_collect(s2p_dac_stream* s, float** pcm_chunk,
                                   int64_t* n_out, cudaStream_t stream);
 s2p_status s2p_dac_stream_finish(s2p_dac_stream* s, float** pcm_chunk,
