@@ -32,12 +32,17 @@ typedef struct {
     int64_t nbytes;     /* byte length (= 4 * prod(dims)) */
     int     ndim;       /* 1..4 */
     int64_t d[4];       /* dims, row-major; unused trail = 1 */
+    int64_t h_off;      /* f16 storage: byte offset into base_h, else -1 */
+    int64_t f_off;      /* f32 keeper arena offset, else -1 */
 } s2p_dacw_ent;
 
 typedef struct {
     s2p_dacw_ent* ents;   /* sorted as listed in codec.idx */
     int           n_ents;
-    float*        base;   /* device buffer holding all of codec.bin */
+    float*        base;   /* device f32 blob; freed after f16 conversion */
+    void*         base_h; /* f16 weights (conv/matmul w-class tensors) */
+    float*        base_f; /* f32 keepers (biases, alphas, norms, codebooks) */
+    int           f16;    /* conversion active (S2P_DAC_F32=1 disables) */
     int64_t       total_bytes;
 } s2p_dacw;
 
@@ -171,17 +176,26 @@ s2p_status s2pd_inc_collect(s2pd_inc* s, float* pcm_host, int64_t* n_out,
 /* All launchers enqueue on `st` and return cudaPeekAtLastError().           */
 
 /* decoder.cu — shared primitives */
+/* conv/matmul weights are void*: f32, or f16 when the load-time conversion
+ * ran (s2pdk_weights_f16 selects the kernel instantiation globally). */
 cudaError_t s2pdk_conv1d(const float* in, int cin, int tin,
-                         const float* w, const float* b, int cout,
+                         const void* w, const float* b, int cout,
                          int k, int dil, int stride, int leftpad,
                          float* out, int tout, cudaStream_t st);
 cudaError_t s2pdk_dwconv1d(const float* in, int c, int tin,
-                           const float* w, const float* b, int k, int leftpad,
+                           const void* w, const float* b, int k, int leftpad,
                            float* out, int tout, cudaStream_t st);
 cudaError_t s2pdk_tconv1d(const float* in, int cin, int tin,
-                          const float* w, const float* b, int cout,
+                          const void* w, const float* b, int cout,
                           int k, int stride, float* out, int tout,
                           cudaStream_t st);
+void        s2pdk_weights_f16(int on);
+cudaError_t s2pdk_conv1d_w32(const float* in, int cin, int tin,
+                             const void* w, const float* b, int cout, int k,
+                             int dil, int stride, int leftpad, float* out,
+                             int tout, cudaStream_t st);
+cudaError_t s2pdk_f32_to_f16(const float* src, void* dst, int64_t n,
+                             cudaStream_t st);
 cudaError_t s2pdk_snake(const float* in, float* out, const float* alpha,
                         int c, int t, cudaStream_t st);
 cudaError_t s2pdk_tanh_ip(float* x, int64_t n, cudaStream_t st);
@@ -194,7 +208,7 @@ cudaError_t s2pdk_rmsnorm(const float* in, const float* w, float eps,
 cudaError_t s2pdk_layernorm_ip(float* x, const float* w, const float* b,
                                float eps, int t, int c, cudaStream_t st);
 cudaError_t s2pdk_matmul(const float* a, int m, int k,
-                         const float* w, int n, const float* bias,
+                         const void* w, int n, const float* bias,
                          float* out, cudaStream_t st);
 cudaError_t s2pdk_rope_ip(float* x, int t, int heads, int hd, int row_stride,
                           const float* tab, cudaStream_t st);
