@@ -247,7 +247,7 @@ static void finish_stream(s2p_sched* s, sched_active* a) {
 /* Handle one decoded frame for an active session. Retires on EOS / error /
  * client-gone / frame cap. */
 static void handle_frame(s2p_sched* s, sched_active* a,
-                         const int32_t codes[S2P_NUM_CODEBOOKS], int is_eos) {
+                         const int32_t codes[S2P_NUM_CODEBOOKS], int is_eos, int do_push) {
     if (is_eos) {
         finish_stream(s, a);
         return;
@@ -264,12 +264,15 @@ static void handle_frame(s2p_sched* s, sched_active* a,
     /* Pipelined: collect the PREVIOUS frame's chunk (sync custream — its
      * decode overlapped this frame's backbone step), enqueue THIS frame on
      * custream so the DAC works through the next backbone step, then spend
-     * host time on delivery while the GPU runs. */
+     * host time on delivery while the GPU runs. In batched-DAC mode the
+     * push happens OUTSIDE, one s2p_dac_stream_push_batch for the whole
+     * tick (do_push == 0 here); the first-frame eager collect then also
+     * runs outside, after that batched push. */
     float*  chunk = NULL;
     int64_t n = 0;
     s2p_status rc = s2p_dac_stream_collect(a->dstream, &chunk, &n,
                                            a->cust);
-    if (rc == S2P_OK)
+    if (rc == S2P_OK && do_push)
         rc = s2p_dac_stream_push_async(a->dstream, codes, a->cust);
     if (rc != S2P_OK) {
         fprintf(stderr, "[s2pro] sched: dac push failed (%d) req %llu\n",
@@ -279,7 +282,7 @@ static void handle_frame(s2p_sched* s, sched_active* a,
         retire(s, a, 0);
         return;
     }
-    if (a->frames == 1) {
+    if (a->frames == 1 && do_push) {
         /* TTFA: the very first frame is collected eagerly instead of riding
          * the one-frame pipeline delay. */
         free(chunk);
@@ -495,6 +498,17 @@ static void kvc_insert(s2p_sched* s, const char* key, int n_sys,
             slot->name, n_sys, (double)bytes / 1e6);
 }
 
+
+/* S2P_DAC_BATCH=0 disables the cross-session batched DAC push (A/B). */
+static int dac_batch_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("S2P_DAC_BATCH");
+        v = (e && e[0] == '0' && e[1] == '\0') ? 0 : 1;
+    }
+    return v;
+}
+
 /* ------------------------------------------------------------ worker loop */
 
 static void* worker_main(void* arg) {
@@ -535,7 +549,10 @@ static void* worker_main(void* arg) {
                 req_free(r);
                 continue;
             }
-            slot->cust = s->custreams[slot_ix % s->n_cust];
+            slot->cust = dac_batch_on()
+                             ? s->custreams[0] /* batched pushes + collects
+                                                * share one stream */
+                             : s->custreams[slot_ix % s->n_cust];
             pthread_mutex_unlock(&s->mu);
             int started = start_request(s, r, slot);
             pthread_mutex_lock(&s->mu);
@@ -625,7 +642,7 @@ static void* worker_main(void* arg) {
                 retire(s, a, 0);
                 continue;
             }
-            handle_frame(s, a, codes, eos);
+            handle_frame(s, a, codes, eos, 1);
         }
 
         /* Lockstep: advance every remaining active session one frame. */
@@ -651,7 +668,56 @@ static void* worker_main(void* arg) {
                 for (int i = 0; i < n; i++)
                     handle_frame(s, batch_slot[i],
                                  &batch_codes[i * S2P_NUM_CODEBOOKS],
-                                 batch_eos[i]);
+                                 batch_eos[i], !dac_batch_on());
+                if (dac_batch_on()) {
+                    /* one batched DAC push for every slot that survived
+                     * handle_frame and emitted codes this tick */
+                    s2p_dac_stream* bstr[64];
+                    sched_active*   bact[64];
+                    int32_t bcodes[64 * S2P_NUM_CODEBOOKS];
+                    int bn = 0;
+                    for (int i = 0; i < n; i++) {
+                        sched_active* a = batch_slot[i];
+                        if (!a->req || batch_eos[i]) continue;
+                        bstr[bn] = a->dstream;
+                        bact[bn] = a;
+                        memcpy(bcodes + (size_t)bn * S2P_NUM_CODEBOOKS,
+                               &batch_codes[i * S2P_NUM_CODEBOOKS],
+                               S2P_NUM_CODEBOOKS * sizeof(int32_t));
+                        bn++;
+                    }
+                    if (bn > 0) {
+                        s2p_status prc = s2p_dac_stream_push_batch(
+                            bstr, bn, bcodes, s->custreams[0]);
+                        if (prc != S2P_OK) {
+                            fprintf(stderr, "[s2pro] sched: batched dac "
+                                    "push failed (%d)\n", (int)prc);
+                            for (int g = 0; g < bn; g++) {
+                                (void)deliver(s, bact[g]->req, NULL, 0, 1);
+                                retire(s, bact[g], 0);
+                            }
+                        } else {
+                            /* first-frame eager collect now that the
+                             * batched push carried it */
+                            for (int g = 0; g < bn; g++) {
+                                sched_active* a = bact[g];
+                                if (a->frames != 1) continue;
+                                float* ch = NULL;
+                                int64_t cn = 0;
+                                if (s2p_dac_stream_collect(
+                                        a->dstream, &ch, &cn,
+                                        s->custreams[0]) == S2P_OK) {
+                                    if (deliver_chunk(s, a->req, ch, cn,
+                                                      0) != 0)
+                                        retire(s, a, 0);
+                                } else {
+                                    (void)deliver(s, a->req, NULL, 0, 1);
+                                    retire(s, a, 0);
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
         pthread_mutex_lock(&s->mu);

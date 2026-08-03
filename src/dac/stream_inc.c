@@ -461,15 +461,15 @@ static s2p_status btab_ensure(s2p_dac* d, int nb) {
 #define TB(t) ((const float* const*)(d->btab_dev + (size_t)(t) * nb))
 #define TBO(t) ((float* const*)(d->btab_dev + (size_t)(t) * nb))
 
-s2p_status s2pd_inc_push_batch(s2pd_inc* const* ss, int nb,
+s2p_status s2pd_inc_push_batch(s2pd_inc* const* ss, int nb, int tn,
                                const int32_t* frame_codes, cudaStream_t st) {
-    if (!ss || !frame_codes || nb < 1) return S2P_ERR_INVALID;
+    if (!ss || !frame_codes || nb < 1 || tn < 1 || tn > INC_MAX_TN)
+        return S2P_ERR_INVALID;
     if (nb == 1) {
-        S2P_TRY(s2pd_inc_push_async(ss[0], frame_codes, 1, st));
+        S2P_TRY(s2pd_inc_push_async(ss[0], frame_codes, tn, st));
         return S2P_OK;
     }
     s2p_dac* d = ss[0]->dac;
-    const int tn = 1;
     int64_t max_pos = 0;
     for (int i = 0; i < nb; i++) {
         if (!ss[i] || ss[i]->dac != d) return S2P_ERR_INVALID;
@@ -512,15 +512,20 @@ s2p_status s2pd_inc_push_batch(s2pd_inc* const* ss, int nb,
     }
     for (int i = 0; i < nb; i++) {
         s2pd_inc* c = ss[i];
-        int32_t cl[S2P_NUM_CODEBOOKS];
-        const int32_t* fc = frame_codes + (size_t)i * S2P_NUM_CODEBOOKS;
-        int32_t v = fc[0];
-        cl[0] = v < 0 ? 0 : (v > S2P_CB_SIZE - 1 ? S2P_CB_SIZE - 1 : v);
-        for (int q = 1; q < S2P_NUM_CODEBOOKS; q++) {
-            v = fc[q];
-            cl[q] = v < 0 ? 0 : (v > 1023 ? 1023 : v);
+        int32_t cl[S2P_NUM_CODEBOOKS * INC_MAX_TN];
+        const int32_t* fc =
+            frame_codes + (size_t)i * tn * S2P_NUM_CODEBOOKS;
+        for (int t = 0; t < tn; t++) {
+            int32_t v = fc[(size_t)t * S2P_NUM_CODEBOOKS];
+            cl[t] = v < 0 ? 0 : (v > S2P_CB_SIZE - 1 ? S2P_CB_SIZE - 1 : v);
+            for (int q = 1; q < S2P_NUM_CODEBOOKS; q++) {
+                v = fc[(size_t)t * S2P_NUM_CODEBOOKS + q];
+                cl[(size_t)q * tn + t] = v < 0 ? 0 : (v > 1023 ? 1023 : v);
+            }
         }
-        S2P_CUDA_TRY(cudaMemcpyAsync(c->codes_dev, cl, sizeof(cl),
+        S2P_CUDA_TRY(cudaMemcpyAsync(c->codes_dev, cl,
+                                     (size_t)S2P_NUM_CODEBOOKS * tn *
+                                         sizeof(int32_t),
                                      cudaMemcpyHostToDevice, st));
         S2P_CUDA_TRY(s2pdk_rvq_from_indices(c->codes_dev, tn, tabs, c->bx,
                                             st));
