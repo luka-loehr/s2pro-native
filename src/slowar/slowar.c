@@ -321,8 +321,14 @@ s2p_status s2p_session_prefill(s2p_session* s, const int64_t* ids,
     }
 
     /* input embeddings + interleaved VQ injection (PORTING pitfall 7) */
-    S2P_CUDA_TRY(s2pk_embed(BF(m->embed), (const int64_t*)m->sids.data,
-                            BF(m->sx), n_ids, S2P_DIM, st));
+    if (m->embed_i8_only)
+        S2P_CUDA_TRY(s2pk_embed_i8((const int8_t*)m->embed_i8.data,
+                                   (const float*)m->embed_scale.data,
+                                   (const int64_t*)m->sids.data, BF(m->sx),
+                                   n_ids, S2P_DIM, st));
+    else
+        S2P_CUDA_TRY(s2pk_embed(BF(m->embed), (const int64_t*)m->sids.data,
+                                BF(m->sx), n_ids, S2P_DIM, st));
     for (int p = 0; p < n_parts; p++) {
         const int T = parts[p].T;
         __nv_bfloat16* rows0 = BF(m->sx) + (size_t)part_start[p] * S2P_DIM;
@@ -459,9 +465,15 @@ static s2p_status decode_tick_enqueue(s2p_model* m, s2p_session* const* act,
         refs.max_len = max_len;
 
         /* embed fed-back token + previous-frame VQ sum, * 1/sqrt(11) */
-        S2P_CUDA_TRY(s2pk_embed(BF(m->embed),
-                                (const int64_t*)(d + m->up.off_ids), BF(m->sx),
-                                bd, S2P_DIM, st));
+        if (m->embed_i8_only)
+            S2P_CUDA_TRY(s2pk_embed_i8((const int8_t*)m->embed_i8.data,
+                                       (const float*)m->embed_scale.data,
+                                       (const int64_t*)(d + m->up.off_ids),
+                                       BF(m->sx), bd, S2P_DIM, st));
+        else
+            S2P_CUDA_TRY(s2pk_embed(BF(m->embed),
+                                    (const int64_t*)(d + m->up.off_ids),
+                                    BF(m->sx), bd, S2P_DIM, st));
         for (int r = 0; r < nruns; r++)
             S2P_TRY(s2pfa_vq_embed_add_dev(
                 m->fastar,
@@ -495,6 +507,21 @@ static s2p_status decode_tick_enqueue(s2p_model* m, s2p_session* const* act,
                               m->embed_i8.data,
                               (const float*)m->embed_scale.data, nact,
                               S2P_TEXT_VOCAB, S2P_DIM, st));
+    else if (m->embed_i8_only)
+        /* bf16 table dropped: serve oversize batches from the sidecar in
+         * GEMV-width chunks (M uniform per call) */
+        for (int m0 = 0; m0 < nact; m0 += S2P_INT8_GEMV_MAX_M) {
+            const int mm = nact - m0 > S2P_INT8_GEMV_MAX_M
+                               ? S2P_INT8_GEMV_MAX_M
+                               : nact - m0;
+            S2P_TRY(s2p_int8_gemv(
+                (char*)m->slogits.data +
+                    (size_t)m0 * S2P_TEXT_VOCAB * sizeof(uint16_t),
+                (const char*)m->shidden.data +
+                    (size_t)m0 * S2P_DIM * sizeof(uint16_t),
+                m->embed_i8.data, (const float*)m->embed_scale.data, mm,
+                S2P_TEXT_VOCAB, S2P_DIM, st));
+        }
     else
         S2P_TRY(s2p_gemm_bf16(m->shidden.data, m->embed.data, m->slogits.data,
                               nact, S2P_TEXT_VOCAB, S2P_DIM, st));
