@@ -127,6 +127,54 @@ s2p_status s2p_dac_stream_push_async(s2p_dac_stream* s,
                                stream);
 }
 
+/* Cross-session batched push: appends each stream's frame to its
+ * accumulator, then flushes ready streams together — streams sharing the
+ * same accumulated tn flush as ONE s2pd_inc_push_batch (weights read once
+ * for the whole group); odd sizes (first-frame TTFA flushes) go
+ * individually. All streams must push on the SAME cuda stream. */
+s2p_status s2p_dac_stream_push_batch(s2p_dac_stream* const* strs, int nb,
+                                     const int32_t* frame_codes,
+                                     cudaStream_t stream) {
+    if (!strs || !frame_codes || nb < 1) return S2P_ERR_INVALID;
+    for (int i = 0; i < nb; i++) {
+        s2p_dac_stream* t = strs[i];
+        if (!t || t->finished) return S2P_ERR_INVALID;
+        if (!t->inc)
+            return s2p_dac_stream_push_async(
+                t, frame_codes + (size_t)i * S2P_NUM_CODEBOOKS, stream);
+        memcpy(t->bat[t->bat_n],
+               frame_codes + (size_t)i * S2P_NUM_CODEBOOKS,
+               S2P_NUM_CODEBOOKS * sizeof(int32_t));
+        t->bat_n++;
+    }
+    /* group ready streams by tn */
+    for (int tn = 1; tn <= STREAM_BATCH_MAX; tn++) {
+        s2pd_inc* incs[64];
+        s2p_dac_stream* grp[64];
+        static int32_t packed[64 * STREAM_BATCH_MAX * S2P_NUM_CODEBOOKS];
+        int gn = 0;
+        for (int i = 0; i < nb && gn < 64; i++) {
+            s2p_dac_stream* t = strs[i];
+            int target = t->first_flushed ? stream_batch() : 1;
+            if (t->bat_n != tn || t->bat_n < target) continue;
+            incs[gn] = t->inc;
+            grp[gn] = t;
+            memcpy(packed + (size_t)gn * tn * S2P_NUM_CODEBOOKS,
+                   &t->bat[0][0],
+                   (size_t)tn * S2P_NUM_CODEBOOKS * sizeof(int32_t));
+            gn++;
+        }
+        if (gn == 0) continue;
+        s2p_status rc = s2pd_inc_push_batch(incs, gn, tn, packed, stream);
+        if (rc != S2P_OK) return rc;
+        for (int g = 0; g < gn; g++) {
+            grp[g]->bat_n = 0;
+            grp[g]->first_flushed = 1;
+        }
+    }
+    return S2P_OK;
+}
+
 s2p_status s2p_dac_stream_collect(s2p_dac_stream* s, float** pcm_chunk,
                                   int64_t* n_out, cudaStream_t stream) {
     if (!s || !pcm_chunk || !n_out) return S2P_ERR_INVALID;
