@@ -32,6 +32,7 @@
 #include "s2pro/tokenizer.h"
 #include "s2pro/wav.h"
 #include "s2pro/scheduler.h"
+#include "s2pro/voices.h"
 
 #define SCHED_QUEUE_DEPTH_DEFAULT 32
 /* Hard per-request frame cap (~ 3.2 min of audio); the model additionally
@@ -64,9 +65,22 @@ typedef struct {
     sched_req*      req;     /* NULL => slot free */
     s2p_session*    sess;
     s2p_dac_stream* dstream;
+    cudaStream_t    cust;    /* this slot's DAC stream (pool round-robin) */
     uint64_t        frames;
     int             fresh;   /* needs its priority first frame */
     int             done;    /* retire at next lock acquisition */
+    /* chunked prefill plan (owned by the slot until pf_pos == pf_len):
+     * the worker advances at most one chunk per tick, so a joining
+     * stream never stalls the running ones for a whole prompt. */
+    int          prefilling;
+    int64_t*     pf_ids;
+    uint8_t*     pf_mask;      /* NULL for cache-seeded suffixes */
+    s2p_vq_part* pf_parts;
+    int*         pf_part_start;
+    int          pf_nparts;
+    int          pf_len, pf_pos, pf_next_part;
+    int          pf_nsys;      /* cache-insert point (0 = not cacheable) */
+    int          pf_inserted;
 } sched_active;
 
 struct s2p_sched {
@@ -90,7 +104,12 @@ struct s2p_sched {
     int       running;
     int       stop;
 
-    cudaStream_t custream; /* DAC stream work */
+    cudaStream_t custreams[16]; /* DAC stream pool (S2P_DAC_STREAMS):
+                                 * per-slot streams overlap different
+                                 * sessions' vocoder kernels, so the conv
+                                 * weight tiles are shared through L2
+                                 * instead of re-read per stream */
+    int          n_cust;
 
     /* KV prefix cache: the per-voice system block (reference VQ included)
      * prefills once; later requests seed their session KV from the blob and
@@ -102,7 +121,7 @@ struct s2p_sched {
         int      P;        /* prefix token count */
         void*    blob;     /* device */
         uint64_t last_use;
-    } kvc[16];
+    } kvc[40];
     int      kvc_cap;
     uint64_t kvc_tick;
 };
@@ -178,11 +197,15 @@ static int deliver_chunk(s2p_sched* s, sched_req* r, float* pcm_f, int64_t n,
 static void retire(s2p_sched* s, sched_active* a, int done_ok) {
     if (a->sess) s2p_session_destroy(a->sess);
     if (a->dstream) {
-        /* a pipelined DAC frame may still be in flight on custream and its
-         * kernels reference the stream state freed next */
-        cudaStreamSynchronize(s->custream);
+        /* a pipelined DAC frame may still be in flight on this slot's
+         * stream and its kernels reference the state freed next */
+        if (a->cust) cudaStreamSynchronize(a->cust);
         s2p_dac_stream_destroy(a->dstream);
     }
+    free(a->pf_ids);
+    free(a->pf_mask);
+    free(a->pf_parts);
+    free(a->pf_part_start);
     pthread_mutex_lock(&s->mu);
     /* If a cancel() is still waiting on in_cb it holds a pointer to req, but
      * deliver() cleared in_cb before we got here, so freeing is safe. */
@@ -199,7 +222,7 @@ static void retire(s2p_sched* s, sched_active* a, int done_ok) {
 static void finish_stream(s2p_sched* s, sched_active* a) {
     float*  prev = NULL;
     int64_t pn = 0;
-    if (s2p_dac_stream_collect(a->dstream, &prev, &pn, s->custream) == S2P_OK &&
+    if (s2p_dac_stream_collect(a->dstream, &prev, &pn, a->cust) == S2P_OK &&
         pn > 0) {
         if (deliver_chunk(s, a->req, prev, pn, 0) != 0) {
             retire(s, a, 0); /* client gone mid-finish */
@@ -210,7 +233,7 @@ static void finish_stream(s2p_sched* s, sched_active* a) {
     }
     float*  tail = NULL;
     int64_t n = 0;
-    s2p_status rc = s2p_dac_stream_finish(a->dstream, &tail, &n, s->custream);
+    s2p_status rc = s2p_dac_stream_finish(a->dstream, &tail, &n, a->cust);
     if (rc != S2P_OK) {
         fprintf(stderr, "[s2pro] sched: dac stream finish failed (%d) req %llu\n",
                 (int)rc, (unsigned long long)a->req->id);
@@ -245,9 +268,9 @@ static void handle_frame(s2p_sched* s, sched_active* a,
     float*  chunk = NULL;
     int64_t n = 0;
     s2p_status rc = s2p_dac_stream_collect(a->dstream, &chunk, &n,
-                                           s->custream);
+                                           a->cust);
     if (rc == S2P_OK)
-        rc = s2p_dac_stream_push_async(a->dstream, codes, s->custream);
+        rc = s2p_dac_stream_push_async(a->dstream, codes, a->cust);
     if (rc != S2P_OK) {
         fprintf(stderr, "[s2pro] sched: dac push failed (%d) req %llu\n",
                 (int)rc, (unsigned long long)a->req->id);
@@ -262,7 +285,7 @@ static void handle_frame(s2p_sched* s, sched_active* a,
         free(chunk);
         chunk = NULL;
         n = 0;
-        rc = s2p_dac_stream_collect(a->dstream, &chunk, &n, s->custream);
+        rc = s2p_dac_stream_collect(a->dstream, &chunk, &n, a->cust);
         if (rc != S2P_OK) {
             (void)deliver(s, a->req, NULL, 0, 1);
             retire(s, a, 0);
@@ -342,32 +365,59 @@ static int start_request(s2p_sched* s, sched_req* r, sched_active* slot) {
 
     s2p_session* sess = NULL;
     rc = s2p_session_create(s->model, &r->sampling, &sess);
+    int plan_off = 0;
     if (rc == S2P_OK) {
         struct kvc_entry* hit = kvc_lookup(s, r->cache_key, n_sys);
         if (hit != NULL) {
-            /* seed the constant system block from the cache, prefill only
-             * the user turn (all VQ parts live inside the prefix) */
+            /* seed the constant system block from the cache; only the
+             * user turn remains to prefill (no VQ outside the prefix) */
             rc = s2p_session_kv_load(sess, hit->blob, hit->P);
-            if (rc == S2P_OK)
-                rc = s2p_session_prefill(sess, ids + n_sys, NULL,
-                                         n_ids - n_sys, NULL, 0);
-        } else {
-            rc = s2p_session_prefill(sess, ids, vq_mask, n_ids, parts,
-                                     n_parts);
-            if (rc == S2P_OK) kvc_insert(s, r->cache_key, n_sys, sess);
+            plan_off = n_sys;
         }
         if (rc != S2P_OK) {
             s2p_session_destroy(sess);
             sess = NULL;
         }
     }
-    free(ids);
-    free(vq_mask);
-    free(parts);
     if (rc != S2P_OK) {
-        fprintf(stderr, "[s2pro] sched: prefill failed (%d) req %llu\n",
-                (int)rc, (unsigned long long)r->id);
+        free(ids); free(vq_mask); free(parts);
+        fprintf(stderr, "[s2pro] sched: session/kv-seed failed (%d) req "
+                "%llu\n", (int)rc, (unsigned long long)r->id);
         goto fail_cb;
+    }
+    /* chunked-prefill plan: the worker loop advances it between ticks */
+    slot->prefilling = 1;
+    slot->pf_ids = ids;
+    slot->pf_mask = plan_off ? NULL : vq_mask;
+    slot->pf_parts = plan_off ? NULL : parts;
+    slot->pf_nparts = plan_off ? 0 : n_parts;
+    slot->pf_len = n_ids - plan_off;
+    slot->pf_pos = 0;
+    slot->pf_next_part = 0;
+    slot->pf_nsys = plan_off ? 0 : n_sys;
+    slot->pf_inserted = 0;
+    if (plan_off) {
+        /* shift the suffix to the front so pf_ids stays the free() ptr */
+        memmove(ids, ids + plan_off, (size_t)(n_ids - plan_off) *
+                sizeof(int64_t));
+        free(vq_mask);
+        free(parts);
+    }
+    slot->pf_part_start = NULL;
+    if (slot->pf_nparts > 0) {
+        slot->pf_part_start =
+            (int*)malloc((size_t)slot->pf_nparts * sizeof(int));
+        if (!slot->pf_part_start) {
+            free(slot->pf_ids); free(slot->pf_mask); free(slot->pf_parts);
+            s2p_session_destroy(sess);
+            goto fail_cb;
+        }
+        int cur = 0;
+        for (int p = 0; p < slot->pf_nparts; p++) {
+            while (cur < slot->pf_len && !slot->pf_mask[cur]) cur++;
+            slot->pf_part_start[p] = cur;
+            cur += slot->pf_parts[p].T;
+        }
     }
 
     s2p_dac_stream* dstream = NULL;
@@ -383,7 +433,7 @@ static int start_request(s2p_sched* s, sched_req* r, sched_active* slot) {
     slot->sess = sess;
     slot->dstream = dstream;
     slot->frames = 0;
-    slot->fresh = 1;
+    slot->fresh = 0; /* set when the prefill plan completes */
     slot->done = 0;
     return 1;
 
@@ -475,14 +525,17 @@ static void* worker_main(void* arg) {
                 continue;
             }
             sched_active* slot = NULL;
+            int slot_ix = 0;
             for (int i = 0; i < s->max_sessions; i++)
-                if (!s->active[i].req) { slot = &s->active[i]; break; }
+                if (!s->active[i].req) { slot = &s->active[i]; slot_ix = i;
+                                         break; }
             if (!slot) { /* invariant guard; cannot happen */
                 fprintf(stderr, "[s2pro] sched: no free slot despite "
                         "n_active=%d\n", s->n_active);
                 req_free(r);
                 continue;
             }
+            slot->cust = s->custreams[slot_ix % s->n_cust];
             pthread_mutex_unlock(&s->mu);
             int started = start_request(s, r, slot);
             pthread_mutex_lock(&s->mu);
@@ -498,6 +551,63 @@ static void* worker_main(void* arg) {
             continue;
         }
         pthread_mutex_unlock(&s->mu);
+
+        /* Chunked prefill: advance ONE chunk of ONE joining stream per
+         * tick (round-robin). Chunks are S2P_PREFILL_CHUNK ids (default
+         * 96) extended so a VQ run never splits (its parts are cb-major
+         * per run and must arrive whole). Completion sets fresh=1; the
+         * cacheable prefix is snapshotted the moment it is resident. */
+        {
+            static int pf_chunk = 0;
+            if (pf_chunk == 0) {
+                const char* e = getenv("S2P_PREFILL_CHUNK");
+                pf_chunk = e ? atoi(e) : 96;
+                if (pf_chunk < 16 || pf_chunk > 4096) pf_chunk = 96;
+            }
+            static int rr = 0;
+            for (int scan = 0; scan < s->max_sessions; scan++) {
+                sched_active* a = &s->active[(rr + scan) % s->max_sessions];
+                if (!a->req || !a->prefilling) continue;
+                rr = (rr + scan + 1) % s->max_sessions;
+                int aof = a->pf_pos;
+                int b = aof + pf_chunk;
+                if (b > a->pf_len) b = a->pf_len;
+                if (a->pf_mask)
+                    while (b < a->pf_len && a->pf_mask[b]) b++;
+                int p0 = a->pf_next_part, np = 0;
+                while (p0 + np < a->pf_nparts &&
+                       a->pf_part_start[p0 + np] < b)
+                    np++;
+                s2p_status prc = s2p_session_prefill(
+                    a->sess, a->pf_ids + aof,
+                    a->pf_mask ? a->pf_mask + aof : NULL, b - aof,
+                    np > 0 ? a->pf_parts + p0 : NULL, np);
+                if (prc != S2P_OK) {
+                    fprintf(stderr, "[s2pro] sched: prefill chunk failed "
+                            "(%d) req %llu\n", (int)prc,
+                            (unsigned long long)a->req->id);
+                    (void)deliver(s, a->req, NULL, 0, 1);
+                    retire(s, a, 0);
+                    break;
+                }
+                a->pf_pos = b;
+                a->pf_next_part = p0 + np;
+                if (!a->pf_inserted && a->pf_nsys > 0 &&
+                    a->pf_pos >= a->pf_nsys) {
+                    kvc_insert(s, a->req->cache_key, a->pf_nsys, a->sess);
+                    a->pf_inserted = 1;
+                }
+                if (a->pf_pos >= a->pf_len) {
+                    a->prefilling = 0;
+                    a->fresh = 1;
+                    free(a->pf_ids); a->pf_ids = NULL;
+                    free(a->pf_mask); a->pf_mask = NULL;
+                    free(a->pf_parts); a->pf_parts = NULL;
+                    free(a->pf_part_start); a->pf_part_start = NULL;
+                }
+                break; /* one chunk per tick */
+            }
+        }
 
         /* Priority first frame: freshly prefilled sessions step alone so
          * their TTFA is not gated on the lockstep rendezvous. */
@@ -522,7 +632,7 @@ static void* worker_main(void* arg) {
         int n = 0;
         for (int i = 0; i < s->max_sessions; i++) {
             sched_active* a = &s->active[i];
-            if (!a->req || a->fresh) continue;
+            if (!a->req || a->fresh || a->prefilling) continue;
             batch_slot[n] = a;
             batch_sess[n] = a->sess;
             n++;
@@ -577,6 +687,50 @@ static void* worker_main(void* arg) {
 
 /* ------------------------------------------------------------- public API */
 
+/* Pre-warm the KV-prefix cache for every registry voice: build each
+ * voice's system-block prompt, prefill it once, snapshot, drop the
+ * session. Call BEFORE serving traffic (the worker must be idle: this
+ * runs GPU work and touches the worker-owned cache from the caller). */
+s2p_status s2p_sched_warm_voices(s2p_sched* s, const s2p_voices* v) {
+    if (!s || !v) return S2P_ERR_INVALID;
+    int warmed = 0;
+    for (int i = 0; i < s2p_voices_count(v) && i < s->kvc_cap; i++) {
+        const s2p_voice* vc = s2p_voices_at(v, i);
+        s2p_request_text rt;
+        memset(&rt, 0, sizeof(rt));
+        rt.text = "";
+        rt.ref_text = vc->transcript;
+        s2p_vq_part part = vc->part;
+        rt.refs = &part;
+        rt.n_refs = 1;
+        rt.cache_key = vc->name;
+        int64_t* ids = NULL;
+        uint8_t* mask = NULL;
+        s2p_vq_part* parts = NULL;
+        int n_ids = 0, n_parts = 0, n_sys = 0;
+        if (s2p_prompt_build(s->tok, s->cfg, &rt, &ids, &mask, &n_ids,
+                             &parts, &n_parts, &n_sys) != S2P_OK)
+            continue;
+        s2p_session* sess = NULL;
+        s2p_sampling_cfg samp;
+        memset(&samp, 0, sizeof(samp));
+        if (n_sys > 0 &&
+            s2p_session_create(s->model, &samp, &sess) == S2P_OK) {
+            if (s2p_session_prefill(sess, ids, mask, n_sys, parts,
+                                    n_parts) == S2P_OK) {
+                kvc_insert(s, vc->name, n_sys, sess);
+                warmed++;
+            }
+            s2p_session_destroy(sess);
+        }
+        free(ids);
+        free(mask);
+        free(parts);
+    }
+    fprintf(stderr, "[s2pro] sched: %d voice prefixes pre-warmed\n", warmed);
+    return S2P_OK;
+}
+
 s2p_status s2p_sched_create(s2p_model* m, s2p_dac* d, s2p_tok* t,
                             const s2p_config* cfg, const s2p_sched_opts* opts,
                             s2p_sched** out) {
@@ -592,12 +746,13 @@ s2p_status s2p_sched_create(s2p_model* m, s2p_dac* d, s2p_tok* t,
     s->queue_depth = (opts && opts->queue_depth > 0) ? opts->queue_depth
                                                      : SCHED_QUEUE_DEPTH_DEFAULT;
     s->next_id = 1;
-    s->kvc_cap = 4; /* KV-prefix cache entries; ~190 MB per 60 s voice */
+    s->kvc_cap = 36; /* KV-prefix entries; ~94 MB per 60 s voice (KV8) —
+                       * sized for the whole registry so caches stay warm */
     {
         const char* e = getenv("S2P_KV_CACHE_VOICES");
         if (e && e[0]) s->kvc_cap = atoi(e);
         if (s->kvc_cap < 0) s->kvc_cap = 0;
-        if (s->kvc_cap > 16) s->kvc_cap = 16;
+        if (s->kvc_cap > 40) s->kvc_cap = 40; /* kvc[] array bound */
     }
     s->queue = (sched_req**)calloc((size_t)s->queue_depth, sizeof(*s->queue));
     s->active =
@@ -615,8 +770,16 @@ s2p_status s2p_sched_create(s2p_model* m, s2p_dac* d, s2p_tok* t,
         free(s);
         return S2P_ERR_INTERNAL;
     }
-    cudaError_t ce = cudaStreamCreateWithFlags(&s->custream,
-                                               cudaStreamNonBlocking);
+    {
+        const char* e = getenv("S2P_DAC_STREAMS");
+        s->n_cust = e ? atoi(e) : 8;
+        if (s->n_cust < 1) s->n_cust = 1;
+        if (s->n_cust > 16) s->n_cust = 16;
+    }
+    cudaError_t ce = cudaSuccess;
+    for (int i = 0; i < s->n_cust && ce == cudaSuccess; i++)
+        ce = cudaStreamCreateWithFlags(&s->custreams[i],
+                                       cudaStreamNonBlocking);
     if (ce != cudaSuccess) {
         fprintf(stderr, "[s2pro] sched: stream create: %s\n",
                 cudaGetErrorString(ce));
@@ -783,7 +946,8 @@ void s2p_sched_destroy(s2p_sched* s) {
         free(s->kvc[i].name);
         if (s->kvc[i].blob) cudaFree(s->kvc[i].blob);
     }
-    cudaStreamDestroy(s->custream);
+    for (int i = 0; i < s->n_cust; i++)
+        cudaStreamDestroy(s->custreams[i]);
     pthread_mutex_destroy(&s->mu);
     pthread_cond_destroy(&s->cv);
     free(s->queue);

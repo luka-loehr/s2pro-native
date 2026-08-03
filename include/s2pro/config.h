@@ -50,7 +50,7 @@ extern "C" {
 #define S2P_SEMANTIC_ID(cb0)     (S2P_TOK_SEMANTIC_START + (cb0))
 
 /* ---- Serving limits ---- */
-#define S2P_MAX_SESSIONS     8
+#define S2P_MAX_SESSIONS     16
 
 /* Runtime-loaded config (paths + anything only known at load time). */
 typedef struct s2p_config s2p_config;
