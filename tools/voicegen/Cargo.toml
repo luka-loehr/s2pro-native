@@ -10,7 +10,7 @@ description = "Generate s2pro-native reference voices with Gemini TTS on Vertex 
 
 [dependencies]
 anyhow = "1.0"
-base64 = "0.22"
+base64 = "0.23"
 # rustls-no-provider (not rustls) keeps aws-lc-sys and its C/asm build out of the
 # tree; the pure-Rust `ring` provider is installed once at startup instead.
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider", "http2"] }
