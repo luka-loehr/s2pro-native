@@ -1,0 +1,7 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /tools/voicegen
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
