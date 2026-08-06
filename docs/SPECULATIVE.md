@@ -90,18 +90,61 @@ produces in deployment, sampling temperature included.
 
 ## 5. Training and the metrics that decide
 
-Loss: SmoothL1 on the predicted hidden plus a KL term over the frozen
-head's 4,096 semantic logits; optional EAGLE-style uniform noise on the
-input hiddens (`--feat-noise`) regularizes against the draft's own
-prediction error compounding over multi-step proposals. Evaluation
-every 1,000 steps on the unseen-text takes reports three numbers:
+The recipe follows an external literature review (EAGLE-1
+arXiv:2401.15077 including its training code, EAGLE-3
+arXiv:2503.01840, HASS arXiv:2408.15766, Leviathan arXiv:2211.17192,
+and the NVIDIA NeMo drafter guide), adapted where our model differs:
+
+- **Loss**: SmoothL1 on the predicted hidden + KL over the frozen
+  head's 4,096 semantic rows. EAGLE's published 0.1 classification
+  weight is a magnitude normalizer for a 32k vocabulary, not a law;
+  both terms are logged separately and the weight is set so they land
+  within ~2× of each other (start 0.3 over our 4,096-row slice).
+- **Optimizer**: AdamW β = (0.9, 0.95), weight decay **0** — several
+  draft parameters are RMSNorm gains initialized from the backbone,
+  and decaying them toward zero corrupts a good init (a latent bug the
+  review caught in the first trainer version). lr 1e-4, 5 % linear
+  warmup, cosine to 0.1×, gradient clip 0.5.
+- **Schedule**: 8,000 steps × batch 8 × sequence 1,024 frames
+  (~8,200 frame-samples per step; ~6 epochs over the phase-1 corpus).
+- **Feature noise**: uniform ±0.05 on the input hiddens. EAGLE's
+  ±0.1 is relative to LLaMA's hidden scale and its own code scales it
+  with sequence length; ours is set from the measured statistics of
+  the final-normed hiddens (σ_global 0.52, mean per-dim σ 0.32 over
+  114k frames), i.e. ≈ 0.1 σ, sweep planned 0.1–0.3 σ.
+
+Evaluation every 1,000 steps, on held-out takes that are unseen BY
+TEXT and additionally split by unseen VOICE (three whole registry
+voices never appear in a training take), reports:
 
 1. **hidden cosine** — the regression target itself;
-2. **semantic argmax agreement** — the greedy acceptance proxy;
-3. **fast-AR chain rate** — fraction of positions where all nine
-   greedy codebook argmaxes from the predicted hidden equal those from
-   the true hidden. This bounds usable draft depth: expected accepted
-   frames per verify pass ≈ Σ_{i=1..k} (a_sem · a_chain)^i, and no
-   published TTS speculation number substitutes for measuring it here.
+2. **teacher-forced semantic argmax agreement** — the 0-depth
+   acceptance proxy, an upper bound only;
+3. **rollout α-curve (depth 1–4)** — the draft's own predicted hidden
+   is fed back for k steps (tokens stay the true trajectory's, the
+   EAGLE n-α definition), because teacher-forced numbers cannot see
+   the feature-error compounding that dominates real acceptance at
+   depth ≥ 2;
+4. **fast-AR chain rate per depth** — all nine greedy codebook
+   argmaxes from the predicted hidden must equal those from the true
+   hidden. This is the acceptance condition specific to a dual-AR
+   model; no published speculation work measures it.
+
+Draft depth target k = 4 (expected accepted frames per verify pass =
+(1−α^{k+1})/(1−α); below α ≈ 0.6 there is little return past k = 3).
+
+**Known risk, stated up front**: token-exact speculative decoding on
+audio tokens has a published failure — on LLaSA-8B a 5.2×-faster draft
+delivered a net 0.98× because near-ties among acoustic tokens rejected
+almost every proposal (arXiv:2511.13732); CosyVoice 2 needed relaxed
+acceptance for its 1.4× (arXiv:2505.15380). Our position is more
+favorable — the draft proposes 4,096-entry *semantic* tokens, exactly
+the codebook class VADUSA (arXiv:2410.13839) found predictable — but
+the honest sequence is: measure exact-acceptance α first; if the
+rollout curve lands below ~0.45, the documented fallback is
+similarity-group acceptance over the frozen head embeddings, not more
+recipe tuning. A regression-free second run (EAGLE-3's ablation
+attributes its data-scaling to dropping the feature loss) and
+multi-step training-time unrolling (HASS) are the queued follow-ups.
 
 Results are appended to this report as they are measured.
