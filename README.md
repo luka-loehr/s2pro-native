@@ -276,6 +276,7 @@ demands them, and a published release line.
 | [docs/DAC-KERNELS.md](docs/DAC-KERNELS.md) | report | vocoder kernel optimization, winning and losing designs |
 | [docs/QAT-RUNS.md](docs/QAT-RUNS.md) | report | QAT distillation runs: conditions, telemetry, results |
 | [docs/SERVING.md](docs/SERVING.md) | report | startup cache, launch-overhead result, concurrency limits |
+| [docs/SPECULATIVE.md](docs/SPECULATIVE.md) | report | speculative multi-frame decoding: draft model, corpus, training |
 | [benchmarks/parity/README.md](benchmarks/parity/README.md) | report | layer-parity protocol and per-path verdicts |
 | [docs/SPARK.md](docs/SPARK.md) | guide | build and deployment on the DGX Spark |
 | [docs/VOICES.md](docs/VOICES.md) | guide | the voice reference system and the accent constraint |
