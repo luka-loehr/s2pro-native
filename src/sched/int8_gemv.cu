@@ -21,6 +21,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_pipeline.h>
+#include <mma.h>
 
 #include "s2pro/status.h"
 #include "s2pro/gemm.h"
@@ -509,6 +510,105 @@ static __global__ void k_gemv_pp(__nv_bfloat16* y, const __nv_bfloat16* x,
 }
 
 
+
+/* ── Tensor-core batch path (S2P_GEMV_TC) ──
+ *
+ * Every bit-identical reorganization of the batch GEMV lost (SERVING.md
+ * §10): the batch cost is the O(M) FMA work itself, so the only way to
+ * serve it faster is the matrix units. This kernel runs the decode
+ * linears as bf16 WMMA (m16n16k16, f32 accumulators) with the INT4
+ * weights dequantized IN-REGISTER per 16x16 tile — no global dequant
+ * round-trip. The effective weight enters the MMA as
+ * bf16(w4 * group_scale), which is exactly the precision the prefill
+ * path has always used (k_dequant_p + cuBLAS bf16), and the summation
+ * order differs from the GEMV — so this path is NOT MD5-gated against
+ * the GEMV; it carries the full parity + listening gate instead, like
+ * every quantization stage before it.
+ *
+ * Shape: one block = 8 warps = 128 output channels; the x tile
+ * [16 rows x 64 K] is staged in shared memory once per chunk and feeds
+ * every warp's A fragment; rows beyond M are zero-filled and their C
+ * rows are never stored. Requires K % 64 == 0 (all serving K are
+ * multiples of 512). */
+#define TC_WARPS 8
+
+static __global__ void k_gemv_tc(__nv_bfloat16* y, const __nv_bfloat16* x,
+                                 const uint8_t* w, const __half* scales,
+                                 int M, int N, int K, int gshift) {
+    using namespace nvcuda;
+    __shared__ __nv_bfloat16 xs[16][64];
+    __shared__ __nv_bfloat16 ws[TC_WARPS][16][16];
+    __shared__ float cs[TC_WARPS][16][16];
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int n0 = (blockIdx.x * TC_WARPS + warp) * 16;
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> c;
+    wmma::fill_fragment(c, 0.0f);
+
+    for (int c0 = 0; c0 < K; c0 += 64) {
+        __syncthreads();
+        for (int i = threadIdx.x; i < 16 * 64; i += blockDim.x) {
+            const int m = i >> 6, k = i & 63;
+            xs[m][k] = (m < M) ? x[(size_t)m * K + c0 + k]
+                               : __float2bfloat16(0.0f);
+        }
+        __syncthreads();
+#pragma unroll
+        for (int sub = 0; sub < 4; sub++) {
+            const int kb = c0 + sub * 16;
+            if (lane < 16) { /* one lane dequants one weight row */
+                const int n = n0 + lane;
+                if (n < N) {
+                    const uint2 wv = *(const uint2*)(
+                        w + (size_t)n * (K >> 1) + (kb >> 1));
+                    int8_t w16[16];
+                    unpack16(w16, (const uint8_t*)&wv);
+                    const float gs = __half2float(
+                        scales[(size_t)n * (K >> gshift) + (kb >> gshift)]);
+#pragma unroll
+                    for (int j = 0; j < 16; j++)
+                        ws[warp][lane][j] =
+                            __float2bfloat16((float)w16[j] * gs);
+                } else {
+#pragma unroll
+                    for (int j = 0; j < 16; j++)
+                        ws[warp][lane][j] = __float2bfloat16(0.0f);
+                }
+            }
+            __syncwarp();
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16,
+                           wmma::row_major> a;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16,
+                           wmma::col_major> b;
+            wmma::load_matrix_sync(a, &xs[0][sub * 16], 64);
+            wmma::load_matrix_sync(b, &ws[warp][0][0], 16);
+            wmma::mma_sync(c, a, b, c);
+            __syncwarp();
+        }
+    }
+
+    wmma::store_matrix_sync(&cs[warp][0][0], c, 16, wmma::mem_row_major);
+    __syncwarp();
+    for (int i = lane; i < 16 * 16; i += 32) {
+        const int m = i >> 4, j = i & 15;
+        if (m < M && n0 + j < N)
+            y[(size_t)m * N + n0 + j] = __float2bfloat16(cs[warp][m][j]);
+    }
+}
+
+/* S2P_GEMV_TC: minimum M at which the tensor-core kernel serves the
+ * packed path (0/unset disables). */
+static int gemv_tc_min(void) {
+    static int v = -2;
+    if (v == -2) {
+        const char* e = getenv("S2P_GEMV_TC");
+        v = e ? atoi(e) : 0;
+        if (v <= 0) v = 0x7fffffff;
+    }
+    return v;
+}
+
 /* ── Register-blocked batch path: two output rows per warp ──
  *
  * The pipelined smem kernel above lost to the plain GEMV at every batch
@@ -724,7 +824,12 @@ extern "C" s2p_status s2p_int4p_gemv(void* y_bf16, const void* x_bf16,
     if (M > S2P_INT8_GEMV_MAX_M || K % 512 != 0 || gs < 0 || K % G != 0)
         return S2P_ERR_INVALID;
     const int blocks = (N + GEMV_WARPS - 1) / GEMV_WARPS;
-    if (M >= gemv_rows2_min()) {
+    if (M >= gemv_tc_min() && K % 64 == 0) {
+        const int tblocks = (N + 16 * TC_WARPS - 1) / (16 * TC_WARPS);
+        k_gemv_tc<<<tblocks, TC_WARPS * 32, 0, stream>>>(
+        (__nv_bfloat16*)y_bf16, (const __nv_bfloat16*)x_bf16,
+        (const uint8_t*)w_pack, (const __half*)scales_f16, M, N, K, gs);
+    } else if (M >= gemv_rows2_min()) {
         const int blocks2 = (N + 2 * GEMV_WARPS - 1) / (2 * GEMV_WARPS);
         if (M <= 8)
             k_gemv_p2<8><<<blocks2, GEMV_WARPS * 32, 0, stream>>>(
