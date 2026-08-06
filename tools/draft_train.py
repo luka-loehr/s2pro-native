@@ -244,10 +244,18 @@ def main():
         model.load_state_dict(sd)
         print(f"[draft] warm start from {args.warm}", flush=True)
     fc = rope_cache(args.seq + 1, dev)
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
-                            weight_decay=0.01)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-        opt, T_max=args.steps, eta_min=args.lr * 0.05)
+    # wd 0: several parameters ARE RMSNorm gains initialized from the
+    # backbone — decaying them toward zero corrupts a good init (review
+    # finding; EAGLE and the NVIDIA recipe both train with wd 0).
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, betas=(0.9, 0.95),
+                            weight_decay=0.0)
+    warm = max(1, args.steps // 20)  # 5% linear warmup, then cosine
+    def lr_at(step):
+        if step < warm:
+            return step / warm
+        prog = (step - warm) / max(1, args.steps - warm)
+        return 0.1 + 0.45 * (1 + math.cos(math.pi * prog))
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_at)
     mask = torch.tril(torch.ones(args.seq, args.seq, dtype=torch.bool,
                                  device=dev))
 
@@ -274,6 +282,60 @@ def main():
         wm = torch.stack([F.pad(torch.ones(x.shape[0], device=dev),
                                 (0, Tm - x.shape[0])) for x in hs])
         return pad(hs), pad(es), pad(ys), wm, Tm
+
+    @torch.no_grad()
+    def rollout_eval(fastar, depth=4, ctx=64, max_windows=256):
+        """EAGLE-style n-alpha: at depth d the input hidden is the
+        draft's own depth-(d-1) prediction while tokens stay the true
+        trajectory's — measures feature-error compounding, the quantity
+        teacher-forced eval cannot see. Reports per-depth semantic
+        argmax agreement and the fast-AR 9/9 chain rate."""
+        e_hid, e_sem, e_codes, e_takes = ev
+        hits = [0] * (depth + 1)
+        chain = [0] * (depth + 1)
+        n = 0
+        for a, b in e_takes:
+            if n >= max_windows:
+                break
+            T_take = b - a
+            if T_take < ctx + depth + 1:
+                continue
+            for w0 in range(a + ctx, b - depth, max(24, (T_take - ctx) // 4)):
+                if n >= max_windows:
+                    break
+                lo = w0 - ctx
+                h_seq = e_hid[lo:w0 + depth].to(dev)
+                sm_seq = e_sem[lo:w0 + depth].to(dev)
+                cd_seq = e_codes[lo:w0 + depth].to(dev)
+                e_seq = build_embeds(sm_seq, cd_seq, embed_main, cb_emb)
+                hin = h_seq.clone()
+                n += 1
+                for d in range(1, depth + 1):
+                    Tt = ctx + d
+                    m = torch.tril(torch.ones(Tt, Tt, dtype=torch.bool,
+                                              device=dev))
+                    with torch.autocast("cuda", torch.bfloat16):
+                        p = model(hin[None, :Tt], e_seq[None, :Tt],
+                                  rope_cache(Tt, dev), m)[0, -1].float()
+                    y = e_hid[w0 + d].to(dev)
+                    ok = ((p @ head_w.T).argmax() ==
+                          (y @ head_w.T).argmax()).item()
+                    hits[d] += ok
+                    if fastar is not None:
+                        st = e_sem[w0 + d].to(dev)[None]
+                        cp = fastar.greedy(p[None].bfloat16(), st)
+                        ct = fastar.greedy(y[None].bfloat16(), st)
+                        chain[d] += int(ok and (cp == ct).all().item())
+                    if d < depth:
+                        hin[ctx + d] = p  # feed the prediction back
+        if n == 0:
+            return
+        line = "[draft-rollout] " + " ".join(
+            f"a{d}={hits[d] / n:.3f}" for d in range(1, depth + 1))
+        if fastar is not None:
+            line += " | chain " + " ".join(
+                f"c{d}={chain[d] / n:.3f}" for d in range(1, depth + 1))
+        print(line + f" ({n} windows)", flush=True)
 
     @torch.no_grad()
     def evaluate(step, fastar=None):
@@ -342,7 +404,7 @@ def main():
             loss = l_h + args.kl_weight * l_kl
         opt.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
         opt.step()
         sched.step()
         if step % 50 == 0:
@@ -351,6 +413,7 @@ def main():
                   f"{(time.time() - t0) / step:.2f}s/step", flush=True)
         if step % args.eval_every == 0 or step == args.steps:
             acc = evaluate(step, fastar)
+            rollout_eval(fastar)
             if acc > best:
                 best = acc
                 from safetensors.torch import save_file
