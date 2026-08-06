@@ -20,6 +20,7 @@
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_pipeline.h>
 
 #include "s2pro/status.h"
 #include "s2pro/gemm.h"
@@ -403,6 +404,210 @@ static __global__ void k_gemv_ps(__nv_bfloat16* y, const __nv_bfloat16* x,
             y[(size_t)m * N + n] = __float2bfloat16(acc[m]);
 }
 
+
+/* ── GEMM pipeline for the batch path (M > 4) ──
+ *
+ * The plain GEMV re-reads every session's activation row once PER OUTPUT
+ * ROW from L2; at M=12 that is N*M*K bf16 per layer and the reason tick
+ * time grows with the batch while DRAM weight bytes stay flat. The first
+ * staged attempt (k_gemv_ps above) failed because 4 warps per block
+ * cannot amortize two barriers per 512-element chunk and the staging
+ * loads did not overlap compute. This kernel fixes exactly those two
+ * defects and nothing else:
+ *   - GEMV_PIPE_WARPS (8) output rows share one block, halving blocks
+ *     and doubling the work each barrier amortizes; the staged x chunk
+ *     serves 8 rows instead of 4;
+ *   - the x chunk for iteration c+1 is fetched with cp.async
+ *     (__pipeline_memcpy_async) into the other half of a double buffer
+ *     WHILE iteration c computes, so staging latency hides behind the
+ *     inner loop instead of serializing with it.
+ * Per output row the arithmetic is exactly k_gemv_p: same chunk order,
+ * same lane->k mapping, same j order, same acc[m] += s*gs sequence,
+ * same shfl reduction — bit-identical by construction (gated on the
+ * two-stream fixed-seed WAV MD5s). K % 512 == 0 is already a launcher
+ * requirement, so every chunk is full and every 16 B cp.async unit is
+ * aligned (K is a multiple of 8). */
+#define GEMV_PIPE_WARPS 8
+
+template <int MM>
+static __global__ void k_gemv_pp(__nv_bfloat16* y, const __nv_bfloat16* x,
+                                 const uint8_t* w, const __half* scales,
+                                 int M, int N, int K, int gshift) {
+    extern __shared__ __nv_bfloat16 sx[]; /* [2][M][512] */
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int n = blockIdx.x * GEMV_PIPE_WARPS + warp;
+    const int active = (n < N);
+    const uint8_t* wrow = active ? w + (size_t)n * (K >> 1) : w;
+    const __half* srow = active ? scales + (size_t)n * (K >> gshift) : scales;
+    const int nch = K >> 9;
+    const int units = M << 6; /* 16 B cp.async units per chunk: M * 512/8 */
+
+    float acc[MM];
+#pragma unroll
+    for (int m = 0; m < MM; m++) acc[m] = 0.0f;
+
+    /* prologue: stage chunk 0 into buffer 0 */
+    for (int i = threadIdx.x; i < units; i += blockDim.x) {
+        const int m = i >> 6, u = i & 63;
+        __pipeline_memcpy_async(sx + (size_t)m * 512 + u * 8,
+                                x + (size_t)m * K + u * 8, 16);
+    }
+    __pipeline_commit();
+
+    for (int c = 0; c < nch; c++) {
+        const int c0 = c << 9;
+        __nv_bfloat16* buf = sx + (size_t)(c & 1) * M * 512;
+        if (c + 1 < nch) { /* prefetch c+1 into the other buffer */
+            __nv_bfloat16* nb = sx + (size_t)((c + 1) & 1) * M * 512;
+            for (int i = threadIdx.x; i < units; i += blockDim.x) {
+                const int m = i >> 6, u = i & 63;
+                __pipeline_memcpy_async(
+                    nb + (size_t)m * 512 + u * 8,
+                    x + (size_t)m * K + c0 + 512 + u * 8, 16);
+            }
+            __pipeline_commit();
+            __pipeline_wait_prior(1);
+        } else {
+            __pipeline_wait_prior(0);
+        }
+        __syncthreads();
+        if (active) {
+            const int k0 = c0 + lane * 16;
+            const uint2 wv = *(const uint2*)(wrow + (k0 >> 1));
+            int8_t w16[16];
+            unpack16(w16, (const uint8_t*)&wv);
+            const float gs = __half2float(srow[k0 >> gshift]);
+            for (int m = 0; m < M; m++) {
+                const __nv_bfloat16* xp = buf + (size_t)m * 512 + lane * 16;
+                const int4 xa = *(const int4*)xp;
+                const int4 xb = *(const int4*)(xp + 8);
+                const __nv_bfloat16* x16a = (const __nv_bfloat16*)&xa;
+                const __nv_bfloat16* x16b = (const __nv_bfloat16*)&xb;
+                float s = 0.0f;
+#pragma unroll
+                for (int j = 0; j < 8; j++)
+                    s += (float)w16[j] * __bfloat162float(x16a[j]);
+#pragma unroll
+                for (int j = 0; j < 8; j++)
+                    s += (float)w16[8 + j] * __bfloat162float(x16b[j]);
+                acc[m] += s * gs;
+            }
+        }
+        __syncthreads(); /* buffer (c+1)&1 may be restaged next iteration */
+    }
+    if (!active) return;
+
+#pragma unroll
+    for (int m = 0; m < MM; m++)
+        for (int off = 16; off > 0; off >>= 1)
+            acc[m] += __shfl_down_sync(0xffffffffu, acc[m], off);
+
+    if (lane == 0)
+        for (int m = 0; m < M; m++)
+            y[(size_t)m * N + n] = __float2bfloat16(acc[m]);
+}
+
+
+/* ── Register-blocked batch path: two output rows per warp ──
+ *
+ * The pipelined smem kernel above lost to the plain GEMV at every batch
+ * size (its two barriers per chunk cost more than the shared staging
+ * saves), which localizes the batch cost in the arithmetic and the
+ * per-row x loads, not in a smem-fixable L2 stream. This variant
+ * attacks the x loads with ZERO synchronization: one warp computes two
+ * ADJACENT output rows and loads each activation vector once for both,
+ * halving x traffic per output row in exchange for register pressure
+ * (two accumulator arrays, two unpacked weight tiles). Per-row
+ * arithmetic and its order are exactly k_gemv_p — bit-identical. */
+template <int MM>
+static __global__ void k_gemv_p2(__nv_bfloat16* y, const __nv_bfloat16* x,
+                                 const uint8_t* w, const __half* scales,
+                                 int M, int N, int K, int gshift) {
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int n0 = (blockIdx.x * GEMV_WARPS + warp) * 2;
+    if (n0 >= N) return;
+    const int two = (n0 + 1 < N);
+    const uint8_t* wrow0 = w + (size_t)n0 * (K >> 1);
+    const uint8_t* wrow1 = wrow0 + (two ? (size_t)(K >> 1) : 0);
+    const __half* srow0 = scales + (size_t)n0 * (K >> gshift);
+    const __half* srow1 = srow0 + (two ? (size_t)(K >> gshift) : 0);
+
+    float acc0[MM], acc1[MM];
+#pragma unroll
+    for (int m = 0; m < MM; m++) acc0[m] = acc1[m] = 0.0f;
+
+    for (int k0 = lane * 16; k0 < K; k0 += 32 * 16) {
+        const uint2 wv0 = *(const uint2*)(wrow0 + (k0 >> 1));
+        const uint2 wv1 = *(const uint2*)(wrow1 + (k0 >> 1));
+        int8_t w16a[16], w16b[16];
+        unpack16(w16a, (const uint8_t*)&wv0);
+        unpack16(w16b, (const uint8_t*)&wv1);
+        const float gs0 = __half2float(srow0[k0 >> gshift]);
+        const float gs1 = __half2float(srow1[k0 >> gshift]);
+        for (int m = 0; m < M; m++) { /* M uniform across the warp */
+            const __nv_bfloat16* xp = x + (size_t)m * K + k0;
+            const int4 xa = *(const int4*)xp;
+            const int4 xb = *(const int4*)(xp + 8);
+            const __nv_bfloat16* x16a = (const __nv_bfloat16*)&xa;
+            const __nv_bfloat16* x16b = (const __nv_bfloat16*)&xb;
+            float s0 = 0.0f, s1 = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const float xv = __bfloat162float(x16a[j]);
+                s0 += (float)w16a[j] * xv;
+                s1 += (float)w16b[j] * xv;
+            }
+#pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const float xv = __bfloat162float(x16b[j]);
+                s0 += (float)w16a[8 + j] * xv;
+                s1 += (float)w16b[8 + j] * xv;
+            }
+            acc0[m] += s0 * gs0;
+            acc1[m] += s1 * gs1;
+        }
+    }
+
+#pragma unroll
+    for (int m = 0; m < MM; m++)
+        for (int off = 16; off > 0; off >>= 1) {
+            acc0[m] += __shfl_down_sync(0xffffffffu, acc0[m], off);
+            acc1[m] += __shfl_down_sync(0xffffffffu, acc1[m], off);
+        }
+
+    if (lane == 0)
+        for (int m = 0; m < M; m++) {
+            y[(size_t)m * N + n0] = __float2bfloat16(acc0[m]);
+            if (two) y[(size_t)m * N + n0 + 1] = __float2bfloat16(acc1[m]);
+        }
+}
+
+/* S2P_GEMV_ROWS2: minimum M at which the two-rows-per-warp kernel
+ * engages for the packed path (0 disables). */
+static int gemv_rows2_min(void) {
+    static int v = -2;
+    if (v == -2) {
+        const char* e = getenv("S2P_GEMV_ROWS2");
+        v = e ? atoi(e) : 0;
+        if (v <= 0) v = 0x7fffffff;
+    }
+    return v;
+}
+
+/* S2P_GEMV_PIPE: minimum M at which the pipelined kernel engages for the
+ * packed path (0 disables). Default set by the measured crossover. */
+static int gemv_pipe_min(void) {
+    static int v = -2;
+    if (v == -2) {
+        const char* e = getenv("S2P_GEMV_PIPE");
+        v = e ? atoi(e) : 0; /* measured out — see the header comments */
+        if (v <= 0) v = 0x7fffffff;
+    }
+    return v;
+}
+
 static __global__ void k_dequant_p(__nv_bfloat16* o, const uint8_t* w,
                                    const __half* scales, int K, int gshift) {
     const int n = blockIdx.x;
@@ -519,7 +724,30 @@ extern "C" s2p_status s2p_int4p_gemv(void* y_bf16, const void* x_bf16,
     if (M > S2P_INT8_GEMV_MAX_M || K % 512 != 0 || gs < 0 || K % G != 0)
         return S2P_ERR_INVALID;
     const int blocks = (N + GEMV_WARPS - 1) / GEMV_WARPS;
-    if (gemv_staged() && M >= 2) {
+    if (M >= gemv_rows2_min()) {
+        const int blocks2 = (N + 2 * GEMV_WARPS - 1) / (2 * GEMV_WARPS);
+        if (M <= 8)
+            k_gemv_p2<8><<<blocks2, GEMV_WARPS * 32, 0, stream>>>(
+        (__nv_bfloat16*)y_bf16, (const __nv_bfloat16*)x_bf16,
+        (const uint8_t*)w_pack, (const __half*)scales_f16, M, N, K, gs);
+        else
+            k_gemv_p2<S2P_INT8_GEMV_MAX_M>
+                <<<blocks2, GEMV_WARPS * 32, 0, stream>>>(
+        (__nv_bfloat16*)y_bf16, (const __nv_bfloat16*)x_bf16,
+        (const uint8_t*)w_pack, (const __half*)scales_f16, M, N, K, gs);
+    } else if (M >= gemv_pipe_min()) {
+        const int pblocks = (N + GEMV_PIPE_WARPS - 1) / GEMV_PIPE_WARPS;
+        const size_t smem = 2 * (size_t)M * 512 * sizeof(__nv_bfloat16);
+        if (M <= 8)
+            k_gemv_pp<8><<<pblocks, GEMV_PIPE_WARPS * 32, smem, stream>>>(
+        (__nv_bfloat16*)y_bf16, (const __nv_bfloat16*)x_bf16,
+        (const uint8_t*)w_pack, (const __half*)scales_f16, M, N, K, gs);
+        else
+            k_gemv_pp<S2P_INT8_GEMV_MAX_M>
+                <<<pblocks, GEMV_PIPE_WARPS * 32, smem, stream>>>(
+        (__nv_bfloat16*)y_bf16, (const __nv_bfloat16*)x_bf16,
+        (const uint8_t*)w_pack, (const __half*)scales_f16, M, N, K, gs);
+    } else if (gemv_staged() && M >= 2) {
         const size_t smem = (size_t)M * 512 * sizeof(__nv_bfloat16);
         if (M <= 8)
             k_gemv_ps<8><<<blocks, GEMV_WARPS * 32, smem, stream>>>(
