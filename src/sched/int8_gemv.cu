@@ -537,7 +537,7 @@ static __global__ void k_gemv_tc(__nv_bfloat16* y, const __nv_bfloat16* x,
                                  int M, int N, int K, int gshift) {
     using namespace nvcuda;
     __shared__ __nv_bfloat16 xs[16][64];
-    __shared__ __nv_bfloat16 ws[TC_WARPS][16][16];
+    __shared__ __nv_bfloat16 ws[TC_WARPS][16][64];
     __shared__ float cs[TC_WARPS][16][16];
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
@@ -554,38 +554,51 @@ static __global__ void k_gemv_tc(__nv_bfloat16* y, const __nv_bfloat16* x,
                                : __float2bfloat16(0.0f);
         }
         __syncthreads();
+        /* dequant the warp's [16 n x 64 k] weight tile with ALL 32
+         * lanes doing one coalesced 16 B load each (lane l -> row l/2,
+         * 32-k half l%2): the weight stream is the decode cost, and the
+         * first version's 16-lane 8 B loads paid for it with a ~2x
+         * fixed-overhead wall. */
+        {
+            const int r = lane >> 1, half = lane & 1;
+            const int n = n0 + r;
+            const int kh = c0 + half * 32;
+            if (n < N) {
+                const uint4 wv = *(const uint4*)(
+                    w + (size_t)n * (K >> 1) + (kh >> 1));
+                int8_t w32[32];
+                unpack16(w32, (const uint8_t*)&wv);
+                unpack16(w32 + 16, (const uint8_t*)&wv + 8);
+                const __half* srw =
+                    scales + (size_t)n * (K >> gshift);
+                const float g0 = __half2float(srw[kh >> gshift]);
+                const float g1 = __half2float(srw[(kh + 16) >> gshift]);
+#pragma unroll
+                for (int j = 0; j < 16; j++)
+                    ws[warp][r][half * 32 + j] =
+                        __float2bfloat16((float)w32[j] * g0);
+#pragma unroll
+                for (int j = 0; j < 16; j++)
+                    ws[warp][r][half * 32 + 16 + j] =
+                        __float2bfloat16((float)w32[16 + j] * g1);
+            } else {
+#pragma unroll
+                for (int j = 0; j < 32; j++)
+                    ws[warp][r][half * 32 + j] = __float2bfloat16(0.0f);
+            }
+        }
+        __syncwarp();
 #pragma unroll
         for (int sub = 0; sub < 4; sub++) {
-            const int kb = c0 + sub * 16;
-            if (lane < 16) { /* one lane dequants one weight row */
-                const int n = n0 + lane;
-                if (n < N) {
-                    const uint2 wv = *(const uint2*)(
-                        w + (size_t)n * (K >> 1) + (kb >> 1));
-                    int8_t w16[16];
-                    unpack16(w16, (const uint8_t*)&wv);
-                    const float gs = __half2float(
-                        scales[(size_t)n * (K >> gshift) + (kb >> gshift)]);
-#pragma unroll
-                    for (int j = 0; j < 16; j++)
-                        ws[warp][lane][j] =
-                            __float2bfloat16((float)w16[j] * gs);
-                } else {
-#pragma unroll
-                    for (int j = 0; j < 16; j++)
-                        ws[warp][lane][j] = __float2bfloat16(0.0f);
-                }
-            }
-            __syncwarp();
             wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16,
                            wmma::row_major> a;
             wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16,
                            wmma::col_major> b;
             wmma::load_matrix_sync(a, &xs[0][sub * 16], 64);
-            wmma::load_matrix_sync(b, &ws[warp][0][0], 16);
+            wmma::load_matrix_sync(b, &ws[warp][0][sub * 16], 64);
             wmma::mma_sync(c, a, b, c);
-            __syncwarp();
         }
+        __syncwarp();
     }
 
     wmma::store_matrix_sync(&cs[warp][0][0], c, 16, wmma::mem_row_major);
