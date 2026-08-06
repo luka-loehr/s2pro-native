@@ -536,9 +536,12 @@ static __global__ void k_gemv_tc(__nv_bfloat16* y, const __nv_bfloat16* x,
                                  const uint8_t* w, const __half* scales,
                                  int M, int N, int K, int gshift) {
     using namespace nvcuda;
-    __shared__ __nv_bfloat16 xs[16][64];
-    __shared__ __nv_bfloat16 ws[TC_WARPS][16][64];
-    __shared__ float cs[TC_WARPS][16][16];
+    /* row stride 72 (not 64): a 128 B row would land every row on the
+     * same shared-memory banks and serialize the WMMA fragment loads
+     * 16-way; the 16 B skew spreads them. cs pads to 20 f32 likewise. */
+    __shared__ __nv_bfloat16 xs[16][72];
+    __shared__ __nv_bfloat16 ws[TC_WARPS][16][72];
+    __shared__ float cs[TC_WARPS][16][20];
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     const int n0 = (blockIdx.x * TC_WARPS + warp) * 16;
@@ -594,14 +597,14 @@ static __global__ void k_gemv_tc(__nv_bfloat16* y, const __nv_bfloat16* x,
                            wmma::row_major> a;
             wmma::fragment<wmma::matrix_b, 16, 16, 16, __nv_bfloat16,
                            wmma::col_major> b;
-            wmma::load_matrix_sync(a, &xs[0][sub * 16], 64);
-            wmma::load_matrix_sync(b, &ws[warp][0][sub * 16], 64);
+            wmma::load_matrix_sync(a, &xs[0][sub * 16], 72);
+            wmma::load_matrix_sync(b, &ws[warp][0][sub * 16], 72);
             wmma::mma_sync(c, a, b, c);
         }
         __syncwarp();
     }
 
-    wmma::store_matrix_sync(&cs[warp][0][0], c, 16, wmma::mem_row_major);
+    wmma::store_matrix_sync(&cs[warp][0][0], c, 20, wmma::mem_row_major);
     __syncwarp();
     for (int i = lane; i < 16 * 16; i += 32) {
         const int m = i >> 4, j = i & 15;
