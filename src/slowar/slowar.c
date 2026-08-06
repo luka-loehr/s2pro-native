@@ -717,8 +717,12 @@ s2p_status s2p_model_batch_next_frame(s2p_model* m, s2p_session** sess, int n,
     const int32_t* sems = (const int32_t*)((char*)m->h_out + m->out_off_sem);
 
     /* S2P_DUMP_FRAMES=path: append per-frame fast-AR training records for
-     * the INT4 QAT self-distillation — [2560 bf16 final-normed hidden]
-     * [i32 sem][10 x i32 codes] per non-EOS frame (5164 B). The teacher
+     * the INT4 QAT self-distillation and the speculative-decoding draft
+     * — [2560 bf16 final-normed hidden][i32 sem][10 x i32 codes] per
+     * non-EOS frame (5164 B), plus a take-boundary sentinel at EOS
+     * (zero hidden, sem/codes -1; QAT readers skip it via sem >= 0,
+     * sequence consumers cut takes there; generate at batch 1). The
+     * teacher
      * trajectory is recomputed in torch from (hidden, sem); codes ride
      * along for verification. Worker-thread only; sync above makes
      * shidden/h_out coherent. */
@@ -733,7 +737,20 @@ s2p_status s2p_model_batch_next_frame(s2p_model* m, s2p_session** sess, int n,
         if (df) {
             static uint16_t hrow[S2P_DIM];
             for (int b = 0; b < nact; b++) {
-                if (eflag[b]) continue;
+                if (eflag[b]) {
+                    /* take-boundary sentinel (sem = -1, codes = -1, zero
+                     * hidden): the draft-model trainer cuts sequences
+                     * here. Corpus generation for it runs one session at
+                     * a time, so records between sentinels are one take
+                     * in order. */
+                    memset(hrow, 0, sizeof(hrow));
+                    int32_t neg = -1;
+                    fwrite(hrow, sizeof(hrow), 1, df);
+                    fwrite(&neg, sizeof(int32_t), 1, df);
+                    for (int q = 0; q < S2P_NUM_CODEBOOKS; q++)
+                        fwrite(&neg, sizeof(int32_t), 1, df);
+                    continue;
+                }
                 if (cudaMemcpy(hrow,
                                (const uint16_t*)m->shidden.data +
                                    (size_t)b * S2P_DIM,
