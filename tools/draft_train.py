@@ -187,7 +187,13 @@ def main():
     ap.add_argument("--kl-weight", type=float, default=0.3)
     ap.add_argument("--kl-temp", type=float, default=1.0)
     ap.add_argument("--holdout", type=int, default=48,
-                    help="takes held out for eval")
+                    help="takes held out for eval (ignored with --eval-dump)")
+    ap.add_argument("--eval-dump", default=None,
+                    help="separate dump of UNSEEN-text takes; if set, all "
+                         "of --dump trains and eval runs on this file")
+    ap.add_argument("--feat-noise", type=float, default=0.0,
+                    help="uniform noise magnitude added to input hiddens "
+                         "during training (EAGLE-style augmentation)")
     ap.add_argument("--eval-every", type=int, default=500)
     ap.add_argument("--warm", default=None,
                     help="resume from a previous draft.safetensors")
@@ -213,15 +219,22 @@ def main():
 
     hid, sem, codes = load_dump(args.dump)
     takes = cut_takes(hid, sem, codes)
-    if len(takes) < args.holdout + 16:
-        raise SystemExit(f"only {len(takes)} takes; need more corpus")
     rng = np.random.default_rng(23)
-    order = rng.permutation(len(takes))
-    ev_takes = [takes[i] for i in order[: args.holdout]]
-    tr_takes = [takes[i] for i in order[args.holdout:]]
+    if args.eval_dump:
+        ev_hid, ev_sem, ev_codes = load_dump(args.eval_dump)
+        ev_takes_ix = cut_takes(ev_hid, ev_sem, ev_codes)
+        ev = (ev_hid, ev_sem, ev_codes, ev_takes_ix)
+        tr_takes = takes
+    else:
+        if len(takes) < args.holdout + 16:
+            raise SystemExit(f"only {len(takes)} takes; need more corpus")
+        order = rng.permutation(len(takes))
+        ev = (hid, sem, codes, [takes[i] for i in order[: args.holdout]])
+        tr_takes = [takes[i] for i in order[args.holdout:]]
     n_frames = sum(b - a for a, b in tr_takes)
-    print(f"[draft] corpus: {len(takes)} takes, train {len(tr_takes)} "
-          f"({n_frames} frames), holdout {len(ev_takes)}", flush=True)
+    print(f"[draft] corpus: train {len(tr_takes)} takes ({n_frames} "
+          f"frames), eval {len(ev[3])} takes"
+          f"{' (unseen texts)' if args.eval_dump else ''}", flush=True)
 
     model = DraftModel(T).to(dev)
     if args.warm:
@@ -265,12 +278,13 @@ def main():
     @torch.no_grad()
     def evaluate(step, fastar=None):
         model.eval()
+        e_hid, e_sem, e_codes, e_takes = ev
         cos_s, arg_s, n = 0.0, 0, 0
         chain_ok, chain_n = 0, 0
-        for a, b in ev_takes:
-            h = hid[a:b].to(dev)
-            sm = sem[a:b].to(dev)
-            cd = codes[a:b].to(dev)
+        for a, b in e_takes:
+            h = e_hid[a:b].to(dev)
+            sm = e_sem[a:b].to(dev)
+            cd = e_codes[a:b].to(dev)
             e = build_embeds(sm, cd, embed_main, cb_emb)
             hin, ein, y = h[:-1], e[:-1], h[1:]
             Tt = hin.shape[0]
@@ -313,6 +327,8 @@ def main():
     t0 = time.time()
     for step in range(1, args.steps + 1):
         h, e, y, wm, Tm = sample_batch()
+        if args.feat_noise > 0.0:
+            h = h + (torch.rand_like(h) * 2 - 1) * args.feat_noise
         m = mask[:Tm, :Tm]
         with torch.autocast("cuda", torch.bfloat16):
             p = model(h, e, fc, m).float()
