@@ -188,6 +188,48 @@ that §6 added are exactly what removed the condition graphs would fix.
 It would return as a live question if the accumulation were dropped for
 latency (§6's F-knob discussion).
 
+## 11. Tensor-core GEMM: the arithmetic served faster, the crossover measured
+
+With bit-identical reorganizations exhausted (§10), the batch cost —
+the O(M) FMA work — moved to the matrix units: a WMMA kernel
+(m16n16k16, f32 accumulators) with the INT4 weights dequantized
+in-register per tile (`S2P_GEMV_TC`, packed path). The effective weight
+enters as bf16(w4 · group scale) — exactly the prefill dequant+cuBLAS
+precision — so this path deliberately trades the MD5 gate for the full
+parity gate, and passes it in the reference class: backbone cos min
+0.9919, prefill and step-1 argmax identical, fast-AR 8/9, byte-for-byte
+the metrics of the GEMV configuration.
+
+Three versions, each fixing the measured dominant overhead of the last
+(worst per-stream RTF, same protocol as §10; GEMV row repeated for
+comparison):
+
+| | B=4 | B=8 | B=12 | B=16 | M=1 probe |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| GEMV (shipping) | 0.89 | 1.46 | 2.07 | 2.90 | 0.55 |
+| v1 naive tiles | 2.06 | 2.48 | 2.94 | 3.38 | 1.80 |
+| v2 + coalesced 16 B weight loads | 1.97 | 2.37 | 2.77 | 3.22 | 1.70 |
+| v3 + 16 B smem row skew | 1.60 | 1.99 | 2.42 | **2.84** | 1.30 |
+
+Two findings. First, the thesis holds: the tensor-core slope is ~0.41
+worst-RTF per 4 streams against the GEMV's ~0.67 — the matrix units do
+make the per-stream arithmetic cheap, and v3 crosses over at B = 16
+(2.84 vs 2.90), the first configuration to beat the GEMV anywhere.
+Second, the fixed per-pass cost (1.30 vs 0.55 at M = 1, after the bank
+conflicts that dominated v1/v2) keeps the GEMV ahead at every practical
+batch size; the remaining levers (128-wide K staging to halve barriers,
+vectorized x staging) are identified but cannot change the strategic
+picture: even a tensor-core path that won from B = 8 would leave B = 12
+at roughly 2× real time — far from the per-stream RTF < 1 rule.
+
+The kernel therefore ships off by default, but not as a negative
+result: its flat slope is exactly the profile a **speculative-decoding
+verify pass** needs, where the effective row count is sessions ×
+(draft length + 1) — 12 sessions verifying 3-frame drafts is a 48-row
+GEMM per linear, deep in the regime where the matrix units win. The
+spec-decoding build (draft model, corpus, verify machinery) is the
+companion track; this kernel is its GEMM engine.
+
 ## 10. The GEMM pipeline campaign: three bit-identical variants, all measured out
 
 After the staged GEMV failed (§8), its two identified defects were fixed
