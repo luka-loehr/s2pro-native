@@ -188,6 +188,48 @@ that §6 added are exactly what removed the condition graphs would fix.
 It would return as a live question if the accumulation were dropped for
 latency (§6's F-knob discussion).
 
+## 10. The GEMM pipeline campaign: three bit-identical variants, all measured out
+
+After the staged GEMV failed (§8), its two identified defects were fixed
+in a proper pipeline kernel, and when that also lost, the remaining
+bit-identity-preserving idea was tried too. All three share the exact
+per-row arithmetic of the plain GEMV (same chunk order, same lane→k
+mapping, same accumulation sequence) and were each proven bit-identical
+on the two-stream fixed-seed WAV gate before being timed:
+
+| variant | mechanism | B=4 / 8 / 12 / 16 (worst RTF) |
+| --- | --- | --- |
+| plain GEMV (shipping) | one warp per row, x from L2 per row | **0.89 / 1.46 / 2.07 / 2.90** |
+| staged (§8) | 4-warp smem staging, barriers | 1.37 / 2.44 / 3.88 / — |
+| pipelined (`S2P_GEMV_PIPE`) | 8 warps, double-buffered `cp.async` | 1.01 / 1.61 / 2.37 / 3.03 |
+| register-blocked (`S2P_GEMV_ROWS2`) | 2 rows/warp, x loaded once for both | 0.95 / 1.59 / 2.35 / 3.22 |
+
+Conditions: reconstructed load script (the box lost `/tmp` to a
+reboot), ~19 s voiced takes, distinct voices, back-to-back runs on
+2026-08-04; the baseline row was re-measured the same hour with the
+same script, so the comparison is internally consistent. Single-stream
+serving is identical in every configuration (0.54–0.55 here; M = 1
+always takes the plain kernel).
+
+The campaign's negative result is the finding. The pipelined kernel
+eliminates barrier-per-chunk serialization *and* overlaps staging with
+compute, and still loses; the register-blocked kernel needs no
+synchronization at all, halves per-row activation traffic, and still
+loses. Together they rule out the activation stream as the dominant
+term: on this memory system the L2 serves the plain kernel's redundant
+x reads faster than any restructuring pays for itself, and what remains
+is the O(M) FMA work itself, which no bit-identical reorganization can
+reduce. Within the constraint that batch output must equal single-file
+output bit for bit, the plain GEMV is the measured optimum of every
+class tried.
+
+Both kernels stay in the tree behind their flags as reproduction paths.
+The two honest ways past the wall are (a) a tensor-core GEMM path,
+which changes the summation order and therefore trades the MD5 gate for
+the full parity + listening gate, and (b) generating more audio per
+tick (speculative multi-frame decoding), which shrinks the O(M) work
+per second of audio instead of trying to serve it faster.
+
 ## 8. Batch GEMV with staged activations: measured out
 
 The GEMV's O(M) activation re-read (§7) has an obvious remedy: stage the
