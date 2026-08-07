@@ -8,6 +8,37 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 for published releases.
 
+## [Unreleased]
+
+### Added
+- Sliced LM-head: the decode head serves the sampler's 4,097 candidate
+  rows instead of all 155,776 — bit-identical (smoke and two-stream
+  fixed-seed MD5s unchanged), ~389 MB less weight stream per frame.
+  Wall RTF 0.55 -> 0.51 zero-shot / 0.52 voice-ref / 0.50 long-form.
+  Full-vocab head stays on the parity-dump path and S2P_HEAD_FULL=1.
+- Droppable encoder arenas: encode-only DAC weights (encoder stack, VQ
+  in_proj, pre_module) load into their own arenas and are freed after
+  the voice registry loads (S2P_KEEP_ENCODER=1 keeps per-request
+  cloning); encode afterwards reports a clean error.
+- Prefill activation scratch capped at 2048 rows (-218 MB), guarded in
+  s2p_session_prefill, S2P_SCRATCH_ROWS overrides.
+- Wall-clock send budget (S2P_HTTP_SEND_MS, default 2000): sockets are
+  non-blocking and the scheduler-thread writer polls against a
+  monotonic deadline — a trickle-reading client can no longer freeze
+  all streams (verified by a slow-reader probe alongside a healthy
+  parallel request).
+
+### Fixed
+- Packed-GEMV dispatch for 9..16 concurrent sessions: the staged-GEMV
+  rewrite had dropped the M>8 instantiation (out-of-bounds register
+  array, undefined behavior). B>=9 series re-measured on the fixed
+  kernel: 0.86/1.41/2.27/2.97 at B=4/8/12/16 with the sliced head.
+- Prefix-cache teardown freed only 16 of 40 entries (leak up to ~2 GB
+  per destroy).
+- SERVING.md 7: the KV-bandwidth attribution of the concurrency wall
+  is retracted (units error; falsified by the section's own trimming
+  experiment). The wall is the O(M) batch-GEMV arithmetic.
+
 ## [0.1.0] — 2026-08-03
 
 First tagged release. Everything below this heading is the state that

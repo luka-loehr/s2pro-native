@@ -27,7 +27,7 @@ is compute ÷ audio; below 1.0 means synthesis outruns playback.
 | --- | ---: | ---: |
 | zero-shot | **0.51** | 0.14 s |
 | 60 s voice reference (warm voice cache) | **0.52** | 0.20 s |
-| ~148 s chunked long-form | **~0.53** | 0.20 s |
+| ~143 s chunked long-form | **0.50** | 0.20 s |
 
 Configuration: all-INT4 weight stream (packed group-wise INT4 backbone +
 QAT-distilled INT4 fast-AR and lm-head, `S2P_INT4_ALL=1` on a
