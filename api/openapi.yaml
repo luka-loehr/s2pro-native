@@ -145,7 +145,7 @@ paths:
               schema:
                 type: string
                 format: binary
-                description: Raw S16LE PCM frames (`"format": "pcm"`).
+                description: 'Raw S16LE PCM frames (`"format": "pcm"`).'
         "400":
           description: Malformed request (JSON, field types, reference audio).
           content:
