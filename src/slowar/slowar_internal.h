@@ -128,7 +128,11 @@ struct s2p_model {
     s2p_tensor sgu;     /* [ctx, 19456] */
     s2p_tensor sffn;    /* [ctx, 9728] */
     s2p_tensor shidden; /* [max_sessions, 2560] final-normed batch hidden */
-    s2p_tensor slogits; /* [max_sessions, 155776] bf16 */
+    s2p_tensor slogits; /* [max_sessions, 155776] bf16 (full head; dump/
+                         * fallback paths) */
+    s2p_tensor slogc;   /* [max_sessions, 4096] bf16 — semantic head slice */
+    s2p_tensor sloge;   /* [max_sessions, 1] bf16 — EOS head row */
+    int head_full;      /* S2P_HEAD_FULL=1: compute the full-vocab head */
     s2p_tensor sattn_part; /* [max_sessions, 32, ctx/64, 130] f32 split-K
                             * flash-decode partials (s2pk_attention_decode) */
     /* device sampling: per-frame output block (fixed layout by max_sessions:

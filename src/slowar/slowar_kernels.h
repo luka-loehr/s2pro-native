@@ -148,6 +148,7 @@ typedef struct {
  * Greedy (temperature 0) is bit-identical to the host sampler; sampled draws
  * differ only by device expf/logf ULPs (parity-gated). */
 cudaError_t s2pk_sample(const __nv_bfloat16* logits, int64_t vocab_stride,
+                        const __nv_bfloat16* eos_logits,
                         s2ps_dev_state* const* states, int rows,
                         int64_t* out_tok, int32_t* out_sem,
                         int32_t* out_codes, uint8_t* out_eos,

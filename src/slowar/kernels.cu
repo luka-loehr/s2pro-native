@@ -971,6 +971,7 @@ static __device__ uint64_t smp_xoshiro_next(uint64_t s[4]) {
 
 static __global__ void k_sample(const __nv_bfloat16* __restrict__ logits,
                                 int64_t vocab_stride,
+                                const __nv_bfloat16* __restrict__ eos_logits,
                                 s2ps_dev_state* const* __restrict__ states,
                                 int64_t* __restrict__ out_tok,
                                 int32_t* __restrict__ out_sem,
@@ -987,9 +988,19 @@ static __global__ void k_sample(const __nv_bfloat16* __restrict__ logits,
     __shared__ float tv[SMP_TOP_K];
     __shared__ int ti[SMP_TOP_K];
 
-    for (int i = tid; i < SMP_N_SEM; i += blockDim.x)
-        cand[i] = s2pk_b2f(lrow[SMP_SEM_START + i]);
-    if (tid == 0) cand[SMP_CAND_EOS] = s2pk_b2f(lrow[SMP_EOS]);
+    /* compact mode (eos_logits != NULL): `logits` holds only the 4096
+     * semantic rows (stride = vocab_stride = 4096) and the EOS logit
+     * arrives separately — same values as the full-vocab gather, so the
+     * sampled trajectory is bit-identical. */
+    if (eos_logits != NULL) {
+        for (int i = tid; i < SMP_N_SEM; i += blockDim.x)
+            cand[i] = s2pk_b2f(lrow[i]);
+        if (tid == 0) cand[SMP_CAND_EOS] = s2pk_b2f(eos_logits[row]);
+    } else {
+        for (int i = tid; i < SMP_N_SEM; i += blockDim.x)
+            cand[i] = s2pk_b2f(lrow[SMP_SEM_START + i]);
+        if (tid == 0) cand[SMP_CAND_EOS] = s2pk_b2f(lrow[SMP_EOS]);
+    }
     __syncthreads();
 
     const int greedy = sp->temperature == 0.0f;
@@ -1163,13 +1174,15 @@ static __global__ void k_sample(const __nv_bfloat16* __restrict__ logits,
 }
 
 extern "C" cudaError_t s2pk_sample(const __nv_bfloat16* logits,
+                                   const __nv_bfloat16* eos_logits,
                                    int64_t vocab_stride,
                                    s2ps_dev_state* const* states, int rows,
                                    int64_t* out_tok, int32_t* out_sem,
                                    int32_t* out_codes, uint8_t* out_eos,
                                    cudaStream_t st) {
     if (rows <= 0) return cudaSuccess;
-    k_sample<<<rows, 128, 0, st>>>(logits, vocab_stride, states, out_tok,
+    k_sample<<<rows, 128, 0, st>>>(logits, vocab_stride, eos_logits,
+                                   states, out_tok,
                                    out_sem, out_codes, out_eos);
     return cudaGetLastError();
 }
