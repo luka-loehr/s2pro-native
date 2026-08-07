@@ -53,6 +53,7 @@ typedef struct sched_req {
     int              n_refs;
     float*           ref_pcm;   /* on-the-fly clone: encoded on the worker */
     int64_t          ref_pcm_n;
+    s2p_vq_part*     clone_out;  /* memo target owned by the connection */
     char*            cache_key;  /* KV-prefix-cache identity (NULL = none) */
     s2p_sampling_cfg sampling;
     s2p_audio_cb     cb;
@@ -335,6 +336,19 @@ static int start_request(s2p_sched* s, sched_req* r, sched_active* slot) {
         r->refs[0].codes = codes;
         r->refs[0].T = T;
         r->n_refs = 1;
+        if (r->clone_out != NULL && r->clone_out->codes == NULL) {
+            /* memoize for the connection: long-form chunk 2+ passes
+             * these as refs and skips the ~1.1 s re-encode stall.
+             * codes pointer set last (the reader keys on it). */
+            size_t cb = (size_t)S2P_NUM_CODEBOOKS * (size_t)T *
+                        sizeof(int32_t);
+            int32_t* dup = (int32_t*)malloc(cb);
+            if (dup) {
+                memcpy(dup, codes, cb);
+                r->clone_out->T = T;
+                r->clone_out->codes = dup;
+            }
+        }
     }
 
     s2p_request_text req_text;
@@ -916,6 +930,7 @@ s2p_status s2p_sched_submit(s2p_sched* s, const s2p_request_text* req,
         }
         memcpy(r->ref_pcm, req->ref_pcm, nb);
         r->ref_pcm_n = req->ref_pcm_n;
+        r->clone_out = req->clone_codes_out;
     }
 
     pthread_mutex_lock(&s->mu);
