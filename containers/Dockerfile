@@ -21,7 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends git \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /work
 COPY scripts/build_fso.sh scripts/build_fso.sh
-RUN git clone --depth 1 https://github.com/luka-loehr/fish-scales-ops.git \
+RUN git clone --depth 1 https://github.com/fishaudio/fish-scales-ops.git \
         /work/3rdparty/fish-scales-ops \
     && ARCH=121a FSO_DIR=/work/3rdparty/fish-scales-ops \
        FSO_OUT=/work/3rdparty/build scripts/build_fso.sh
