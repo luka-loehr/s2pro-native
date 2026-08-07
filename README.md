@@ -119,6 +119,25 @@ lockstep scheduler (sessions, first-frame priority, backpressure)
 
 ## 4. Quickstart
 
+### Container (two commands)
+
+```bash
+docker pull ghcr.io/luka-loehr/s2pro-native:1.0.0
+docker run --gpus all -p 8010:8010 -v s2pro-data:/data \
+    ghcr.io/luka-loehr/s2pro-native:1.0.0
+```
+
+On first start the entrypoint downloads the S2-Pro checkpoint into the
+`s2pro-data` volume (Fish Audio Research License — non-commercial use;
+the checkpoint is never part of the image) and converts the codec
+artifact; every later start is warm. Optional: place a named-voice
+registry under `voices/` in the volume, a `qat_patch.safetensors` for
+the all-INT4 fast-AR, set `S2P_TOKEN` for bearer auth, `HF_TOKEN` if
+the checkpoint repo requires it. The image is built from
+[`containers/Dockerfile`](containers/Dockerfile) on an `sm_121` host.
+
+### From source
+
 Requires Docker with the NVIDIA runtime on an `sm_121` machine; the host
 needs no CUDA toolkit, Python, or PyTorch. Full walkthrough:
 [docs/SPARK.md](docs/SPARK.md).

@@ -200,9 +200,10 @@ hidden cosine **0.934** (vs 0.911), semantic argmax **0.551** (vs
 0.547), rollout **a1 0.602, a2 0.164, a3 0.098, a4 0.074** — equal at
 depth 1, slightly better where features compound. Run 2's checkpoint
 (`run2/draft.safetensors`, 114 M parameters bf16) is the retained
-artifact. Both runs and the corpus remain on the box for the scaling
-curve (1 M → 3 M → 10 M frames) should the relaxed-acceptance track be
-authorized.
+artifact. Both runs and the corpus were retained until the
+2026-08-07 machine cleanup; they are regenerable from the tools in this
+repository (`draft_corpus.py`, ~9 h of generation; `draft_train.py`,
+~35 min per run).
 
 ### 6.3 The decision this leaves
 

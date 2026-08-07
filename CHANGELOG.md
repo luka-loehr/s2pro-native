@@ -8,6 +8,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 for published releases.
 
+## [Unreleased]
+
+### Added
+- Container distribution: `containers/Dockerfile` builds the
+  self-contained serving image (multi-stage; fish-scales-ops and the
+  engine compiled from source, CUDA runtime base, CPU-torch only for
+  the one-time codec conversion). Published as
+  `ghcr.io/luka-loehr/s2pro-native`; two-command quickstart in the
+  README. The checkpoint is never part of the image.
+
 ## [1.0.0] — 2026-08-07
 
 First stable release. The serving stack, its quality gates, and its
