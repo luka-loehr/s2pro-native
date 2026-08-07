@@ -11,6 +11,16 @@ for published releases.
 ## [Unreleased]
 
 ### Added
+- Audit tail, all individually gated: fast-AR batched
+  rope/append/attention (bit-identical, B=8 1.41 -> 1.35), split-K
+  attention tile skew (bit-identical), per-connection clone-codes memo
+  (clone long-form at registry RTF 0.52), DAC encode workspace freed
+  after use, dead fast-AR slab memset dropped (bit-identical), and a
+  parity-gated tensor-core prefill for chunk-sized M behind
+  S2P_PREFILL_TC=1 (default off; cos 0.9926, TTFA 0.64 -> 0.61).
+  Final series: B=4/8/12/16 worst RTF 0.83/1.36/2.18/2.82.
+- api/openapi.yaml: the complete HTTP contract as OpenAPI 3.1 (every
+  field, default, error shape, streaming/backpressure semantics).
 - Sliced LM-head: the decode head serves the sampler's 4,097 candidate
   rows instead of all 155,776 — bit-identical (smoke and two-stream
   fixed-seed MD5s unchanged), ~389 MB less weight stream per frame.
