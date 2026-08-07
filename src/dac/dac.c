@@ -666,6 +666,15 @@ s2p_status s2p_dac_encode(s2p_dac* d, const float* pcm, int64_t n_samples,
     if (ce != cudaSuccess) { free(host); return S2P_ERR_CUDA; }
     *codes_out = host;
     *T_out = F;
+    /* encode workspaces reach GBs for a 60 s reference (64*L floats x4);
+     * encodes are rare (registry load, clone), so return the arena now
+     * and let the next encode re-allocate */
+    if (d->ws && d->ws_bytes > (256u << 20)) {
+        cudaFree(d->ws);
+        d->ws = NULL;
+        d->ws_bytes = 0;
+        d->ws_buf_floats = 0;
+    }
     return S2P_OK;
 }
 
