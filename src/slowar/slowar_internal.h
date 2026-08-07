@@ -133,6 +133,7 @@ struct s2p_model {
     s2p_tensor slogc;   /* [max_sessions, 4096] bf16 — semantic head slice */
     s2p_tensor sloge;   /* [max_sessions, 1] bf16 — EOS head row */
     int head_full;      /* S2P_HEAD_FULL=1: compute the full-vocab head */
+    int scratch_rows;   /* prefill scratch row capacity (default 2048) */
     s2p_tensor sattn_part; /* [max_sessions, 32, ctx/64, 130] f32 split-K
                             * flash-decode partials (s2pk_attention_decode) */
     /* device sampling: per-frame output block (fixed layout by max_sessions:

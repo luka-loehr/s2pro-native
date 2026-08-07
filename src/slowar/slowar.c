@@ -279,6 +279,13 @@ s2p_status s2p_session_prefill(s2p_session* s, const int64_t* ids,
     const int pos0 = s->kv_len;
     /* reference clamps max_new_tokens to ctx-1-prompt: need >= 1 decode slot */
     if (pos0 + n_ids > m->ctx_len - 1) return S2P_ERR_INVALID;
+    if (n_ids > m->scratch_rows) {
+        fprintf(stderr,
+                "[s2pro] prefill of %d ids exceeds scratch capacity %d "
+                "(raise S2P_SCRATCH_ROWS)\n",
+                n_ids, m->scratch_rows);
+        return S2P_ERR_INVALID;
+    }
 
     for (int i = 0; i < n_ids; i++)
         if (ids[i] < 0 || ids[i] >= S2P_TEXT_VOCAB) return S2P_ERR_INVALID;
