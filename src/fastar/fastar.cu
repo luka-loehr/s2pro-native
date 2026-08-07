@@ -731,8 +731,11 @@ s2p_status s2pfa_decode_frame_batch_dev(s2pfa* f, const __nv_bfloat16* hidden,
     if (B < 1 || B > f->max_b) return S2P_ERR_INVALID;
     *stage_dev = f->stage;
 
-    /* reset_caches(): the reference zeroes the KV cache EVERY frame. */
-    S2P_CUDA_TRY(cudaMemsetAsync(f->kv_slab, 0, f->kv_slab_bytes, stream));
+    /* reset_caches(): the reference zeroes the KV cache every frame, but
+     * every position the attention reads (0..cb_idx) is freshly appended
+     * within the same frame before it is read — the zeroing is
+     * semantically dead and cost a full-slab memset per frame. Dropped;
+     * gated on unchanged take MD5s (audit small-catch). */
 
     /* Prime pass, KV pos 0: project_in = Identity on the FINAL-NORMED slow
      * hidden (PORTING pitfall 5). The reference computes output(norm(x)) here
