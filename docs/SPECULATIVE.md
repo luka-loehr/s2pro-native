@@ -219,6 +219,36 @@ authorized: E ≈ 1 + a_sem · a_code-relaxed per pass, plausibly
 1.4–1.6× fewer backbone passes (RTF ~0.38–0.42), to be measured, with
 every relaxation step listening-gated. Absent that authorization, the
 serving stack stands at RTF 0.58 single-stream / cap 4–5 concurrent,
-and this report closes as the third measured structural negative of
-the optimization program — alongside FP8 and the bit-identical GEMV
+and this report would close as the third measured structural negative
+of the optimization program — alongside FP8 and the bit-identical GEMV
 campaign — each of which changed where the next effort goes.
+
+## 7. The authorized track: relaxed acceptance, staged and gated
+
+The relaxed track was authorized on 2026-08-07. Because the
+approximation enters the PERMANENT KV cache of accepted positions
+(drift is the failure mode to fear), the build is staged so that
+audio-affecting risk arrives last:
+
+1. **Native draft forward** (`src/draft/`): load `draft.safetensors`
+   (fuse + one backbone-shaped layer + final norm, bf16, own per-take
+   RoPE positions and per-session KV), reusing the engine's kernel
+   entry points. Gate: cosine ≥ 0.999 against the torch draft on
+   fixture (h, e) pairs — parity before anything touches serving.
+2. **Shadow mode** (`S2P_SPEC_SHADOW=1`): the draft runs alongside
+   normal decode WITHOUT changing any output, logging the real
+   in-engine semantic acceptance under the production sampler and the
+   embedding-space distance Δe between drafted and true codes. This
+   measures the actual α and the Δe distribution that the relaxation
+   threshold θ must be chosen from — on real serving, at zero quality
+   risk.
+3. **Verify-pass integration** (`S2P_SPEC=1`): sessions contribute two
+   rows to the lockstep tick (the second fed by the drafted frame);
+   Leviathan accept/reject on the sampler-transformed distributions of
+   both draft and target; the relaxed code check admits the second
+   position when Δe ≤ θ. θ starts at 0 (behaviorally identical to
+   non-speculative serving) and is loosened stepwise, each step
+   listening-gated, with the envelope and EOS instruments alongside.
+
+Every stage lands as its own gated commit; a failed gate at any stage
+closes the track with the measurement that closed it.
