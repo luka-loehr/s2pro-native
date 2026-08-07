@@ -37,6 +37,9 @@ typedef struct {
 } s2p_dacw_ent;
 
 typedef struct {
+    void*  base_he;       /* f16 arena, ENCODE-only tensors (droppable) */
+    float* base_fe;       /* f32 keepers, ENCODE-only tensors (droppable) */
+    int    enc_dropped;   /* encoder arenas freed; encode unavailable */
     s2p_dacw_ent* ents;   /* sorted as listed in codec.idx */
     int           n_ents;
     float*        base;   /* device f32 blob; freed after f16 conversion */
@@ -51,6 +54,8 @@ void       s2p_dacw_free(s2p_dacw* w);
 /* Device pointer for a tensor by exact name, NULL if absent. */
 const float*        s2p_dacw_find(const s2p_dacw* w, const char* name);
 const s2p_dacw_ent* s2p_dacw_ent_find(const s2p_dacw* w, const char* name);
+int  dacw_is_enc(const char* name);
+void s2p_dacw_drop_encoder(s2p_dacw* w);
 
 /* ---------------- resolved weight views ---------------------------------- */
 

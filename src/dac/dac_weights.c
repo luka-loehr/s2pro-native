@@ -147,7 +147,7 @@ s2p_status s2p_dacw_load(const char* model_dir, s2p_dacw* w) {
     {
         const char* keep = getenv("S2P_DAC_F32");
         if (keep && keep[0] == '1' && keep[1] == '\0') return S2P_OK;
-        int64_t hbytes = 0, fbytes = 0;
+        int64_t hbytes = 0, fbytes = 0, hebytes = 0, febytes = 0;
         for (int i = 0; i < n; i++) {
             s2p_dacw_ent* e = &ents[i];
             size_t len = strlen(e->name);
@@ -158,18 +158,30 @@ s2p_status s2p_dacw_load(const char* model_dir, s2p_dacw* w) {
                          /* rvq.cu reads out_proj directly as f32 (the
                           * encode-side conv1d use forces f32 explicitly) */
                          strstr(e->name, "out_proj") == NULL;
+            /* encode-only tensors go into their own droppable arenas:
+             * the whole encoder stack plus the VQ in_proj/pre_module
+             * side, which only s2p_dac_encode touches */
+            const int enc = dacw_is_enc(e->name);
             if (wclass) {
-                e->h_off = hbytes;
-                hbytes += (e->nbytes / 2 + 255) & ~(int64_t)255;
+                e->h_off = enc ? hebytes : hbytes;
+                if (enc) hebytes += (e->nbytes / 2 + 255) & ~(int64_t)255;
+                else     hbytes  += (e->nbytes / 2 + 255) & ~(int64_t)255;
             } else {
-                e->f_off = fbytes;
-                fbytes += (e->nbytes + 255) & ~(int64_t)255;
+                e->f_off = enc ? febytes : fbytes;
+                if (enc) febytes += (e->nbytes + 255) & ~(int64_t)255;
+                else     fbytes  += (e->nbytes + 255) & ~(int64_t)255;
             }
         }
         void* devh = NULL;
         float* devf = NULL;
+        void* devhe = NULL;
+        float* devfe = NULL;
         if (cudaMalloc(&devh, (size_t)hbytes) != cudaSuccess ||
-            cudaMalloc((void**)&devf, (size_t)fbytes) != cudaSuccess) {
+            cudaMalloc((void**)&devf, (size_t)fbytes) != cudaSuccess ||
+            cudaMalloc(&devhe, (size_t)hebytes) != cudaSuccess ||
+            cudaMalloc((void**)&devfe, (size_t)febytes) != cudaSuccess) {
+            if (devhe) cudaFree(devhe);
+            if (devf) cudaFree(devf);
             if (devh) cudaFree(devh);
             fprintf(stderr, "[s2pro] dac: f16 arena alloc failed, staying "
                             "f32\n");
@@ -181,19 +193,23 @@ s2p_status s2p_dacw_load(const char* model_dir, s2p_dacw* w) {
             s2p_dacw_ent* e = &ents[i];
             const char* src = (const char*)dev + e->off;
             cudaError_t c2;
+            const int enc = dacw_is_enc(e->name);
             if (e->h_off >= 0)
-                c2 = s2pdk_f32_to_f16((const float*)src,
-                                      (char*)devh + e->h_off, e->nbytes / 4,
-                                      0);
+                c2 = s2pdk_f32_to_f16(
+                    (const float*)src,
+                    (char*)(enc ? devhe : devh) + e->h_off, e->nbytes / 4,
+                    0);
             else
-                c2 = cudaMemcpyAsync((char*)devf + e->f_off, src,
-                                     (size_t)e->nbytes,
+                c2 = cudaMemcpyAsync((char*)(enc ? devfe : devf) + e->f_off,
+                                     src, (size_t)e->nbytes,
                                      cudaMemcpyDeviceToDevice, 0);
             if (c2 != cudaSuccess) {
                 fprintf(stderr, "[s2pro] dac: f16 convert failed (%s), "
                                 "staying f32\n", cudaGetErrorString(c2));
                 cudaFree(devh);
                 cudaFree(devf);
+                cudaFree(devhe);
+                cudaFree(devfe);
                 for (int j = 0; j < n; j++)
                     ents[j].h_off = ents[j].f_off = -1;
                 return S2P_OK;
@@ -202,6 +218,8 @@ s2p_status s2p_dacw_load(const char* model_dir, s2p_dacw* w) {
         if (cudaDeviceSynchronize() != cudaSuccess) {
             cudaFree(devh);
             cudaFree(devf);
+            cudaFree(devhe);
+            cudaFree(devfe);
             for (int j = 0; j < n; j++)
                 ents[j].h_off = ents[j].f_off = -1;
             return S2P_OK;
@@ -210,6 +228,8 @@ s2p_status s2p_dacw_load(const char* model_dir, s2p_dacw* w) {
         w->base = NULL;
         w->base_h = devh;
         w->base_f = devf;
+        w->base_he = devhe;
+        w->base_fe = devfe;
         w->f16 = 1;
         s2pdk_weights_f16(1);
         fprintf(stderr, "[s2pro] dac: weights f16 (%lld MB, keepers %lld "
@@ -219,12 +239,33 @@ s2p_status s2p_dacw_load(const char* model_dir, s2p_dacw* w) {
     return S2P_OK;
 }
 
+int dacw_is_enc(const char* name) {
+    return strncmp(name, "encoder.", 8) == 0 ||
+           strstr(name, ".in_proj.") != NULL ||
+           strstr(name, "pre_module") != NULL;
+}
+
+/* Free the encode-only arenas (server calls this once the voice
+ * registry is loaded when per-request cloning is disabled): ~55% of
+ * the vocoder weight bytes. Irreversible for the process lifetime;
+ * s2p_dac_encode reports S2P_ERR_STATE afterwards. */
+void s2p_dacw_drop_encoder(s2p_dacw* w) {
+    if (!w || !w->f16 || w->enc_dropped) return;
+    if (w->base_he) cudaFree(w->base_he);
+    if (w->base_fe) cudaFree(w->base_fe);
+    w->base_he = NULL;
+    w->base_fe = NULL;
+    w->enc_dropped = 1;
+}
+
 void s2p_dacw_free(s2p_dacw* w) {
     if (!w) return;
     free(w->ents);
     if (w->base) cudaFree(w->base);
     if (w->base_h) cudaFree(w->base_h);
     if (w->base_f) cudaFree(w->base_f);
+    if (w->base_he) cudaFree(w->base_he);
+    if (w->base_fe) cudaFree(w->base_fe);
     memset(w, 0, sizeof(*w));
 }
 
@@ -246,9 +287,15 @@ const float* s2p_dacw_find(const s2p_dacw* w, const char* name) {
     if (w->f16) {
         /* w-class tensors live in the half blob (consumers pass them
          * through the void* launcher params); keepers are real f32 */
+        const int enc = dacw_is_enc(e->name);
+        if (enc && w->enc_dropped) return NULL;
         if (e->h_off >= 0)
-            return (const float*)((const char*)w->base_h + e->h_off);
-        return (const float*)((const char*)w->base_f + e->f_off);
+            return (const float*)((const char*)(enc ? w->base_he
+                                                    : w->base_h) +
+                                  e->h_off);
+        return (const float*)((const char*)(enc ? (const float*)w->base_fe
+                                                : w->base_f) +
+                              e->f_off);
     }
     return (const float*)((const char*)w->base + e->off);
 }

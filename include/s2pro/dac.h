@@ -58,6 +58,10 @@ void       s2p_dac_stream_destroy(s2p_dac_stream* s);
 
 /* Encoder (voice cloning): mono 44.1 kHz PCM in [-1,1] -> codes [10, T],
  * malloc'd, codebook-major. */
+/* Free the encode-only weight arenas (~55% of vocoder bytes). Encode
+ * afterwards returns S2P_ERR_STATE; decode is untouched. */
+void s2p_dac_drop_encoder(s2p_dac* d);
+
 s2p_status s2p_dac_encode(s2p_dac* d, const float* pcm, int64_t n_samples,
                           int32_t** codes_out, int* T_out, cudaStream_t stream);
 

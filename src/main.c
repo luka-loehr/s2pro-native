@@ -145,6 +145,11 @@ int main(int argc, char** argv) {
 
     /* 4b. named-voice registry (each reference encoded ONCE, cached) */
     rc = s2p_voices_load(voices_dir, dac, &voices);
+    {
+        const char* ke = getenv("S2P_KEEP_ENCODER");
+        if (!(ke && ke[0] == '1'))
+            s2p_dac_drop_encoder(dac);
+    }
     if (rc != S2P_OK) {
         fprintf(stderr, "[s2pro] voices load failed: %d\n", (int)rc);
         goto out;

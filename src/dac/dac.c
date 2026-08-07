@@ -552,6 +552,11 @@ static s2p_status run_vq_step(const s2pd_vq* vq, float* resid, int T,
 
 s2p_status s2p_dac_encode(s2p_dac* d, const float* pcm, int64_t n_samples,
                           int32_t** codes_out, int* T_out, cudaStream_t stream) {
+    if (d && d->w.enc_dropped) {
+        fprintf(stderr, "[s2pro] dac: encode unavailable (encoder weights "
+                        "dropped; start with S2P_KEEP_ENCODER=1)\n");
+        return S2P_ERR_STATE;
+    }
     if (!d || !pcm || !codes_out || !T_out || n_samples < 1)
         return S2P_ERR_INVALID;
     *codes_out = NULL;
@@ -662,4 +667,12 @@ s2p_status s2p_dac_encode(s2p_dac* d, const float* pcm, int64_t n_samples,
     *codes_out = host;
     *T_out = F;
     return S2P_OK;
+}
+
+void s2p_dac_drop_encoder(s2p_dac* d) {
+    if (!d) return;
+    s2p_dacw_drop_encoder(&d->w);
+    if (d->w.enc_dropped)
+        fprintf(stderr, "[s2pro] dac: encoder weights dropped (registry "
+                        "loaded; per-request cloning disabled)\n");
 }
