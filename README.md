@@ -37,7 +37,7 @@ An unpatched checkpoint serves the INT8-fast-AR configuration at
 measured path from 2.05 to 0.51 — including the negative results — is
 recorded in the technical reports (§7).
 
-> **Status: v0.2.0.** BF16, INT8, and the
+> **Status: v1.0.0, stable.** BF16, INT8, and the
 > packed group-wise INT4 backbone pass the layer-parity gate against the
 > PyTorch reference; voice cloning, the multilingual voice registry, and
 > the HTTP streaming server are exercised end to end on real hardware.

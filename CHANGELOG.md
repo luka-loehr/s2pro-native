@@ -8,6 +8,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 for published releases.
 
+## [1.0.0] — 2026-08-07
+
+First stable release. The serving stack, its quality gates, and its
+documentation are complete; the API contract is frozen at
+[`api/openapi.yaml`](api/openapi.yaml) and will evolve
+backward-compatibly within 1.x.
+
+Headline, measured on one DGX Spark (GB10, `sm_121`): wall RTF **0.51**
+zero-shot / **0.52** warm voice reference / **0.50** chunked long-form,
+TTFA 0.14–0.20 s, server start ~78 s warm, ~5.4 GB steady-state device
+memory, up to 5 concurrent streams under the per-stream RTF < 1 rule.
+
+### Changed
+- Repository release sweep: verified-unused imports removed from the
+  offline tools; full-tree artifact audit (tracked files are source,
+  documentation, specifications, and parity evidence only — measured
+  negative paths remain in-tree deliberately, each env-gated and
+  documented in the reports).
+
 ## [0.2.0] — 2026-08-07
 
 ### Added

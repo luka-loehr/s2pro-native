@@ -24,10 +24,7 @@ Usage (inside a torch container, model dir + dump mounted):
 """
 import argparse
 import json
-import math
 import os
-import struct
-import sys
 import time
 
 import numpy as np
