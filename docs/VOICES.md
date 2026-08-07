@@ -101,3 +101,38 @@ curl -s -X POST localhost:8010/v1/tts \
 `reference_audio_b64` wins over `voice`; neither field selects zero-shot.
 The on-the-fly clone pays one DAC encode (~1 s per 10 s of audio) on the
 scheduler thread per request; named voices do not.
+
+
+## Licensing of generated reference audio
+
+The reference clips this deployment generates via the Gemini API are
+governed by Google's terms, reviewed 2026-08-07 (Gemini API Additional
+Terms of Service, section "Use of Generated Content"; Google APIs ToS
+§5). The four facts that shape this project's policy:
+
+1. **Ownership**: Google claims no ownership of generated content and
+   grants none — and purely machine-generated TTS audio most likely
+   carries no copyright at all (no personal intellectual creation).
+   Nothing here can be sublicensed, which is one reason the clips are
+   not part of this repository.
+2. **Redistribution**: not clearly permitted. The APIs ToS content
+   clause (§5e) can be read to prohibit distributing API-returned
+   content; Google's own product documentation contradicts the wide
+   reading, but it is not watertight. Reference audio is therefore
+   generated per deployment and never committed; the repository's
+   history was scrubbed of three clips that were briefly tracked in an
+   early commit.
+3. **Use as cloning reference**: no clause prohibits using generated
+   audio as an inference-time conditioning input for another TTS
+   system — this project trains nothing on Gemini output and touches
+   no weights, which distinguishes it from the "develop models that
+   compete" restriction. The "replicate any component of the Services"
+   clause is the untested edge; publicly distributing cloned-voice
+   audio banks would move toward it, which this project does not do.
+4. **Under-18 clause**: the Gemini terms prohibit using the API as
+   part of a service directed at under-18s. This deployment's
+   architecture is shaped by that clause: the Gemini API is called
+   exactly once, at deployment time, by an adult operator running
+   `tools/voicegen`; the serving system and its users never touch the
+   Gemini API. The running application is therefore not an API client
+   in the sense of the clause.
