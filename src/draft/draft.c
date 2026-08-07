@@ -7,6 +7,17 @@
 
 #include "s2pro/config.h"
 #include "s2pro/gemm.h"
+
+/* C-compat shim for the frozen kernels.h prototypes (same pattern as
+ * src/slowar/slowar_kernels.h): cuda_bf16.h defines __nv_bfloat16 only
+ * under C++; only pointers cross the ABI, so a layout-identical POD is
+ * exact. */
+#if !defined(__cplusplus) && !defined(S2P_SLOWAR_BF16_SHIM)
+#define S2P_SLOWAR_BF16_SHIM
+typedef struct {
+    unsigned short x;
+} __nv_bfloat16;
+#endif
 #include "s2pro/kernels.h"
 
 #define TRY(x)                                                              \
