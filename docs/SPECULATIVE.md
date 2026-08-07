@@ -235,6 +235,9 @@ audio-affecting risk arrives last:
    RoPE positions and per-session KV), reusing the engine's kernel
    entry points. Gate: cosine ≥ 0.999 against the torch draft on
    fixture (h, e) pairs — parity before anything touches serving.
+   **PASSED 2026-08-07**: mean cosine 0.999986, min 0.999962 over the
+   32-position fixture — native forward, loader, per-session KV state
+   and per-take RoPE all verified against the torch draft.
 2. **Shadow mode** (`S2P_SPEC_SHADOW=1`): the draft runs alongside
    normal decode WITHOUT changing any output, logging the real
    in-engine semantic acceptance under the production sampler and the
