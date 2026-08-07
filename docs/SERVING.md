@@ -230,6 +230,22 @@ GEMM per linear, deep in the regime where the matrix units win. The
 spec-decoding build (draft model, corpus, verify machinery) is the
 companion track; this kernel is its GEMM engine.
 
+## 12. Sliced LM-head: the audit's largest single-stream lever
+
+The decode head computed all 155,776 vocabulary logits every frame;
+the semantic sampler reads exactly 4,096 contiguous semantic rows plus
+the EOS row. Serving them from the same sidecar rows through the same
+GEMV with the same accumulation into two compact buffers is
+bit-identical — smoke MD5 and both two-stream fixed-seed WAVs
+unchanged — and removes ~389 MB of weight stream per frame: decode
+23.2 → 21.7 ms/frame, server wall RTF **0.55 → 0.51 zero-shot /
+0.52 voice-ref** (same script, same day). The full-vocabulary head
+remains on the parity-dump path and behind `S2P_HEAD_FULL=1`.
+Found by the 43-agent full-repository audit of 2026-08-07, which also
+surfaced the M > 8 dispatch bug above and a prefix-cache teardown
+leak (both fixed), and whose ranked remaining levers are tracked in
+the audit record.
+
 ## 10. The GEMM pipeline campaign: three bit-identical variants, all measured out
 
 After the staged GEMV failed (§8), its two identified defects were fixed
@@ -333,13 +349,19 @@ serving all rows) rather than any further KV work.
 
 
 
-**Where the wall lives now.** The DAC batching changes none of these
-numbers (batch-off and batch-on walls are identical at every B) — the
-per-stream marginal cost of ~6.3 ms is not vocoder work. It matches the
-backbone's per-stream KV read: ~1450 prefix tokens × 74 KB (INT8 KV)
-× 16 streams ≈ 1.7 GB per tick ≈ 7.7 ms at bus speed. Concurrency is
-now KV-bandwidth-bound; the cap under the per-stream RTF < 1 rule is
-**5** (B = 4 at 0.91 with margin, B = 6 at 1.16 just over). The next
-structural levers are KV-side: shorter effective contexts, sub-8-bit
-KV, or attention windowing — plus the reviewed D1 (DAC graph capture)
-for launch-gap economy.
+**Where the wall lives now.** An earlier revision of this section
+attributed the concurrency wall to backbone KV bandwidth; that claim
+is corrected here, twice over. First, its arithmetic compared a
+per-tick total against a per-stream marginal (a units error). Second,
+the section's own reference-trimming experiment falsified it: cutting
+the cached prefix 2.3× moved B = 12 by only ~9 %. The wall is the
+O(M) arithmetic of the batch GEMV (§10), with the tensor-core path
+(§11) as the measured-but-not-yet-winning attack on it. KV-side
+levers remain real as MEMORY levers only.
+
+A second correction: the B ≥ 9 figures originally published in §10/§11
+were measured through an out-of-bounds dispatch bug (the staged-GEMV
+rewrite dropped the M > 8 kernel instantiation; fixed 2026-08-07).
+Re-measured on the fixed kernel WITH the sliced LM-head (§12):
+B = 4/8/12/16 worst per-stream RTF **0.86 / 1.41 / 2.27 / 2.97**. The
+cap under the per-stream RTF < 1 rule stays 5.
