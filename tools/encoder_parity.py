@@ -22,7 +22,6 @@ Usage (inside a torch container with the codec checkpoint mounted):
 """
 import argparse
 import json
-import struct
 import sys
 
 
