@@ -1,0 +1,12 @@
+build/
+model/
+3rdparty/
+artifacts-local/
+.git/
+.github/
+voices/*.wav
+voices/*.txt
+voices/*.codes
+docs/assets/
+*.o
+MONDAY-PLAN.md
