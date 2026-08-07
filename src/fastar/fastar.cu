@@ -19,6 +19,9 @@
 
 #include "fastar.h"
 #include "s2pro/kernels.h"
+/* batched decode uses the slow-AR private launchers (rope_pos and the
+ * per-row-cache append/attention); C++ TU, so the real bf16 type */
+#include "../slowar/slowar_kernels.h"
 #include "s2pro/tensor.h"
 
 /* parity dump hooks (src/slowar/debug_dump.c); no-ops without S2P_DUMP_DIR */
@@ -69,10 +72,29 @@ struct s2pfa {
     int32_t       *sem_host;     /* pinned [B] */
     __nv_bfloat16 *kv_slab;      /* [FA_LAYERS][max_b][2][FA_KVSZ] */
     size_t         kv_slab_bytes;
+    /* batched rope/append/attention (audit P1-8): per-(layer,row) cache
+     * pointer tables + per-codebook-step constant position arrays, built
+     * whenever the slab is (re)allocated — the decode loop then runs 3
+     * batched launches instead of 3*B */
+    __nv_bfloat16 **d_kptr, **d_vptr; /* [FA_LAYERS*max_b] device */
+    int32_t        *d_cbpos;          /* [10*max_b] device, row j = j/max_b */
     /* vq scratch (grow-on-demand) */
     int32_t       *vq_dev;
     size_t         vq_cap;       /* elements */
 };
+
+static s2p_status fa_build_batch_tables(struct s2pfa* f, int B);
+
+/* S2P_FA_LOOP=1 restores the per-row launch loop (revert path for the
+ * batched variant; outputs must be MD5-identical either way). */
+static int fa_loop_forced(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("S2P_FA_LOOP");
+        v = (e && e[0] == '1') ? 1 : 0;
+    }
+    return v;
+}
 
 /* ---------------------------------------------------------------- kernels */
 
@@ -332,6 +354,7 @@ s2p_status s2pfa_load(s2pfa** out, s2p_st* st, s2p_qcache* qc,
                 cudaSuccess)
                 rc = S2P_ERR_OOM;
         }
+        if (rc == S2P_OK) rc = fa_build_batch_tables(f, B);
         if (rc == S2P_OK &&
             cudaMalloc((void**)&f->ids64, B * sizeof(int64_t)) != cudaSuccess)
             rc = S2P_ERR_OOM;
@@ -586,6 +609,44 @@ static inline __nv_bfloat16* fa_vcache(s2pfa* f, int l, int b) {
     return f->kv_slab + ((size_t)(l * f->max_b + b) * 2 + 1) * FA_KVSZ;
 }
 
+static s2p_status fa_build_batch_tables(s2pfa* f, int B) {
+    if (f->d_kptr) cudaFree(f->d_kptr);
+    if (f->d_vptr) cudaFree(f->d_vptr);
+    if (f->d_cbpos) cudaFree(f->d_cbpos);
+    f->d_kptr = f->d_vptr = NULL;
+    f->d_cbpos = NULL;
+    size_t np = (size_t)FA_LAYERS * B;
+    __nv_bfloat16** hk =
+        (__nv_bfloat16**)malloc(np * sizeof(void*) * 2);
+    int32_t* hp = (int32_t*)malloc((size_t)FA_NCB * B * sizeof(int32_t));
+    if (!hk || !hp) { free(hk); free(hp); return S2P_ERR_OOM; }
+    __nv_bfloat16** hv = hk + np;
+    for (int l = 0; l < FA_LAYERS; l++)
+        for (int b = 0; b < B; b++) {
+            hk[l * B + b] = fa_kcache(f, l, b);
+            hv[l * B + b] = fa_vcache(f, l, b);
+        }
+    for (int cb = 0; cb < FA_NCB; cb++)
+        for (int b = 0; b < B; b++) hp[cb * B + b] = cb;
+    cudaError_t c1 = cudaMalloc((void**)&f->d_kptr, np * sizeof(void*));
+    cudaError_t c2 = cudaMalloc((void**)&f->d_vptr, np * sizeof(void*));
+    cudaError_t c3 =
+        cudaMalloc((void**)&f->d_cbpos, (size_t)FA_NCB * B * sizeof(int32_t));
+    if (c1 == cudaSuccess && c2 == cudaSuccess && c3 == cudaSuccess) {
+        c1 = cudaMemcpy(f->d_kptr, hk, np * sizeof(void*),
+                        cudaMemcpyHostToDevice);
+        c2 = cudaMemcpy(f->d_vptr, hv, np * sizeof(void*),
+                        cudaMemcpyHostToDevice);
+        c3 = cudaMemcpy(f->d_cbpos, hp, (size_t)FA_NCB * B * sizeof(int32_t),
+                        cudaMemcpyHostToDevice);
+    }
+    free(hk);
+    free(hp);
+    return (c1 == cudaSuccess && c2 == cudaSuccess && c3 == cudaSuccess)
+               ? S2P_OK
+               : S2P_ERR_CUDA;
+}
+
 /* One 4-layer forward of x [B, 2560] at KV position cb_idx. Matches
  * TransformerBlock.forward_kvcached: h = x + attn(attention_norm(x)),
  * out = h + ff(ffn_norm(h)); attention has NO qk-norm, RoPE at pos cb_idx
@@ -615,6 +676,22 @@ static s2p_status fa_run_layers(s2pfa* f, int B, int cb_idx,
                 f->q, f->k, f->v, fa_kcache(f, l, 0), fa_vcache(f, l, 0),
                 (size_t)2 * FA_KVSZ, f->attn, cb_idx, S2P_ROPE_BASE);
             S2P_CUDA_TRY(cudaGetLastError());
+        } else if (B > 1 && f->d_kptr && !fa_loop_forced()) {
+            /* three batched launches over per-row cache pointer tables
+             * and a constant per-step position array (audit P1-8) */
+            const int32_t* posv = f->d_cbpos + (size_t)cb_idx * f->max_b;
+            S2P_CUDA_TRY(s2pk_rope_pos(f->q, f->k, B, FA_QH, FA_KVH, FA_HD,
+                                       posv, S2P_ROPE_BASE, stream));
+            S2P_CUDA_TRY(s2pk_kv_append_ptrs(
+                f->k, f->v, f->d_kptr + (size_t)l * f->max_b,
+                f->d_vptr + (size_t)l * f->max_b, B, FA_KVH, FA_HD, posv,
+                FA_SEQ, stream));
+            S2P_CUDA_TRY(s2pk_attention_ptrs(
+                f->q, (const __nv_bfloat16* const*)(f->d_kptr +
+                                                    (size_t)l * f->max_b),
+                (const __nv_bfloat16* const*)(f->d_vptr +
+                                              (size_t)l * f->max_b),
+                f->attn, B, FA_QH, FA_KVH, FA_HD, posv, FA_SEQ, stream));
         } else {
             for (int b = 0; b < B; b++) {
                 S2P_CUDA_TRY(s2pk_rope(f->q + (size_t)b * FA_QW,
