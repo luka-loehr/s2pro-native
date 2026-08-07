@@ -508,7 +508,31 @@ static s2p_status decode_tick_enqueue(s2p_model* m, s2p_session* const* act,
     /* tied lm-head: logits[b] = hidden[b] @ embed^T. INT8 mode reads the
      * per-row-quantized sidecar; batches beyond the GEMV width use the kept
      * bf16 table. */
-    if (m->mode == S2P_GEMM_INT8 && m->embed_i8.data != NULL &&
+    const int head_full = m->head_full || s2psl_dump_dir() != NULL;
+    if (!head_full && m->mode == S2P_GEMM_INT8 && m->embed_i8.data != NULL) {
+        /* sliced head: the sampler consumes ONLY the 4096 semantic rows
+         * plus the EOS row — the same sidecar rows through the same GEMV
+         * with the same accumulation, so the sampled trajectory is
+         * bit-identical while the weight stream drops from 155776 to
+         * 4097 rows (~389 MB/frame less at INT8). */
+        const int8_t* sid = (const int8_t*)m->embed_i8.data;
+        const float* ssc = (const float*)m->embed_scale.data;
+        for (int m0 = 0; m0 < nact; m0 += S2P_INT8_GEMV_MAX_M) {
+            const int mm = nact - m0 > S2P_INT8_GEMV_MAX_M
+                               ? S2P_INT8_GEMV_MAX_M
+                               : nact - m0;
+            const char* hh = (const char*)m->shidden.data +
+                             (size_t)m0 * S2P_DIM * sizeof(uint16_t);
+            S2P_TRY(s2p_int8_gemv(
+                (char*)m->slogc.data + (size_t)m0 * 4096 * sizeof(uint16_t),
+                hh, sid + (size_t)S2P_TOK_SEMANTIC_START * S2P_DIM,
+                ssc + S2P_TOK_SEMANTIC_START, mm, 4096, S2P_DIM, st));
+            S2P_TRY(s2p_int8_gemv(
+                (char*)m->sloge.data + (size_t)m0 * sizeof(uint16_t), hh,
+                sid + (size_t)S2P_TOK_EOS * S2P_DIM, ssc + S2P_TOK_EOS, mm,
+                1, S2P_DIM, st));
+        }
+    } else if (m->mode == S2P_GEMM_INT8 && m->embed_i8.data != NULL &&
         nact <= S2P_INT8_GEMV_MAX_M)
         S2P_TRY(s2p_int8_gemv(m->slogits.data, m->shidden.data,
                               m->embed_i8.data,
@@ -552,9 +576,17 @@ static s2p_status decode_tick_enqueue(s2p_model* m, s2p_session* const* act,
     S2P_CUDA_TRY(cudaMemcpyAsync(m->d_sampptr, m->h_sampptr,
                                  (size_t)nact * sizeof(void*),
                                  cudaMemcpyHostToDevice, st));
-    S2P_CUDA_TRY(s2pk_sample((const __nv_bfloat16*)m->slogits.data,
-                             S2P_TEXT_VOCAB,
-                             (s2ps_dev_state* const*)m->d_sampptr, nact,
+    S2P_CUDA_TRY(s2pk_sample(
+        head_full || m->mode != S2P_GEMM_INT8 || m->embed_i8.data == NULL
+            ? (const __nv_bfloat16*)m->slogits.data
+            : (const __nv_bfloat16*)m->slogc.data,
+        head_full || m->mode != S2P_GEMM_INT8 || m->embed_i8.data == NULL
+            ? (int64_t)S2P_TEXT_VOCAB
+            : (int64_t)4096,
+        head_full || m->mode != S2P_GEMM_INT8 || m->embed_i8.data == NULL
+            ? (const __nv_bfloat16*)NULL
+            : (const __nv_bfloat16*)m->sloge.data,
+        (s2ps_dev_state* const*)m->d_sampptr, nact,
                              d_tok, d_sem, d_codes, d_eos, st));
     const int32_t* stage = NULL;
     S2P_TRY(s2pfa_decode_frame_batch_dev(m->fastar,
