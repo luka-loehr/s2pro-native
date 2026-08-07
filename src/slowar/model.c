@@ -99,16 +99,27 @@ static s2p_status alloc_2d(s2p_tensor* t, int64_t r, int64_t c, s2p_dtype dt) {
 static s2p_status alloc_scratch(s2p_model* m) {
     const int64_t ctx = m->ctx_len;
     const int64_t ms = m->max_sessions;
-    S2P_TRY(alloc_2d(&m->sx, ctx, S2P_DIM, S2P_DT_BF16));
-    S2P_TRY(alloc_2d(&m->snorm, ctx, S2P_DIM, S2P_DT_BF16));
-    S2P_TRY(alloc_2d(&m->sqkv, ctx, S2P_QKV_WIDTH, S2P_DT_BF16));
-    S2P_TRY(alloc_2d(&m->sq, ctx, S2P_Q_WIDTH, S2P_DT_BF16));
-    S2P_TRY(alloc_2d(&m->sk, ctx, S2P_KV_WIDTH, S2P_DT_BF16));
-    S2P_TRY(alloc_2d(&m->sv, ctx, S2P_KV_WIDTH, S2P_DT_BF16));
-    S2P_TRY(alloc_2d(&m->sattn, ctx, S2P_Q_WIDTH, S2P_DT_BF16));
-    S2P_TRY(alloc_2d(&m->sproj, ctx, S2P_DIM, S2P_DT_BF16));
-    S2P_TRY(alloc_2d(&m->sgu, ctx, S2P_GU_ROWS, S2P_DT_BF16));
-    S2P_TRY(alloc_2d(&m->sffn, ctx, S2P_FFN_DIM, S2P_DT_BF16));
+    /* Prefill activation scratch is sized by the longest single prefill
+     * pass, not the context: the largest real pass is the system+
+     * reference block (~1400 ids). 2048 halves ~436 MB of scratch;
+     * s2p_prefill guards the bound (S2P_SCRATCH_ROWS overrides). */
+    int64_t pr = 2048;
+    {
+        const char* e = getenv("S2P_SCRATCH_ROWS");
+        if (e && atoi(e) > 0) pr = atoi(e);
+        if (pr > ctx) pr = ctx;
+    }
+    m->scratch_rows = (int)pr;
+    S2P_TRY(alloc_2d(&m->sx, pr, S2P_DIM, S2P_DT_BF16));
+    S2P_TRY(alloc_2d(&m->snorm, pr, S2P_DIM, S2P_DT_BF16));
+    S2P_TRY(alloc_2d(&m->sqkv, pr, S2P_QKV_WIDTH, S2P_DT_BF16));
+    S2P_TRY(alloc_2d(&m->sq, pr, S2P_Q_WIDTH, S2P_DT_BF16));
+    S2P_TRY(alloc_2d(&m->sk, pr, S2P_KV_WIDTH, S2P_DT_BF16));
+    S2P_TRY(alloc_2d(&m->sv, pr, S2P_KV_WIDTH, S2P_DT_BF16));
+    S2P_TRY(alloc_2d(&m->sattn, pr, S2P_Q_WIDTH, S2P_DT_BF16));
+    S2P_TRY(alloc_2d(&m->sproj, pr, S2P_DIM, S2P_DT_BF16));
+    S2P_TRY(alloc_2d(&m->sgu, pr, S2P_GU_ROWS, S2P_DT_BF16));
+    S2P_TRY(alloc_2d(&m->sffn, pr, S2P_FFN_DIM, S2P_DT_BF16));
     S2P_TRY(alloc_2d(&m->shidden, ms, S2P_DIM, S2P_DT_BF16));
     S2P_TRY(alloc_2d(&m->slogits, ms, S2P_TEXT_VOCAB, S2P_DT_BF16));
     S2P_TRY(alloc_2d(&m->slogc, ms, 4096, S2P_DT_BF16));
