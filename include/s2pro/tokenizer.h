@@ -42,6 +42,11 @@ typedef struct {
      * reference block, e.g. the registry voice name. NULL disables caching
      * for this request (per-request clones have no stable identity). */
     const char*        cache_key;
+    /* Clone-codes memo (additive, 2026-08-07): if set, the scheduler
+     * worker deposits a malloc'd copy of the codes it encoded from
+     * ref_pcm here (codes pointer written last). Long-form chunk 2+
+     * passes them via refs and skips the re-encode stall. */
+    s2p_vq_part*       clone_codes_out;
 } s2p_request_text;
 
 /* Sentence-aware UTF-8 text chunking for long-form synthesis (additive,

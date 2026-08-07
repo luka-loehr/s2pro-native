@@ -136,7 +136,8 @@ typedef struct {
     int         gap_lead_skip;      /* trimming next chunk's leading silence */
     size_t      gap_lead_skipped;
     const s2p_voice* lf_voice;      /* registry voice (stable) or NULL */
-    float*      lf_clone_pcm;       /* inline clone, re-encoded per chunk */
+    float*      lf_clone_pcm;       /* inline clone PCM (chunk 1 encodes) */
+    s2p_vq_part lf_clone_part;      /* worker-deposited codes; chunk 2+ */
     int64_t     lf_clone_n;
     char*       lf_clone_text;
     s2p_sampling_cfg lf_sampling;   /* base; per-chunk seed derived */
@@ -463,10 +464,16 @@ static s2p_status submit_chunk(http_srv* s, conn* c) {
     s2p_request_text req;
     memset(&req, 0, sizeof(req));
     req.text = c->chunks[c->cur_chunk];
-    if (c->lf_clone_pcm) {
+    if (c->lf_clone_pcm && c->lf_clone_part.codes != NULL) {
+        /* clone codes memoized by the worker on chunk 1 */
+        req.refs = &c->lf_clone_part;
+        req.n_refs = 1;
+        req.ref_text = c->lf_clone_text;
+    } else if (c->lf_clone_pcm) {
         req.ref_pcm = c->lf_clone_pcm;
         req.ref_pcm_n = c->lf_clone_n;
         req.ref_text = c->lf_clone_text;
+        req.clone_codes_out = &c->lf_clone_part;
     } else if (c->lf_voice) {
         req.refs = &c->lf_voice->part;
         req.n_refs = 1;
@@ -490,6 +497,7 @@ static void conn_reset(conn* c) {
     free(c->acc);
     s2p_text_chunks_free(c->chunks, c->n_chunks);
     free(c->lf_clone_pcm);
+    free((void*)c->lf_clone_part.codes);
     free(c->lf_clone_text);
     free(c->gap_hold);
     memset(c, 0, sizeof(*c));
