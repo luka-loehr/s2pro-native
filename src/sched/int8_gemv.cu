@@ -545,6 +545,9 @@ static __global__ void k_gemv_tc(__nv_bfloat16* y, const __nv_bfloat16* x,
     const int warp = threadIdx.x >> 5;
     const int lane = threadIdx.x & 31;
     const int n0 = (blockIdx.x * TC_WARPS + warp) * 16;
+    /* blockIdx.y tiles M in 16-row steps (prefill chunks, M <= 128);
+     * decode launches with gridDim.y == 1 and m0 == 0 as before */
+    const int m0 = (int)blockIdx.y * 16;
 
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> c;
     wmma::fill_fragment(c, 0.0f);
@@ -553,8 +556,8 @@ static __global__ void k_gemv_tc(__nv_bfloat16* y, const __nv_bfloat16* x,
         __syncthreads();
         for (int i = threadIdx.x; i < 16 * 64; i += blockDim.x) {
             const int m = i >> 6, k = i & 63;
-            xs[m][k] = (m < M) ? x[(size_t)m * K + c0 + k]
-                               : __float2bfloat16(0.0f);
+            xs[m][k] = (m0 + m < M) ? x[(size_t)(m0 + m) * K + c0 + k]
+                                    : __float2bfloat16(0.0f);
         }
         __syncthreads();
         /* dequant the warp's [16 n x 64 k] weight tile with ALL 32
@@ -608,8 +611,9 @@ static __global__ void k_gemv_tc(__nv_bfloat16* y, const __nv_bfloat16* x,
     __syncwarp();
     for (int i = lane; i < 16 * 16; i += 32) {
         const int m = i >> 4, j = i & 15;
-        if (m < M && n0 + j < N)
-            y[(size_t)m * N + n0 + j] = __float2bfloat16(cs[warp][m][j]);
+        if (m0 + m < M && n0 + j < N)
+            y[(size_t)(m0 + m) * N + n0 + j] =
+                __float2bfloat16(cs[warp][m][j]);
     }
 }
 
@@ -892,6 +896,32 @@ extern "C" s2p_status s2p_int4p_gemv(void* y_bf16, const void* x_bf16,
     if (ce != cudaSuccess) {
         fprintf(stderr, "[s2pro] int4p gemv launch (M=%d,N=%d,K=%d): %s\n", M,
                 N, K, cudaGetErrorString(ce));
+        return S2P_ERR_CUDA;
+    }
+    return S2P_OK;
+}
+
+/* Tensor-core GEMM over the packed INT4 weights for prefill-sized M
+ * (17..128): in-register dequant, no scratch round-trip. Same numerics
+ * class as the dequant+cuBLAS path (bf16 effective weights, f32
+ * accumulators) with a different summation order — parity-gated, not
+ * MD5-gated (S2P_PREFILL_TC=1 enables in gemm.c). */
+extern "C" s2p_status s2p_int4p_gemm_tc(void* y_bf16, const void* x_bf16,
+                                        const void* w_pack,
+                                        const void* scales_f16, int M, int N,
+                                        int K, int G, cudaStream_t stream) {
+    const int gs = gshift_of(G);
+    if (!y_bf16 || !x_bf16 || !w_pack || !scales_f16 || M <= 0 || M > 128 ||
+        N <= 0 || K <= 0 || K % 64 != 0 || gs < 0 || K % G != 0)
+        return S2P_ERR_INVALID;
+    dim3 grid((N + 16 * TC_WARPS - 1) / (16 * TC_WARPS), (M + 15) / 16);
+    k_gemv_tc<<<grid, TC_WARPS * 32, 0, stream>>>(
+        (__nv_bfloat16*)y_bf16, (const __nv_bfloat16*)x_bf16,
+        (const uint8_t*)w_pack, (const __half*)scales_f16, M, N, K, gs);
+    cudaError_t ce = cudaGetLastError();
+    if (ce != cudaSuccess) {
+        fprintf(stderr, "[s2pro] int4p tc gemm (M=%d,N=%d,K=%d): %s\n", M, N,
+                K, cudaGetErrorString(ce));
         return S2P_ERR_CUDA;
     }
     return S2P_OK;

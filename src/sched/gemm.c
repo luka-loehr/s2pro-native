@@ -373,6 +373,20 @@ s2p_status s2p_linear_prepare_int8_site(s2p_linear* lin, s2p_qsite site,
 }
 
 /* Ensure the dequant scratch covers one [N,K] BF16 layer. g.mu held. */
+s2p_status s2p_int4p_gemm_tc(void* y_bf16, const void* x_bf16,
+                             const void* w_pack, const void* scales_f16,
+                             int M, int N, int K, int G,
+                             cudaStream_t stream);
+
+static int prefill_tc_on(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("S2P_PREFILL_TC");
+        v = (e && e[0] == '1') ? 1 : 0;
+    }
+    return v;
+}
+
 static s2p_status deq_scratch_reserve(size_t bytes, cudaStream_t stream) {
     if (bytes <= g.deq_bytes) return S2P_OK;
     S2P_CUDA_TRY(cudaStreamSynchronize(stream));
@@ -441,6 +455,15 @@ s2p_status s2p_linear_forward(const s2p_linear* lin, const void* x_bf16,
                                  (const float*)lin->w_iscale.data, M, N, K,
                                  stream);
         }
+        /* S2P_PREFILL_TC=1: chunk-sized prefills (M <= 128) run the
+         * tensor-core GEMM over the packed weights directly — no
+         * N*K*2 B dequant round-trip per linear per chunk. Different
+         * summation order than cuBLAS, so parity-gated and off by
+         * default (audit P1-5). */
+        if (prefill_tc_on() && lin->q_packed && M <= 128 && K % 64 == 0)
+            return s2p_int4p_gemm_tc(y_bf16, x_bf16, lin->w_pack.data,
+                                     lin->w_iscale.data, M, N, K,
+                                     lin->q_group, stream);
         /* prefill / oversize batch: dequant into the shared scratch, then
          * the proven cuBLAS call. Lock held across both so a concurrent
          * reserve can never free the scratch under the GEMM. */
