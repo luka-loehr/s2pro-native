@@ -879,8 +879,12 @@ extern "C" s2p_status s2p_int4p_gemv(void* y_bf16, const void* x_bf16,
                 <<<blocks, GEMV_WARPS * 32, smem, stream>>>(
         (__nv_bfloat16*)y_bf16, (const __nv_bfloat16*)x_bf16,
         (const uint8_t*)w_pack, (const __half*)scales_f16, M, N, K, gs);
-    } else {
+    } else if (M <= 8) {
         k_gemv_p<8><<<blocks, GEMV_WARPS * 32, 0, stream>>>(
+        (__nv_bfloat16*)y_bf16, (const __nv_bfloat16*)x_bf16,
+        (const uint8_t*)w_pack, (const __half*)scales_f16, M, N, K, gs);
+    } else {
+        k_gemv_p<S2P_INT8_GEMV_MAX_M><<<blocks, GEMV_WARPS * 32, 0, stream>>>(
         (__nv_bfloat16*)y_bf16, (const __nv_bfloat16*)x_bf16,
         (const uint8_t*)w_pack, (const __half*)scales_f16, M, N, K, gs);
     }

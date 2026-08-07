@@ -1010,7 +1010,9 @@ void s2p_sched_destroy(s2p_sched* s) {
     if (!s) return;
     (void)s2p_sched_stop(s);
     /* Worker exit path drained the queue and retired all sessions. */
-    for (int i = 0; i < 16; i++) {
+    for (int i = 0; i < 40; i++) { /* full kvc[] — the cap-raise to 40
+                                    * left this at 16, leaking up to 24
+                                    * prefix blobs per destroy */
         free(s->kvc[i].name);
         if (s->kvc[i].blob) cudaFree(s->kvc[i].blob);
     }
