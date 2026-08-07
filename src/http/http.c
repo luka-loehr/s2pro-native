@@ -206,12 +206,45 @@ static void http_sig_handler(int sig) {
 
 /* ------------------------------------------------------------- socket I/O */
 
+/* Wall-clock budget for one send_all call. SO_SNDTIMEO alone cannot
+ * bound the stall: a trickle-reading client that accepts one byte
+ * every few seconds resets the timeout on every partial write, and
+ * conn_emit runs on the SCHEDULER thread — an adversarial or wedged
+ * client would freeze every stream indefinitely. Sockets are
+ * non-blocking; on EAGAIN we poll for writability against a monotonic
+ * deadline and fail the connection when the budget is spent. */
+static int http_send_budget_ms(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char* e = getenv("S2P_HTTP_SEND_MS");
+        v = e ? atoi(e) : 2000;
+        if (v <= 0) v = 2000;
+    }
+    return v;
+}
+
+static int64_t mono_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 static int send_all(int fd, const void* buf, size_t n) {
     const char* p = (const char*)buf;
+    const int64_t deadline = mono_ms() + http_send_budget_ms();
     while (n > 0) {
-        ssize_t w = send(fd, p, n, MSG_NOSIGNAL);
+        ssize_t w = send(fd, p, n, MSG_NOSIGNAL | MSG_DONTWAIT);
         if (w < 0) {
             if (errno == EINTR) continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                int64_t left = deadline - mono_ms();
+                if (left <= 0) return -1; /* budget spent: drop client */
+                struct pollfd pw = { fd, POLLOUT, 0 };
+                if (poll(&pw, 1, left > 100 ? 100 : (int)left) < 0 &&
+                    errno != EINTR)
+                    return -1;
+                continue;
+            }
             return -1;
         }
         if (w == 0) return -1;
@@ -1015,6 +1048,10 @@ s2p_status s2p_server_run(s2p_sched* sched, const s2p_server_opts* opts) {
                                sizeof(one));
                     struct timeval tv = { HTTP_SEND_SECS, 0 };
                     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+                    /* non-blocking: send_all bounds worker stalls by
+                     * wall clock; the read loop is poll-driven */
+                    fcntl(fd, F_SETFL,
+                          fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
                 }
             }
         }
