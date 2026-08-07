@@ -21,10 +21,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends git \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /work
 COPY scripts/build_fso.sh scripts/build_fso.sh
-RUN git clone --depth 1 https://github.com/fishaudio/fish-scales-ops.git \
-        /work/3rdparty/fish-scales-ops \
-    && ARCH=121a FSO_DIR=/work/3rdparty/fish-scales-ops \
-       FSO_OUT=/work/3rdparty/build scripts/build_fso.sh
+# build_fso.sh clones fish-scales-ops itself, recursively (CUTLASS is a
+# submodule), when FSO_DIR does not exist yet
+RUN ARCH=121a FSO_DIR=/work/3rdparty/fish-scales-ops \
+    FSO_OUT=/work/3rdparty/build scripts/build_fso.sh
 
 # ---- stage 2: engine build --------------------------------------------------
 FROM nvidia/cuda:${CUDA_TAG}-devel-ubuntu24.04 AS build
