@@ -1,0 +1,302 @@
+openapi: "3.1.0"
+info:
+  title: s2pro-native TTS API
+  version: "0.1.0"
+  summary: Native S2-Pro text-to-speech serving on NVIDIA DGX Spark.
+  description: |
+    Dependency-free HTTP/1.1 interface of the s2pro-native serving engine
+    (`src/http/http.c`). Three routes: liveness/statistics, the named-voice
+    registry, and streaming synthesis.
+
+    **Streaming model.** `POST /v1/tts` answers with
+    `Transfer-Encoding: chunked` and delivers audio progressively while the
+    engine generates (`"stream": true`, the default) — a WAV header with
+    unknown length arrives first so players can start immediately. With
+    `"stream": false` the take is buffered and answered with an exact
+    `Content-Length`.
+
+    **Long-form.** Voiced requests longer than `chunk_length` bytes are split
+    at sentence boundaries and generated as chained sessions; joins are
+    normalized to exactly `chunk_gap_ms` of silence. Take-level edges are
+    never trimmed.
+
+    **Authentication.** When the server is started with `--token <secret>`,
+    every route except `GET /healthz` requires
+    `Authorization: Bearer <secret>`; requests without it receive 401.
+
+    **Backpressure.** A client that stops reading its stream is disconnected
+    once the per-write wall-clock budget (`S2P_HTTP_SEND_MS`, default
+    2000 ms) is spent; generation for that request is cancelled.
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+  contact:
+    name: s2pro-native
+    url: https://github.com/luka-loehr/s2pro-native
+servers:
+  - url: http://{host}:{port}
+    variables:
+      host:
+        default: "127.0.0.1"
+      port:
+        default: "8010"
+tags:
+  - name: system
+    description: Liveness and scheduler statistics.
+  - name: voices
+    description: The named-voice registry (`voices/<name>.wav` + `.txt`).
+  - name: synthesis
+    description: Text-to-speech generation.
+security: []
+paths:
+  /healthz:
+    get:
+      tags: [system]
+      operationId: getHealth
+      summary: Liveness and scheduler statistics
+      description: Never requires authentication.
+      responses:
+        "200":
+          description: Engine is serving.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+              example:
+                status: ok
+                active_sessions: 2
+                queued: 0
+                frames_decoded: 184320
+                requests_done: 57
+  /v1/voices:
+    get:
+      tags: [voices]
+      operationId: listVoices
+      summary: List the named-voice registry
+      security:
+        - bearerAuth: []
+        - {}
+      responses:
+        "200":
+          description: Registry listing (order is load order).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/VoiceList"
+              example:
+                voices:
+                  - name: deeper-male
+                    duration_s: 49.6
+                    reference_frames: 1067
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+  /v1/tts:
+    post:
+      tags: [synthesis]
+      operationId: synthesize
+      summary: Synthesize speech from text
+      description: |
+        Generates 44,100 Hz mono signed-16-bit-little-endian PCM, wrapped as
+        WAV (`"format": "wav"`, default) or raw (`"format": "pcm"`).
+        Exactly one voice source may be given: `voice` (registry name) or
+        `reference_audio_b64` + `reference_text` (on-the-fly clone); with
+        neither, generation is zero-shot. Determinism: a nonzero `seed`
+        makes a take reproducible for identical request parameters; for
+        long-form requests each chunk derives its own seed from it.
+      security:
+        - bearerAuth: []
+        - {}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TtsRequest"
+            examples:
+              minimal:
+                summary: Zero-shot, streamed WAV
+                value:
+                  text: "Hello from the DGX Spark."
+              registry-voice:
+                summary: Registry voice, reproducible, buffered
+                value:
+                  text: "Guten Morgen, liebe Schülerinnen und Schüler!"
+                  voice: deeper-male
+                  seed: 42
+                  stream: false
+              clone:
+                summary: On-the-fly clone (≤ 15 s reference)
+                value:
+                  text: "This will sound like the reference speaker."
+                  reference_audio_b64: "<base64 RIFF wav, 44.1 kHz mono s16>"
+                  reference_text: "Exact transcript of the reference audio."
+      responses:
+        "200":
+          description: |
+            Audio. Streamed responses use `Transfer-Encoding: chunked`
+            (WAV header carries an unknown-length marker); buffered
+            responses carry an exact `Content-Length`.
+          content:
+            audio/wav:
+              schema:
+                type: string
+                format: binary
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+                description: Raw S16LE PCM frames (`"format": "pcm"`).
+        "400":
+          description: Malformed request (JSON, field types, reference audio).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              examples:
+                unknown-voice:
+                  value: { error: "unknown voice (see GET /v1/voices)" }
+                bad-reference:
+                  value:
+                    error: >-
+                      reference audio must be a RIFF wav, 16-bit PCM mono
+                      44100 Hz
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "413":
+          description: Request body exceeds the server limit.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: Queue full or too many connections.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: Only enforced when the server runs with `--token`.
+  responses:
+    Unauthorized:
+      description: Missing or wrong bearer token (server started with `--token`).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+  schemas:
+    Health:
+      type: object
+      required: [status, active_sessions, queued, frames_decoded, requests_done]
+      properties:
+        status:
+          type: string
+          const: ok
+        active_sessions:
+          type: integer
+          description: Sessions currently decoding in the lockstep batch.
+        queued:
+          type: integer
+          description: Requests waiting for a free session slot.
+        frames_decoded:
+          type: integer
+          format: int64
+          description: Codec frames (~46.4 ms each) decoded since start.
+        requests_done:
+          type: integer
+          format: int64
+    VoiceList:
+      type: object
+      required: [voices]
+      properties:
+        voices:
+          type: array
+          items:
+            $ref: "#/components/schemas/Voice"
+    Voice:
+      type: object
+      required: [name, duration_s, reference_frames]
+      properties:
+        name:
+          type: string
+          description: Registry name (`voices/<name>.wav`).
+        duration_s:
+          type: number
+          description: Reference audio length in seconds.
+        reference_frames:
+          type: integer
+          description: Encoded reference length in codec frames.
+    TtsRequest:
+      type: object
+      required: [text]
+      properties:
+        text:
+          type: string
+          minLength: 1
+          description: |
+            Text to speak (UTF-8). Inline square-bracket tags pass through
+            to the model for free-form prosody/emotion control.
+        voice:
+          type: string
+          description: Registry voice name (see `GET /v1/voices`).
+        reference_audio_b64:
+          type: string
+          contentEncoding: base64
+          description: |
+            On-the-fly clone reference: base64 RIFF WAV, 44,100 Hz mono
+            16-bit PCM, at most 15 s. Takes precedence over `voice`.
+            Requires `reference_text`. Unavailable (clean error) when the
+            server dropped its encoder weights (default; keep them with
+            `S2P_KEEP_ENCODER=1`).
+        reference_text:
+          type: string
+          description: Exact transcript of the reference audio (required with `reference_audio_b64`).
+        format:
+          type: string
+          enum: [wav, pcm]
+          default: wav
+        temperature:
+          type: number
+          minimum: 0
+          default: 0.8
+          description: Semantic-token sampling temperature.
+        top_p:
+          type: number
+          minimum: 0
+          maximum: 1
+          default: 0.8
+        seed:
+          type: integer
+          format: int64
+          default: 0
+          description: Nonzero = reproducible take; 0 = fresh RNG.
+        stream:
+          type: boolean
+          default: true
+          description: Chunked progressive delivery (true) or buffered with exact length (false).
+        chunk_length:
+          type: integer
+          minimum: 0
+          default: 300
+          description: |
+            Long-form split target in text bytes (voiced requests only);
+            0 disables chunking. Values below 32 are rejected unless 0.
+        chunk_sentences:
+          type: integer
+          minimum: 0
+          default: 2
+          description: Close a chunk after this many sentences (0 = byte limit only).
+        chunk_gap_ms:
+          type: integer
+          minimum: 0
+          default: 1000
+          description: Normalized silence inserted at long-form chunk joins (0 = raw concatenation).
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
