@@ -25,9 +25,9 @@ is compute ÷ audio; below 1.0 means synthesis outruns playback.
 
 | serving path | wall RTF | TTFA |
 | --- | ---: | ---: |
-| zero-shot | **0.60** | 0.14 s |
-| 60 s voice reference (warm voice cache) | **0.58** | 0.20 s |
-| ~148 s chunked long-form | **0.58–0.59** | 0.20 s |
+| zero-shot | **0.51** | 0.14 s |
+| 60 s voice reference (warm voice cache) | **0.52** | 0.20 s |
+| ~148 s chunked long-form | **~0.53** | 0.20 s |
 
 Configuration: all-INT4 weight stream (packed group-wise INT4 backbone +
 QAT-distilled INT4 fast-AR and lm-head, `S2P_INT4_ALL=1` on a
