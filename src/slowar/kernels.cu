@@ -790,7 +790,12 @@ static __global__ void k_attn_split8(const __nv_bfloat16* __restrict__ q,
     /* u32-typed shared arrays so the coalesced u32 tile copies are aligned;
      * aliased as int8/f16 for the compute reads. */
     const int EL = (BW == 8) ? S2PK_HD : S2PK_HD / 2; /* bytes per vector */
-    __shared__ uint32_t tile8_u[S2PK_SPLIT * S2PK_HD / 4]; /* 8 KB payload */
+    /* row stride EL+4: at stride 128 B every lane of the K-score phase
+     * (lane t walks row t) lands on the same bank — a 32-way conflict on
+     * every read. One u32 of skew makes the word stride 33 (coprime with
+     * 32), spreading rows across all banks; same values, same order. */
+    const int ELP = EL + 4;
+    __shared__ uint32_t tile8_u[S2PK_SPLIT * (S2PK_HD + 4) / 4];
     __shared__ uint32_t stile_u[S2PK_SPLIT * (S2PK_HD >> 5) / 2]; /* scales */
     int8_t* tile8 = (int8_t*)tile8_u;
     __half* stile = (__half*)stile_u;
@@ -811,8 +816,9 @@ static __global__ void k_attn_split8(const __nv_bfloat16* __restrict__ q,
     const __half* ksrow = k_scales[row] + ((size_t)kvh * max_seq + start) * NG;
     {
         const uint32_t* src = (const uint32_t*)kc;
-        for (int i = tid; i < cnt * EL / 4; i += blockDim.x)
-            tile8_u[i] = src[i];
+        const int wpr = EL / 4; /* payload words per row */
+        for (int i = tid; i < cnt * wpr; i += blockDim.x)
+            tile8_u[(i / wpr) * (ELP / 4) + i % wpr] = src[i];
         const uint32_t* ssrc = (const uint32_t*)ksrow;
         for (int i = tid; i < cnt * NG / 2; i += blockDim.x)
             stile_u[i] = ssrc[i];
@@ -820,7 +826,7 @@ static __global__ void k_attn_split8(const __nv_bfloat16* __restrict__ q,
     __syncthreads();
 
     if (tid < cnt) {
-        const int8_t* kr = tile8 + (size_t)tid * EL;
+        const int8_t* kr = tile8 + (size_t)tid * ELP;
         const __half* krs = stile + (size_t)tid * NG;
         for (int g = 0; g < S2PK_GROUP; g++) {
             const float* qv = sq[g];
@@ -878,8 +884,9 @@ static __global__ void k_attn_split8(const __nv_bfloat16* __restrict__ q,
     __syncthreads();
     {
         const uint32_t* src = (const uint32_t*)vc;
-        for (int i = tid; i < cnt * EL / 4; i += blockDim.x)
-            tile8_u[i] = src[i];
+        const int wpr = EL / 4;
+        for (int i = tid; i < cnt * wpr; i += blockDim.x)
+            tile8_u[(i / wpr) * (ELP / 4) + i % wpr] = src[i];
         const uint32_t* ssrc = (const uint32_t*)vsrow;
         for (int i = tid; i < cnt * NG / 2; i += blockDim.x)
             stile_u[i] = ssrc[i];
@@ -892,9 +899,9 @@ static __global__ void k_attn_split8(const __nv_bfloat16* __restrict__ q,
         for (int j = 0; j < cnt; j++) {
             float vv;
             if (BW == 8) {
-                vv = (float)tile8[(size_t)j * EL + tid];
+                vv = (float)tile8[(size_t)j * ELP + tid];
             } else {
-                const int8_t byte = tile8[(size_t)j * EL + (tid >> 1)];
+                const int8_t byte = tile8[(size_t)j * ELP + (tid >> 1)];
                 const int nib = (tid & 1) ? (byte >> 4) : (byte & 0xF);
                 vv = (float)(int8_t)((nib << 4) >> 4);
             }
