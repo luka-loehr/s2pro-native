@@ -230,6 +230,54 @@ GEMM per linear, deep in the regime where the matrix units win. The
 spec-decoding build (draft model, corpus, verify machinery) is the
 companion track; this kernel is its GEMM engine.
 
+## 13. The audit tail: five more gated landings, and what was closed
+
+The remaining audit findings landed the same day, each gated
+individually (two-stream fixed-seed MD5s unchanged unless noted):
+
+- **Fast-AR batched launches** (P1-8): rope/append/attention ran once
+  per row per layer per codebook step — 3·B·4·10 launches per frame.
+  Per-(layer,row) cache-pointer tables and constant per-step position
+  arrays are built when the KV slab is allocated; the loop is now three
+  batched launches through the parity-proven `_ptrs` kernels.
+  Bit-identical; B = 8 worst RTF 1.41 → 1.35 (`S2P_FA_LOOP=1` reverts).
+- **Split-K attention tile skew** (P1-6): the K-score phase read one
+  128-byte shared row per lane — a 32-way bank conflict on every
+  payload read. Row stride EL+4 (word stride 33). Bit-identical;
+  B = 4 0.86 → 0.85.
+- **Clone-codes memo** (P2-13): long-form cloned requests re-encoded
+  the reference on the worker for EVERY chunk (~1.1 s all-stream stall
+  each). The worker deposits the codes into the connection once; clone
+  long-form now serves at registry-voice RTF (measured 0.52).
+- **Encode workspace returned** (P2-10): the DAC encode arena (GBs for
+  a 60 s reference) is freed after each encode instead of persisting.
+- **Dead fast-AR slab memset dropped**: every position the attention
+  reads is appended in the same frame first; the reference's
+  per-frame zeroing was semantically dead here. Bit-identical.
+- **Tensor-core prefill** (P1-5, `S2P_PREFILL_TC=1`, DEFAULT OFF): for
+  chunk-sized prefills (M ≤ 128) the WMMA kernel computes straight
+  from the packed INT4 weights instead of the N·K·2 B dequant+cuBLAS
+  round-trip. Parity holds the reference class (backbone cos min
+  0.9926, argmax intact, fast-AR 8/9); measured TTFA 0.64 → 0.61 and
+  ~4 % batch-wall at B = 8. It stays off because the summation order
+  differs from the shipped path — enabling it is a numerics-class
+  change reserved for a listening-signed rollout, exactly like §11.
+
+Final concurrency series on the complete stack (same protocol as §10):
+**B = 4/8/12/16 worst per-stream RTF 0.83 / 1.36 / 2.18 / 2.82.**
+
+Two items were closed without code, with reasons on record: the decode
+graph's length bucketing (P1-7) trades ≤ 1 % of tick time against an
+8× multiplication of the captured-graph cache that all serving relies
+on — declined at this return; and the fast-AR norm+GEMV fusion (P1-9)
+is the measured negative of §3 in a new coat (same fusion class, same
+bit-exactness failure mode, and CUDA graphs already amortize what it
+would remove). The review's C4 sweep was attempted: GB10 exposes no
+`dram__` metrics to Nsight Compute (n/a on the unified-LPDDR path);
+`lts__t_bytes.sum` works and is the recorded instrument for a future
+multi-session harness, and the 128× weight-traffic arithmetic of §6
+continues to rest on the bandwidth model plus the timing evidence.
+
 ## 12. Sliced LM-head: the audit's largest single-stream lever
 
 The decode head computed all 155,776 vocabulary logits every frame;
