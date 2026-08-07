@@ -34,10 +34,10 @@ QAT-distilled INT4 fast-AR and lm-head, `S2P_INT4_ALL=1` on a
 QAT-patched checkpoint), accepted by critical listening on 2026-08-03.
 An unpatched checkpoint serves the INT8-fast-AR configuration at
 0.75–0.76. Starting point of the same stack: wall RTF 2.05. The complete
-measured path from 2.05 to 0.60 — including the negative results — is
+measured path from 2.05 to 0.51 — including the negative results — is
 recorded in the technical reports (§7).
 
-> **Status: v0.1.0, the first tagged release.** BF16, INT8, and the
+> **Status: v0.2.0.** BF16, INT8, and the
 > packed group-wise INT4 backbone pass the layer-parity gate against the
 > PyTorch reference; voice cloning, the multilingual voice registry, and
 > the HTTP streaming server are exercised end to end on real hardware.
