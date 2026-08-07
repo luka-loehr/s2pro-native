@@ -68,6 +68,9 @@ $(BUILD)/s2p-test: $(LIB_OBJS) $(BUILD)/tests/test_forward.o
 $(BUILD)/s2p-parity: $(LIB_OBJS) $(BUILD)/tests/parity.o
 	$(NVCC) $(GENCODE) $^ $(FSO_OBJS) -o $@ $(LIBS)
 
+$(BUILD)/s2p-draft-test: $(LIB_OBJS) $(BUILD)/tests/test_draft.o
+	$(NVCC) $(GENCODE) $^ $(FSO_OBJS) -o $@ $(LIBS)
+
 parity: $(BUILD)/s2p-parity
 
 # ---- host-side selftests (json parser, tokenizer + prompt builder) --------
