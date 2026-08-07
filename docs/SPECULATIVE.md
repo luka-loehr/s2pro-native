@@ -255,3 +255,30 @@ audio-affecting risk arrives last:
 
 Every stage lands as its own gated commit; a failed gate at any stage
 closes the track with the measurement that closed it.
+
+**Closed at stage 2, 2026-08-07.** The relaxation premise — drafted
+codes whose input embeddings are near-equivalent to the true ones —
+does not hold for this model. Measured on holdout takes with the SAME
+greedy decoder on both sides (so no proxy mismatch inflates the
+number): at positions where the draft's semantic token is CORRECT, the
+relative embedding distance Δe between the drafted and the true frame
+has median **0.43**, with **zero** mass below 0.1 and 0.2 % below 0.2.
+There is no operating point: any θ tight enough to plausibly protect
+quality accepts nothing (θ = 0.1 → 0 %), and a θ loose enough to
+accept anything (θ = 0.3 → 5 %) would inject 30–50 % input-embedding
+perturbations into the permanent KV cache for a ≤3 % pass reduction.
+The nine residual codebooks, driven greedily from a predicted hidden,
+diverge essentially completely from those driven by the true hidden —
+consistent with §6.1's sensitivity result, now shown at the embedding
+level that relaxation itself would operate on.
+
+No listening sample was produced, deliberately: there is no candidate
+configuration whose audio a listening gate could meaningfully accept.
+Speculative decoding for this dual-AR architecture is closed by
+measurement at both levels — exact (the chain condition, §6.1) and
+relaxed (the Δe distribution above) — with the staged plan having done
+its job: the track died in instrumentation, before a single frame of
+served audio was put at risk. Serving stands at RTF 0.58; the yield of
+the program is the draft artifact, the corpus, the rollout/chain
+instrumentation, and a chapter of measured structural results that no
+published speculation work covers for this model class.
