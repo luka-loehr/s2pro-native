@@ -147,4 +147,78 @@ recipe tuning. A regression-free second run (EAGLE-3's ablation
 attributes its data-scaling to dropping the feature loss) and
 multi-step training-time unrolling (HASS) are the queued follow-ups.
 
-Results are appended to this report as they are measured.
+## 6. Results — 2026-08-07
+
+Corpus as designed: 2,482 training requests → 5,453 sentinel-cut takes,
+**1,067,801 transitions** (14.5 h of audio, generated in 8.1 h); holdout
+305 requests → 642 takes, 125k transitions across the three cells.
+Training cost 0.13–0.26 s/step on the box — a full 8,000-step run in
+~35 minutes, which allowed the loss-weight comparison to run as two
+complete trainings rather than a guess.
+
+### 6.1 The chain condition is structurally unreachable
+
+Before trusting the trainer's chain-rate zeros, I measured the fast-AR
+cascade's sensitivity directly: uniform noise on the TRUE final-normed
+hidden, then greedy 9-code decode, 256 holdout frames:
+
+| perturbation of the true hidden | per-code match | all-9 match |
+| --- | ---: | ---: |
+| ±0.01 | 0.923 | **0.793** |
+| ±0.05 | 0.677 | 0.270 |
+| ±0.10 | 0.536 | 0.102 |
+
+A draft would need residual error below ~±0.01 per dimension (hidden
+cosine ≳ 0.9995) for the code chain to survive; EAGLE-class feature
+predictors reach ~0.90–0.97. The measured chain rate of the trained
+draft is 0.000 at every depth, at every checkpoint — consistent with
+this ceiling and not a training deficiency. Because the input embedding
+of frame t+1 is a function of frame t's full code set (§2), the chain
+gates the SECOND speculated position at every draft depth including
+k = 1: expected frames per backbone pass is 1 + a_sem · a_chain ≈ 1.
+
+**Exact-equivalence speculative decoding — output distribution
+identical to non-speculative serving — is therefore structurally
+infeasible for this dual-AR model.** Not because the draft is weak, but
+because nine consecutive greedy argmaxes over a 4,096-entry codebook
+amplify any feature error; a published near-miss for a related class
+(LLaSA's 0.98× under token-exact acceptance) understated our case,
+which fails at the code-chain stage before token acceptance is even
+tested.
+
+### 6.2 What the draft does deliver
+
+Run 1 (kl-weight 0.3), unseen-text holdout, best checkpoint at step
+8,000: hidden cosine 0.911, teacher-forced semantic argmax **0.547**,
+rollout α-curve **a1 0.605, a2 0.164, a3 0.090, a4 0.055** — the
+depth-1→2 collapse is the feature-error compounding the rollout eval
+was built to expose. The loss-balance check confirmed EAGLE's 0.1
+classification weight as a magnitude normalizer (at 0.3 the KL term
+contributed ~6× the hidden term); run 2 (kl-weight 0.1) trained to
+compare, and the balanced weight wins on every axis that matters:
+hidden cosine **0.934** (vs 0.911), semantic argmax **0.551** (vs
+0.547), rollout **a1 0.602, a2 0.164, a3 0.098, a4 0.074** — equal at
+depth 1, slightly better where features compound. Run 2's checkpoint
+(`run2/draft.safetensors`, 114 M parameters bf16) is the retained
+artifact. Both runs and the corpus remain on the box for the scaling
+curve (1 M → 3 M → 10 M frames) should the relaxed-acceptance track be
+authorized.
+
+### 6.3 The decision this leaves
+
+The semantic-token predictor itself is real (0.55–0.6 on unseen text
+and voices is in the range the audio-speculation literature reports as
+workable), but under exact acceptance it cannot be cashed in. The one
+door left open is **relaxed acceptance** (accept drafted codes whose
+input embeddings are near-equivalent, as the CosyVoice 2 and LLaSA
+work did): it converts the guarantee of a bit-identical output
+distribution into approximately equivalent audio, which moves the gate
+from mathematics to listening — a quality-for-speed trade that only
+the project's listening gate can authorize. Estimated ceiling if
+authorized: E ≈ 1 + a_sem · a_code-relaxed per pass, plausibly
+1.4–1.6× fewer backbone passes (RTF ~0.38–0.42), to be measured, with
+every relaxation step listening-gated. Absent that authorization, the
+serving stack stands at RTF 0.58 single-stream / cap 4–5 concurrent,
+and this report closes as the third measured structural negative of
+the optimization program — alongside FP8 and the bit-identical GEMV
+campaign — each of which changed where the next effort goes.
