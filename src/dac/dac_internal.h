@@ -47,6 +47,7 @@ typedef struct {
     float*        base_f; /* f32 keepers (biases, alphas, norms, codebooks) */
     int           f16;    /* conversion active (S2P_DAC_F32=1 disables) */
     int64_t       total_bytes;
+    uint8_t       artifact_sha256[32]; /* codec.idx + codec.bin identity */
 } s2p_dacw;
 
 s2p_status s2p_dacw_load(const char* model_dir, s2p_dacw* w);

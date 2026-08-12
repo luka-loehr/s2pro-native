@@ -25,6 +25,7 @@
 #include <string.h>
 #include <cuda_runtime.h>
 #include "dac_internal.h"
+#include "s2pro/sha256.h"
 
 static int ent_cmp_name(const void* a, const void* b) {
     return strcmp(((const s2p_dacw_ent*)a)->name, ((const s2p_dacw_ent*)b)->name);
@@ -35,6 +36,11 @@ s2p_status s2p_dacw_load(const char* model_dir, s2p_dacw* w) {
     memset(w, 0, sizeof(*w));
 
     char path[1024];
+    s2p_sha256 artifact_hash;
+    s2p_sha256_init(&artifact_hash);
+    static const char idx_domain[] = "s2pro-codec.idx";
+    static const char bin_domain[] = "s2pro-codec.bin";
+    s2p_sha256_update(&artifact_hash, idx_domain, sizeof(idx_domain));
     snprintf(path, sizeof(path), "%s/codec.idx", model_dir);
     FILE* fi = fopen(path, "r");
     if (!fi) {
@@ -49,6 +55,7 @@ s2p_status s2p_dacw_load(const char* model_dir, s2p_dacw* w) {
     char line[512];
     int64_t max_end = 0;
     while (fgets(line, sizeof(line), fi)) {
+        s2p_sha256_update(&artifact_hash, line, strlen(line));
         if (line[0] == '\0' || line[0] == '\n' || line[0] == '#') continue;
         if (n == cap) {
             cap *= 2;
@@ -85,6 +92,7 @@ s2p_status s2p_dacw_load(const char* model_dir, s2p_dacw* w) {
     if (n == 0) { free(ents); return S2P_ERR_FORMAT; }
     qsort(ents, (size_t)n, sizeof(*ents), ent_cmp_name);
 
+    s2p_sha256_update(&artifact_hash, bin_domain, sizeof(bin_domain));
     snprintf(path, sizeof(path), "%s/codec.bin", model_dir);
     FILE* fb = fopen(path, "rb");
     if (!fb) {
@@ -122,6 +130,7 @@ s2p_status s2p_dacw_load(const char* model_dir, s2p_dacw* w) {
             free(stage); cudaFree(dev); fclose(fb); free(ents);
             return S2P_ERR_IO;
         }
+        s2p_sha256_update(&artifact_hash, stage, want);
         ce = cudaMemcpy((char*)dev + done, stage, want, cudaMemcpyHostToDevice);
         if (ce != cudaSuccess) {
             fprintf(stderr, "[s2pro] dac: H2D upload failed: %s\n",
@@ -138,6 +147,7 @@ s2p_status s2p_dacw_load(const char* model_dir, s2p_dacw* w) {
     w->n_ents = n;
     w->base = dev;
     w->total_bytes = fsz;
+    s2p_sha256_final(&artifact_hash, w->artifact_sha256);
 
     /* ---- FP16 weight conversion (S2P_DAC_F32=1 keeps everything f32) ----
      * Big conv/matmul weights convert to a half blob; the small keepers

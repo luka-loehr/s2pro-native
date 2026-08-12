@@ -84,9 +84,19 @@ $(BUILD)/selftest_tok: $(LIB_OBJS) $(BUILD)/tests/selftest_tok.o
 # selftest_tok needs a tokenizer.json; the repo model/ dir carries one.
 SELFTEST_MODEL_DIR ?= model
 
-selftest: $(BUILD)/selftest_json $(BUILD)/selftest_tok
+selftest: $(BUILD)/selftest_json $(BUILD)/selftest_tok \
+          $(BUILD)/selftest_voice_cache
 	$(BUILD)/selftest_json
 	$(BUILD)/selftest_tok $(SELFTEST_MODEL_DIR)
+	$(BUILD)/selftest_voice_cache
+
+$(BUILD)/selftest_voice_cache: tests/selftest_voice_cache.c \
+                              src/voice/voice_cache.c src/core/sha256.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $^ -o $@
+
+selftest-voice-cache: $(BUILD)/selftest_voice_cache
+	$(BUILD)/selftest_voice_cache
 
 # ---- compile-only syntax pass (no link; .cu/.cpp still need nvcc+device) --
 
@@ -116,4 +126,4 @@ clean:
 # the old layout linked in.
 -include $(shell find $(BUILD) -name '*.d' 2>/dev/null)
 
-.PHONY: all nvcc-build syntax selftest parity clean
+.PHONY: all nvcc-build syntax selftest selftest-voice-cache parity clean

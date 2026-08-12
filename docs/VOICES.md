@@ -65,8 +65,14 @@ Requirements:
 - The transcript must match the audio word for word — it is part of the
   prompt, not metadata.
 - Clean, dry audio; no music, no second speaker.
-- Every voice is DAC-encoded once at server start and cached; voice
-  selection costs nothing per request.
+- Every voice is DAC-encoded once at server start and cached. Each `.codes`
+  sidecar is bound to the SHA-256 of the WAV content and to a producer
+  fingerprint covering the codec artifact, encoder implementation version,
+  and encoder weight precision. A legacy, truncated, or incompatible cache
+  is ignored and atomically regenerated; `S2P_VOICE_CACHE=0` disables this
+  cache entirely. The release container defaults to FP32 DAC weights
+  (`S2P_DAC_F32=1`); caches made with FP16 are deliberately incompatible.
+  Voice selection costs nothing per request.
 
 `voices/` ships empty; reference audio is generated per deployment, not
 committed (~5.4 MB per voice, reproducible from one command —

@@ -26,6 +26,8 @@
 #include <cuda_runtime.h>
 #include "s2pro/dac.h"
 #include "dac_internal.h"
+#include "dac_fingerprint.h"
+#include "s2pro/sha256.h"
 
 /* ------------------------------------------------------------------ utils */
 
@@ -326,6 +328,23 @@ void s2p_dac_free(s2p_dac* d) {
     if (d->codes_dev) cudaFree(d->codes_dev);
     s2p_dacw_free(&d->w);
     free(d);
+}
+
+void s2p_dac_encoder_fingerprint(const s2p_dac* d, uint8_t out[32]) {
+    /* Increment when encoder numerics change without changing codec files. */
+    static const char implementation[] = "s2pro-dac-encoder-v2";
+    static const char precision_f16[] = "weights=f16";
+    static const char precision_f32[] = "weights=f32";
+    s2p_sha256 hash;
+    s2p_sha256_init(&hash);
+    if (d) s2p_sha256_update(&hash, d->w.artifact_sha256,
+                             sizeof(d->w.artifact_sha256));
+    s2p_sha256_update(&hash, implementation, sizeof(implementation));
+    const char* precision = d && d->w.f16 ? precision_f16 : precision_f32;
+    size_t precision_len = d && d->w.f16 ? sizeof(precision_f16)
+                                         : sizeof(precision_f32);
+    s2p_sha256_update(&hash, precision, precision_len);
+    s2p_sha256_final(&hash, out);
 }
 
 /* ----------------------------------------------------------- runners ----- */

@@ -10,6 +10,21 @@ for published releases.
 
 ## [Unreleased]
 
+## [1.0.1] — 2026-08-12
+
+### Fixed
+- Voice-code sidecar caches now use the `S2PVC2` format and are bound to
+  SHA-256 identities for both the WAV contents and the producer: loaded codec
+  artifact, encoder implementation version, and encoder weight precision.
+  Legacy, truncated, or incompatible `.codes` files miss safely and are
+  atomically regenerated. This prevents a cache produced under different DAC
+  numerics from silently poisoning every request that uses the named voice.
+- Added a host selftest for cache round trips, producer changes, legacy V1
+  rejection, and the previously missed same-size/same-mtime WAV-content
+  replacement case.
+- The container now defaults to FP32 DAC weights. FP16 DAC remains available
+  by explicitly clearing `S2P_DAC_F32`, but is not the release-audited path.
+
 ### Added
 - Container distribution: `containers/Dockerfile` builds the
   self-contained serving image (multi-stage; fish-scales-ops and the

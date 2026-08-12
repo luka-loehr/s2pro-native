@@ -2,12 +2,12 @@
 # s2pro-native — self-contained serving image (linux/arm64, DGX Spark).
 #
 # Build (on an sm_121 host):
-#   docker build -f containers/Dockerfile -t ghcr.io/luka-loehr/s2pro-native:1.0.0 .
+#   docker build -f containers/Dockerfile -t ghcr.io/luka-loehr/s2pro-native:1.0.1 .
 #
 # Run (two commands, see README §Quickstart):
-#   docker pull ghcr.io/luka-loehr/s2pro-native:1.0.0
+#   docker pull ghcr.io/luka-loehr/s2pro-native:1.0.1
 #   docker run --gpus all -p 8010:8010 -v s2pro-data:/data \
-#       ghcr.io/luka-loehr/s2pro-native:1.0.0
+#       ghcr.io/luka-loehr/s2pro-native:1.0.1
 #
 # The S2-Pro checkpoint is NOT in the image (Fish Audio Research License);
 # the entrypoint downloads it into the /data volume on first start and
@@ -62,10 +62,11 @@ COPY LICENSE THIRD_PARTY_NOTICES.md api/openapi.yaml ./
 RUN chmod +x /entrypoint.sh scripts/fetch_model.sh
 
 # Serving defaults: all-INT4 weight stream, prequant sidecar into /data,
-# encoder kept so per-request voice cloning works without a registry.
+# encoder kept so per-request voice cloning works without a registry. Keep
+# DAC weights in FP32: FP16 saves memory, but failed the release ear audit.
 ENV S2P_INT8=1 S2P_INT4=1 S2P_INT4_ALL=1 \
     S2P_QCACHE_DIR=/data/qcache S2P_KEEP_ENCODER=1 \
-    S2P_PORT=8010 S2P_BIND=0.0.0.0
+    S2P_DAC_F32=1 S2P_PORT=8010 S2P_BIND=0.0.0.0
 VOLUME /data
 EXPOSE 8010
 ENTRYPOINT ["/entrypoint.sh"]
