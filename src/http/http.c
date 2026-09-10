@@ -77,6 +77,17 @@
 #define HTTP_CHUNK_BYTES_DEFAULT     300
 #define HTTP_CHUNK_SENTENCES_DEFAULT 2
 
+/* Chunks of one long-form request generated concurrently. The lockstep
+ * scheduler reads the weight stream once per tick for all sessions, so N
+ * chunks in flight cost little more memory-bus traffic than one, while the
+ * request's audio arrives up to ~N times faster. Wire order is unchanged:
+ * the chunk whose turn it is streams live, later chunks buffer until then.
+ * Request field "chunk_parallel" / env S2P_CHUNK_PARALLEL; 1 restores the
+ * sequential chain. Per-request cloning stays sequential (chunk 1 memoizes
+ * the clone codes the later chunks reuse). */
+#define HTTP_CHUNK_PARALLEL_DEFAULT 4
+#define HTTP_CHUNK_PARALLEL_MAX     8
+
 /* Inter-chunk gap normalization: the model's own sentence pauses inside a
  * take run ~1.0-1.3 s (the project owner's "perfect" range), but the
  * trailing/leading silence around a chunk join is whatever the two takes
@@ -105,6 +116,18 @@ typedef enum {
     C_STREAMING,
 } conn_state;
 
+/* One long-form chunk: its scheduler request and the audio it produced
+ * before its turn on the wire. */
+typedef struct chunk_slot {
+    void*    owner;      /* conn* (conn is declared below) */
+    int      idx;
+    uint64_t req_id;     /* poll-loop thread */
+    int      submitted;  /* poll-loop thread */
+    int      done;       /* scheduler thread: final delivered */
+    int16_t* pend;       /* scheduler thread: audio waiting for its turn */
+    size_t   pend_n, pend_cap;
+} chunk_slot;
+
 typedef struct {
     int        fd;
     conn_state st;
@@ -124,12 +147,19 @@ typedef struct {
     char*       acc;
     size_t      acc_len, acc_cap;
     /* long-form chunk chain: text split at sentence boundaries, one
-     * scheduler request per chunk, all audio in ONE response. The audio cb
-     * (scheduler thread) sets chunk_advance on a non-last chunk's final
-     * instead of finished; the poll loop then submits the next chunk. */
+     * scheduler request per chunk, all audio in ONE response, in order. The
+     * poll loop submits up to `parallel` chunks at once (later chunks only
+     * after the first chunk produced audio, protecting TTFA); the scheduler
+     * thread streams the chunk at emit_chunk and buffers the others in
+     * their slot until their turn. */
     char**      chunks;
-    int         n_chunks, cur_chunk;
-    atomic_int  chunk_advance;
+    int         n_chunks;
+    chunk_slot* slots;
+    int         parallel;     /* max chunks in flight; 1 = sequential */
+    int         next_submit;  /* poll-loop thread */
+    int         emit_chunk;   /* scheduler thread */
+    atomic_int  in_flight;
+    atomic_int  first_audio;
     int         gap_ms;             /* inter-chunk gap; 0 = raw concat */
     int16_t*    gap_hold;           /* boundary tail window (scheduler thr) */
     size_t      gap_hold_n;
@@ -404,66 +434,111 @@ static int gap_boundary(conn* c) {
     return 0;
 }
 
+/* All audio is out: close the response (scheduler thread). */
+static void conn_finish_response(conn* c) {
+    if (c->buffered) {
+        char head[256];
+        size_t body = c->acc_len + (c->wav ? 44u : 0u);
+        int hn = snprintf(head, sizeof(head),
+                          "HTTP/1.1 200 OK\r\n"
+                          "Content-Type: %s\r\n"
+                          "Content-Length: %zu\r\n"
+                          "Cache-Control: no-store\r\n"
+                          "Connection: close\r\n\r\n",
+                          c->wav ? "audio/wav" : "application/octet-stream",
+                          body);
+        int ok = hn > 0 && send_all(c->fd, head, (size_t)hn) == 0;
+        if (ok && c->wav) {
+            uint8_t hdr[44];
+            size_t wn = s2p_wav_header(hdr, (uint32_t)c->acc_len,
+                                       S2P_SAMPLE_RATE);
+            ok = send_all(c->fd, hdr, wn) == 0;
+        }
+        if (ok && c->acc_len > 0)
+            (void)send_all(c->fd, c->acc, c->acc_len);
+        atomic_store(&c->finished, 1); /* LAST touch of c by this thread */
+        return;
+    }
+    (void)conn_emit(c, NULL, 0); /* header even for an empty stream */
+    (void)send_all(c->fd, "0\r\n\r\n", 5); /* terminal chunk */
+    atomic_store(&c->finished, 1);         /* LAST touch of c by this thread */
+}
+
+/* Single request (no long-form chain). */
 static int tts_audio_cb(void* user, const int16_t* pcm, int64_t n, int final) {
     conn* c = (conn*)user;
-    const int chained = c->n_chunks > 1;
-    if (n > 0 && pcm) {
-        int rc = chained ? gap_feed(c, pcm, (size_t)n)
-                         : conn_emit(c, pcm, (size_t)n);
-        if (rc != 0) return 1;
-    }
-    if (final && chained && c->cur_chunk + 1 < c->n_chunks) {
-        if (gap_boundary(c) != 0) return 1;
-        /* non-last chunk done: hand back to the poll loop for the next
-         * submit. LAST touch of c by this thread until resubmitted. */
-        atomic_store(&c->chunk_advance, 1);
-        return 0;
-    }
-    if (final && chained && c->gap_hold) {
-        /* last chunk: flush the held-back tail untrimmed */
-        if (conn_emit(c, c->gap_hold, c->gap_hold_n) != 0) return 1;
-        c->gap_hold_n = 0;
-    }
-    if (c->buffered) {
-        if (final) {
-            char head[256];
-            size_t body = c->acc_len + (c->wav ? 44u : 0u);
-            int hn = snprintf(head, sizeof(head),
-                              "HTTP/1.1 200 OK\r\n"
-                              "Content-Type: %s\r\n"
-                              "Content-Length: %zu\r\n"
-                              "Cache-Control: no-store\r\n"
-                              "Connection: close\r\n\r\n",
-                              c->wav ? "audio/wav" : "application/octet-stream",
-                              body);
-            int ok = hn > 0 && send_all(c->fd, head, (size_t)hn) == 0;
-            if (ok && c->wav) {
-                uint8_t hdr[44];
-                size_t wn = s2p_wav_header(hdr, (uint32_t)c->acc_len,
-                                           S2P_SAMPLE_RATE);
-                ok = send_all(c->fd, hdr, wn) == 0;
-            }
-            if (ok && c->acc_len > 0)
-                (void)send_all(c->fd, c->acc, c->acc_len);
-            atomic_store(&c->finished, 1); /* LAST touch of c by this thread */
-        }
-        return 0;
-    }
-    if (final) {
-        (void)conn_emit(c, NULL, 0); /* header even for an empty stream */
-        (void)send_all(c->fd, "0\r\n\r\n", 5); /* terminal chunk */
-        atomic_store(&c->finished, 1);         /* LAST touch of c by this thread */
-    }
+    if (n > 0 && pcm && conn_emit(c, pcm, (size_t)n) != 0) return 1;
+    if (final) conn_finish_response(c);
     return 0;
 }
 
-/* Submit chunk c->cur_chunk of a long-form chain (poll-loop thread only).
+static int pend_append(chunk_slot* sl, const int16_t* pcm, size_t n) {
+    if (sl->pend_n + n > sl->pend_cap) {
+        size_t nc = sl->pend_cap ? sl->pend_cap * 2 : 8u * 44100u;
+        while (nc < sl->pend_n + n) nc *= 2;
+        int16_t* nb = (int16_t*)realloc(sl->pend, nc * sizeof(int16_t));
+        if (!nb) return 1;
+        sl->pend = nb;
+        sl->pend_cap = nc;
+    }
+    memcpy(sl->pend + sl->pend_n, pcm, n * sizeof(int16_t));
+    sl->pend_n += n;
+    return 0;
+}
+
+/* The chunk at emit_chunk delivered its final audio: close the join and hand
+ * the wire to the next chunk, flushing what it already produced. Continues
+ * through chunks that completed while waiting (scheduler thread). */
+static int chain_advance(conn* c) {
+    for (;;) {
+        int k = c->emit_chunk;
+        if (k + 1 >= c->n_chunks) {
+            if (c->gap_hold && c->gap_hold_n > 0 &&
+                conn_emit(c, c->gap_hold, c->gap_hold_n) != 0)
+                return 1;
+            c->gap_hold_n = 0;
+            conn_finish_response(c);
+            return 0;
+        }
+        if (gap_boundary(c) != 0) return 1;
+        chunk_slot* nx = &c->slots[k + 1];
+        c->emit_chunk = k + 1;
+        if (nx->pend_n > 0 && gap_feed(c, nx->pend, nx->pend_n) != 0)
+            return 1;
+        free(nx->pend);
+        nx->pend = NULL;
+        nx->pend_n = nx->pend_cap = 0;
+        if (!nx->done) return 0; /* streams live from its next callback */
+    }
+}
+
+/* Long-form chunk (scheduler thread; callbacks are serialized). */
+static int tts_chunk_cb(void* user, const int16_t* pcm, int64_t n, int final) {
+    chunk_slot* sl = (chunk_slot*)user;
+    conn* c = (conn*)sl->owner;
+    if (n > 0 && pcm && sl->idx == 0) atomic_store(&c->first_audio, 1);
+    if (sl->idx != c->emit_chunk) {
+        if (n > 0 && pcm && pend_append(sl, pcm, (size_t)n) != 0) return 1;
+        if (final) {
+            sl->done = 1;
+            atomic_fetch_sub(&c->in_flight, 1);
+        }
+        return 0;
+    }
+    if (n > 0 && pcm && gap_feed(c, pcm, (size_t)n) != 0) return 1;
+    if (!final) return 0;
+    sl->done = 1;
+    atomic_fetch_sub(&c->in_flight, 1);
+    return chain_advance(c);
+}
+
+/* Submit chunk idx of a long-form chain (poll-loop thread only).
  * Reproducibility: an explicit seed varies per chunk (seed + k*P) so chunks
  * do not share sampler trajectories; seed 0 stays 0 (fresh RNG). */
-static s2p_status submit_chunk(http_srv* s, conn* c) {
+static s2p_status submit_chunk(http_srv* s, conn* c, int idx) {
     s2p_request_text req;
     memset(&req, 0, sizeof(req));
-    req.text = c->chunks[c->cur_chunk];
+    req.text = c->chunks[idx];
     if (c->lf_clone_pcm && c->lf_clone_part.codes != NULL) {
         /* clone codes memoized by the worker on chunk 1 */
         req.refs = &c->lf_clone_part;
@@ -482,11 +557,35 @@ static s2p_status submit_chunk(http_srv* s, conn* c) {
     }
     s2p_sampling_cfg sampling = c->lf_sampling;
     if (sampling.seed != 0) {
-        sampling.seed += 1000003ull * (uint64_t)c->cur_chunk;
+        sampling.seed += 1000003ull * (uint64_t)idx;
         if (sampling.seed == 0) sampling.seed = 1;
     }
-    return s2p_sched_submit(s->sched, &req, &sampling, tts_audio_cb, c,
-                            &c->req_id);
+    chunk_slot* sl = &c->slots[idx];
+    atomic_fetch_add(&c->in_flight, 1); /* before submit: the final may race */
+    s2p_status rc = s2p_sched_submit(s->sched, &req, &sampling, tts_chunk_cb,
+                                     sl, &sl->req_id);
+    if (rc == S2P_OK) {
+        sl->submitted = 1;
+        c->next_submit = idx + 1;
+    } else {
+        atomic_fetch_sub(&c->in_flight, 1);
+    }
+    return rc;
+}
+
+/* Submit every chunk the in-flight window allows (poll-loop thread only). A
+ * full scheduler queue is not an error for a later chunk: it is retried on
+ * the next loop. */
+static s2p_status chain_submit_ready(http_srv* s, conn* c) {
+    while (c->next_submit < c->n_chunks &&
+           atomic_load(&c->in_flight) < c->parallel &&
+           (c->next_submit == 0 || c->parallel == 1 ||
+            atomic_load(&c->first_audio))) {
+        s2p_status rc = submit_chunk(s, c, c->next_submit);
+        if (rc == S2P_ERR_FULL && c->next_submit > 0) return S2P_OK;
+        if (rc != S2P_OK) return rc;
+    }
+    return S2P_OK;
 }
 
 /* ------------------------------------------------------------- conn mgmt */
@@ -500,9 +599,26 @@ static void conn_reset(conn* c) {
     free((void*)c->lf_clone_part.codes);
     free(c->lf_clone_text);
     free(c->gap_hold);
+    if (c->slots) {
+        for (int i = 0; i < c->n_chunks; i++) free(c->slots[i].pend);
+        free(c->slots);
+    }
     memset(c, 0, sizeof(*c));
     c->fd = -1;
     c->st = C_FREE;
+}
+
+/* Cancel every submitted request of a connection (poll-loop thread only).
+ * cancel() waits out an in-flight callback, so afterwards no scheduler
+ * callback touches c and its fd may be written or closed. */
+static void conn_cancel_all(http_srv* s, conn* c) {
+    if (c->slots) {
+        for (int i = 0; i < c->n_chunks; i++)
+            if (c->slots[i].submitted)
+                (void)s2p_sched_cancel(s->sched, c->slots[i].req_id);
+    } else if (c->req_id != 0) {
+        (void)s2p_sched_cancel(s->sched, c->req_id);
+    }
 }
 
 static conn* conn_alloc(http_srv* s, int fd) {
@@ -706,6 +822,17 @@ static void route_tts(http_srv* s, conn* c) {
         chunk_gap_ms = (int)s2p_jint(v);
     if (chunk_gap_ms < 0) chunk_gap_ms = 0;
     if (chunk_gap_ms > 10000) chunk_gap_ms = 10000;
+    int chunk_parallel = HTTP_CHUNK_PARALLEL_DEFAULT;
+    {
+        const char* e = getenv("S2P_CHUNK_PARALLEL");
+        if (e && e[0]) chunk_parallel = atoi(e);
+    }
+    if ((v = s2p_jobj_get(root, "chunk_parallel")) != NULL &&
+        !s2p_jis_null(v))
+        chunk_parallel = (int)s2p_jint(v);
+    if (chunk_parallel < 1) chunk_parallel = 1;
+    if (chunk_parallel > HTTP_CHUNK_PARALLEL_MAX)
+        chunk_parallel = HTTP_CHUNK_PARALLEL_MAX;
 
     /* voice selection / on-the-fly cloning (all errors here are pre-header,
      * so clients still get proper JSON error responses) */
@@ -774,10 +901,20 @@ static void route_tts(http_srv* s, conn* c) {
         int    n = 0;
         if (s2p_text_chunks(text_c, chunk_target, chunk_sentences, &chunks,
                             &n) == S2P_OK) {
-            if (n > 1) {
+            chunk_slot* slots =
+                n > 1 ? (chunk_slot*)calloc((size_t)n, sizeof(chunk_slot))
+                      : NULL;
+            if (n > 1 && slots) {
+                for (int i = 0; i < n; i++) {
+                    slots[i].owner = c;
+                    slots[i].idx = i;
+                }
                 c->chunks = chunks;
                 c->n_chunks = n;
-                c->cur_chunk = 0;
+                c->slots = slots;
+                c->parallel = clone_pcm != NULL ? 1 : chunk_parallel;
+                c->next_submit = 0;
+                c->emit_chunk = 0;
                 c->lf_voice = named;
                 c->lf_clone_pcm = clone_pcm;   /* ownership -> conn */
                 c->lf_clone_n = clone_n;
@@ -816,7 +953,8 @@ static void route_tts(http_srv* s, conn* c) {
     c->sent_wav_hdr = 0;
     c->buffered = buffered;
     atomic_store(&c->finished, 0);
-    atomic_store(&c->chunk_advance, 0);
+    atomic_store(&c->in_flight, 0);
+    atomic_store(&c->first_audio, 0);
 
     if (!buffered) {
         /* Response headers BEFORE submit so the cb can stream immediately.
@@ -841,7 +979,7 @@ static void route_tts(http_srv* s, conn* c) {
     s2p_status rc;
     if (c->n_chunks > 1) {
         c->lf_sampling = sampling;
-        rc = submit_chunk(s, c);
+        rc = chain_submit_ready(s, c);
     } else {
         uint64_t req_id = 0;
         rc = s2p_sched_submit(s->sched, &req, &sampling, tts_audio_cb, c,
@@ -1008,15 +1146,16 @@ s2p_status s2p_server_run(s2p_sched* sched, const s2p_server_opts* opts) {
                 conn_reset(c); /* final chunk delivered; close */
                 continue;
             }
-            if (c->st == C_STREAMING && atomic_load(&c->chunk_advance)) {
-                /* previous long-form chunk finished; submit the next */
-                atomic_store(&c->chunk_advance, 0);
-                c->cur_chunk++;
-                s2p_status crc = submit_chunk(&srv, c);
+            if (c->st == C_STREAMING && c->n_chunks > 1 &&
+                c->next_submit < c->n_chunks) {
+                /* long-form chain: submit what the in-flight window allows */
+                s2p_status crc = chain_submit_ready(&srv, c);
                 if (crc != S2P_OK) {
                     fprintf(stderr,
                             "[s2pro] http: chunk %d/%d submit failed (%d)\n",
-                            c->cur_chunk + 1, c->n_chunks, (int)crc);
+                            c->next_submit + 1, c->n_chunks, (int)crc);
+                    /* no chunk callback may write while the error goes out */
+                    conn_cancel_all(&srv, c);
                     if (c->buffered)
                         send_simple(c->fd, 503, "Service Unavailable",
                                     "application/json",
@@ -1083,7 +1222,7 @@ s2p_status s2p_server_run(s2p_sched* sched, const s2p_server_opts* opts) {
                                    errno != EWOULDBLOCK && errno != EINTR)) {
                         /* Client gone. cancel() guarantees the worker is out
                          * of the callback before we close the fd. */
-                        (void)s2p_sched_cancel(srv.sched, c->req_id);
+                        conn_cancel_all(&srv, c);
                         conn_reset(c);
                     }
                     /* r > 0: stray request bytes on a streaming conn — drop. */
@@ -1124,7 +1263,7 @@ s2p_status s2p_server_run(s2p_sched* sched, const s2p_server_opts* opts) {
     for (int i = 0; i < max_conns; i++) {
         conn* c = &srv.conns[i];
         if (c->st == C_STREAMING)
-            (void)s2p_sched_cancel(srv.sched, c->req_id);
+            conn_cancel_all(&srv, c);
         if (c->st != C_FREE) conn_reset(c);
     }
     free(pfds);

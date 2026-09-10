@@ -289,6 +289,16 @@ components:
           minimum: 0
           default: 2
           description: Close a chunk after this many sentences (0 = byte limit only).
+        chunk_parallel:
+          type: integer
+          minimum: 1
+          maximum: 8
+          default: 4
+          description: >-
+            Long-form chunks generated concurrently (1 = one after another).
+            Audio still streams in order; chunks after the first start once the
+            first chunk has produced audio. Per-request cloning always runs
+            sequentially.
         chunk_gap_ms:
           type: integer
           minimum: 0
