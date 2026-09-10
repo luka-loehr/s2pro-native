@@ -413,3 +413,50 @@ rewrite dropped the M > 8 kernel instantiation; fixed 2026-08-07).
 Re-measured on the fixed kernel WITH the sliced LM-head (§12):
 B = 4/8/12/16 worst per-stream RTF **0.86 / 1.41 / 2.27 / 2.97**. The
 cap under the per-stream RTF < 1 rule stays 5.
+
+## 14. Parallel long-form chunks and the take-length guard (2026-09-10)
+
+A long-form request used to chain its sentence chunks: chunk k+1 was
+submitted only after chunk k had finished, so a request never occupied
+more than one lockstep row and a 58 s take needed 32.7 s of wall time
+(RTF 0.56) however idle the batch was. `src/http/http.c` now submits up
+to `chunk_parallel` chunks at once (default 4). Chunks after the first
+wait for the first chunk's first audio, so TTFA does not pay for the
+extra prefills; the chunk at the wire position streams live and later
+chunks buffer in their slot until their turn, so order and the join
+filter are untouched. Disconnects cancel every in-flight chunk before
+the socket is closed.
+
+Measured (all-INT4, voice `deeper-male`, 58 s German take, seed 42):
+
+| | sequential | parallel 4 |
+| --- | ---: | ---: |
+| wall RTF | 0.561 | **0.226** |
+| first audio byte | 0.265 s | 0.266 s |
+| deterministic across two runs | yes | yes |
+
+The audio at a fixed seed matches the chain for the first three chunks
+and is a different take for the fourth: chunk generations are
+independent sessions, so the lockstep batch composition changes the
+sampled trajectory once rows differ.
+
+**Runaway and empty chunks.** Under concurrent chunked requests the
+model occasionally never emits its end token for a two-sentence chunk
+and drones — continuous voiced sound, not silence — until its context
+bound (~127 s), or ends a chunk with no speech. The unguarded build
+showed this in 3 of 12 concurrent requests. Every generation now carries
+a cap from its text (bytes / 15 s × 2 + 3 s, min 8 s; `GUARD_*` in
+http.c, `S2P_CHUNK_GUARD=0` disables). A buffered chunk that overruns or
+ends empty is regenerated with a fresh seed, twice at most; a live chunk
+is cut at the cap because its audio is already with the listener. Under
+16 rounds × 3 concurrent requests with the language model generating
+continuously on the same GPU (191 sessions, 57 830 frames): one cut, no
+crash. The root cause is open; a text-derived cap was chosen over a
+silence detector because the runaway audio is fully voiced.
+
+**Do not run under CUDA MPS.** With MPS co-scheduling this server and a
+vLLM instance on the GB10, two heavy CUDA-graph workloads faulted the
+GPU within seconds of simultaneous load (Xid 13 once, Xid 31 once) and
+the MPS server tore both clients down. Separate default contexts
+time-slice and are hardware-isolated; a fault stays in its process.
+

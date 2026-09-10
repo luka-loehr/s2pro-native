@@ -10,6 +10,22 @@ for published releases.
 
 ## [Unreleased]
 
+### Added
+- Parallel long-form chunks: up to `chunk_parallel` chunks of one request
+  (default 4, max 8, env `S2P_CHUNK_PARALLEL`) generate concurrently in the
+  lockstep batch; wire order and join normalization are unchanged. A 58 s
+  German take on the DGX Spark: wall RTF 0.561 → 0.226 at the same 0.27 s
+  first-audio latency.
+- Take-length guard: every generation is capped from its text
+  (bytes / 15 s × 2 + 3 s, min 8 s). A buffered chunk that overruns or ends
+  empty is regenerated with a fresh seed (2×); a live chunk is cut at the
+  cap. Bounds the occasional runaway chunk (voiced drone to the context
+  bound) seen under concurrent requests. `S2P_CHUNK_GUARD=0` disables.
+
+### Notes
+- Do not run this server under CUDA MPS next to a vLLM instance: under
+  simultaneous heavy load the GPU faults and both clients die (measured).
+
 ## [1.0.1] — 2026-08-12
 
 ### Fixed

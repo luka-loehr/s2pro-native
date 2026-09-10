@@ -173,8 +173,9 @@ curl -X POST localhost:8010/v1/tts -d '{"text":"Hello.","format":"wav"}' -o hell
 | `POST /v1/tts` | Chunked streaming synthesis (WAV or raw PCM). |
 
 `POST /v1/tts` accepts `{"text", "format": "wav"|"pcm", "temperature",
-"top_p", "seed", "stream", "chunk_length", "chunk_gap_ms", "voice",
-"reference_audio_b64", "reference_text"}`; with `--token` set, requests
+"top_p", "seed", "stream", "chunk_length", "chunk_sentences",
+"chunk_gap_ms", "chunk_parallel", "voice", "reference_audio_b64",
+"reference_text"}`; with `--token` set, requests
 require `Authorization: Bearer <token>`.
 
 **Voice selection.** `voice` selects a pre-encoded registry voice;
@@ -195,6 +196,29 @@ generation holds the opening-quality prosody across the whole take (2–5
 pauses per bucket through 130+ s; the same text runs ~26 % longer because
 the rushing is gone). Zero-shot requests never chunk (each chunk would
 draw a new voice).
+
+**Parallel chunks.** The chunks of one request are generated
+concurrently rather than one after another: up to `chunk_parallel` of
+them (default 4, max 8, env `S2P_CHUNK_PARALLEL`; `1` restores the
+sequential chain) sit in the lockstep batch at once, chunks after the
+first joining only once the first has produced audio so time-to-first-
+audio is unchanged. The lockstep scheduler reads the weight stream once
+per tick for every session, so the extra chunks cost little memory-bus
+traffic while the request's audio arrives much faster: on the DGX Spark
+a 58 s German take drops from wall RTF 0.56 to 0.23 at the same 0.27 s
+first-audio latency. Wire order and the join filter are unchanged — the
+chunk whose turn it is streams live, later chunks buffer until their
+turn. Per-request cloning stays sequential (chunk 1 memoizes the codes).
+
+**Take-length guard.** The model occasionally fails to emit its end
+token for a short chunk and drones on to its context bound, or ends a
+chunk before producing speech. Every generation therefore carries a
+duration cap from its text (bytes / 15 per second, ×2, +3 s, at least
+8 s). A chunk still buffered when it overruns, or that ends nearly
+empty, is regenerated with a fresh seed (up to 2×) before the listener
+reaches it; the chunk on the wire is cut at the cap. Measured under 48
+heavy concurrent requests: one cut, no crash. `S2P_CHUNK_GUARD=0`
+disables it. Root cause not yet found; the guard bounds it.
 
 **Join normalization.** Boundary silence at chunk joins is trimmed on
 both sides and replaced by exactly `chunk_gap_ms` of silence (default
