@@ -2,12 +2,12 @@
 # s2pro-native — self-contained serving image (linux/arm64, DGX Spark).
 #
 # Build (on an sm_121 host):
-#   docker build -f containers/Dockerfile -t ghcr.io/luka-loehr/s2pro-native:1.0.1 .
+#   docker build -f containers/Dockerfile -t ghcr.io/luka-loehr/s2pro-native:1.1.0 .
 #
 # Run (two commands, see README §Quickstart):
-#   docker pull ghcr.io/luka-loehr/s2pro-native:1.0.1
+#   docker pull ghcr.io/luka-loehr/s2pro-native:1.1.0
 #   docker run --gpus all -p 8010:8010 -v s2pro-data:/data \
-#       ghcr.io/luka-loehr/s2pro-native:1.0.1
+#       ghcr.io/luka-loehr/s2pro-native:1.1.0
 #
 # The S2-Pro checkpoint is NOT in the image (Fish Audio Research License);
 # the entrypoint downloads it into the /data volume on first start and

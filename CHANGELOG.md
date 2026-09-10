@@ -10,6 +10,8 @@ for published releases.
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-09-10
+
 ### Added
 - Parallel long-form chunks: up to `chunk_parallel` chunks of one request
   (default 4, max 8, env `S2P_CHUNK_PARALLEL`) generate concurrently in the

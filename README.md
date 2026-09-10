@@ -37,7 +37,7 @@ An unpatched checkpoint serves the INT8-fast-AR configuration at
 measured path from 2.05 to 0.51 — including the negative results — is
 recorded in the technical reports (§7).
 
-> **Status: v1.0.1, stable.** BF16, INT8, and the
+> **Status: v1.1.0, stable.** BF16, INT8, and the
 > packed group-wise INT4 backbone pass the layer-parity gate against the
 > PyTorch reference; voice cloning, the multilingual voice registry, and
 > the HTTP streaming server are exercised end to end on real hardware.
@@ -122,9 +122,9 @@ lockstep scheduler (sessions, first-frame priority, backpressure)
 ### Container (two commands)
 
 ```bash
-docker pull ghcr.io/luka-loehr/s2pro-native:1.0.1
+docker pull ghcr.io/luka-loehr/s2pro-native:1.1.0
 docker run --gpus all -p 8010:8010 -v s2pro-data:/data \
-    ghcr.io/luka-loehr/s2pro-native:1.0.1
+    ghcr.io/luka-loehr/s2pro-native:1.1.0
 ```
 
 On first start the entrypoint downloads the S2-Pro checkpoint into the
