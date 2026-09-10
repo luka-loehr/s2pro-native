@@ -88,6 +88,23 @@
 #define HTTP_CHUNK_PARALLEL_DEFAULT 4
 #define HTTP_CHUNK_PARALLEL_MAX     8
 
+/* Take-length guard. The model occasionally fails to emit its end token
+ * for a short chunk and drones on until its context bound (~2 min), or
+ * ends a chunk before producing any speech. Each generation therefore
+ * carries a duration cap derived from its text: cap = text_bytes /
+ * GUARD_BYTES_PER_SEC * GUARD_CAP_FACTOR + GUARD_CAP_SLACK_S (never below
+ * GUARD_CAP_MIN_S). A chunk that is still buffered when it overruns the cap
+ * or ends nearly empty is regenerated with a fresh seed, up to
+ * GUARD_RETRIES times; the chunk on the wire is cut at the cap instead
+ * (its audio is already with the listener). S2P_CHUNK_GUARD=0 disables. */
+#define GUARD_BYTES_PER_SEC   15.0
+#define GUARD_CAP_FACTOR      2.0
+#define GUARD_CAP_SLACK_S     3.0
+#define GUARD_CAP_MIN_S       8.0
+#define GUARD_EMPTY_S         0.3   /* final with less audio = empty */
+#define GUARD_EMPTY_MIN_BYTES 12    /* shorter chunks may legitimately be silent */
+#define GUARD_RETRIES         2
+
 /* Inter-chunk gap normalization: the model's own sentence pauses inside a
  * take run ~1.0-1.3 s (the project owner's "perfect" range), but the
  * trailing/leading silence around a chunk join is whatever the two takes
@@ -126,7 +143,26 @@ typedef struct chunk_slot {
     int      done;       /* scheduler thread: final delivered */
     int16_t* pend;       /* scheduler thread: audio waiting for its turn */
     size_t   pend_n, pend_cap;
+    /* take-length guard */
+    size_t     samples;     /* scheduler thread: audio produced this attempt */
+    size_t     cap_samples; /* 0 = no cap */
+    int        retries;     /* regenerations left */
+    int        attempt;     /* poll-loop thread: seed offset */
+    atomic_int retry;       /* scheduler -> poll loop: resubmit this chunk */
 } chunk_slot;
+
+static size_t guard_cap_samples(size_t text_bytes) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char* e = getenv("S2P_CHUNK_GUARD");
+        enabled = !(e && e[0] == '0' && e[1] == '\0');
+    }
+    if (!enabled) return 0;
+    double s = (double)text_bytes / GUARD_BYTES_PER_SEC * GUARD_CAP_FACTOR +
+               GUARD_CAP_SLACK_S;
+    if (s < GUARD_CAP_MIN_S) s = GUARD_CAP_MIN_S;
+    return (size_t)(s * 44100.0);
+}
 
 typedef struct {
     int        fd;
@@ -160,6 +196,8 @@ typedef struct {
     int         emit_chunk;   /* scheduler thread */
     atomic_int  in_flight;
     atomic_int  first_audio;
+    size_t      samples;        /* single-request path: audio produced */
+    size_t      cap_samples;    /* single-request path: 0 = no cap */
     int         gap_ms;             /* inter-chunk gap; 0 = raw concat */
     int16_t*    gap_hold;           /* boundary tail window (scheduler thr) */
     size_t      gap_hold_n;
@@ -464,12 +502,23 @@ static void conn_finish_response(conn* c) {
     atomic_store(&c->finished, 1);         /* LAST touch of c by this thread */
 }
 
-/* Single request (no long-form chain). */
+/* Single request (no long-form chain). A take that overruns its cap is
+ * cut there: the response closes and the session is cancelled. */
 static int tts_audio_cb(void* user, const int16_t* pcm, int64_t n, int final) {
     conn* c = (conn*)user;
-    if (n > 0 && pcm && conn_emit(c, pcm, (size_t)n) != 0) return 1;
-    if (final) conn_finish_response(c);
-    return 0;
+    int cut = 0;
+    if (n > 0 && pcm && c->cap_samples && c->samples + (size_t)n > c->cap_samples) {
+        n = (int64_t)(c->cap_samples - c->samples);
+        cut = 1;
+        fprintf(stderr, "[s2pro] http: take overran its cap (%.1f s), cut\n",
+                (double)c->cap_samples / 44100.0);
+    }
+    if (n > 0 && pcm) {
+        if (conn_emit(c, pcm, (size_t)n) != 0) return 1;
+        c->samples += (size_t)n;
+    }
+    if (final || cut) conn_finish_response(c);
+    return cut; /* nonzero cancels the session; c is not touched again */
 }
 
 static int pend_append(chunk_slot* sl, const int16_t* pcm, size_t n) {
@@ -512,24 +561,59 @@ static int chain_advance(conn* c) {
     }
 }
 
+/* Arm a regeneration of chunk sl (scheduler thread). The current attempt's
+ * buffered audio is dropped; the poll loop resubmits with a fresh seed. */
+static void chunk_regenerate(conn* c, chunk_slot* sl, const char* why) {
+    fprintf(stderr, "[s2pro] http: chunk %d/%d %s, regenerating (%d left)\n",
+            sl->idx + 1, c->n_chunks, why, sl->retries - 1);
+    free(sl->pend);
+    sl->pend = NULL;
+    sl->pend_n = sl->pend_cap = 0;
+    sl->samples = 0;
+    sl->retries--;
+    atomic_fetch_sub(&c->in_flight, 1);
+    atomic_store(&sl->retry, 1); /* LAST touch: the poll loop owns sl now */
+}
+
 /* Long-form chunk (scheduler thread; callbacks are serialized). */
 static int tts_chunk_cb(void* user, const int16_t* pcm, int64_t n, int final) {
     chunk_slot* sl = (chunk_slot*)user;
     conn* c = (conn*)sl->owner;
-    if (n > 0 && pcm && sl->idx == 0) atomic_store(&c->first_audio, 1);
-    if (sl->idx != c->emit_chunk) {
-        if (n > 0 && pcm && pend_append(sl, pcm, (size_t)n) != 0) return 1;
-        if (final) {
-            sl->done = 1;
-            atomic_fetch_sub(&c->in_flight, 1);
+    const int live = sl->idx == c->emit_chunk;
+    int cut = 0;
+    if (n > 0 && pcm && sl->cap_samples &&
+        sl->samples + (size_t)n > sl->cap_samples) {
+        if (!live && sl->retries > 0) {
+            chunk_regenerate(c, sl, "overran its cap");
+            return 1; /* cancel this attempt's session */
         }
+        n = (int64_t)(sl->cap_samples - sl->samples);
+        cut = 1;
+        fprintf(stderr, "[s2pro] http: chunk %d/%d overran its cap (%.1f s), cut\n",
+                sl->idx + 1, c->n_chunks, (double)sl->cap_samples / 44100.0);
+    }
+    if (n > 0 && pcm) {
+        if (sl->idx == 0) atomic_store(&c->first_audio, 1);
+        if (live ? gap_feed(c, pcm, (size_t)n) != 0
+                 : pend_append(sl, pcm, (size_t)n) != 0)
+            return 1;
+        sl->samples += (size_t)n;
+    }
+    if (!final && !cut) return 0;
+    if (final && !cut && sl->retries > 0 &&
+        sl->samples < (size_t)(GUARD_EMPTY_S * 44100.0) &&
+        strlen(c->chunks[sl->idx]) >= GUARD_EMPTY_MIN_BYTES &&
+        (!live || sl->samples == 0)) {
+        /* nothing (or next to nothing) was produced: try again; a live
+         * chunk only when none of it reached the wire */
+        chunk_regenerate(c, sl, "came back empty");
         return 0;
     }
-    if (n > 0 && pcm && gap_feed(c, pcm, (size_t)n) != 0) return 1;
-    if (!final) return 0;
     sl->done = 1;
     atomic_fetch_sub(&c->in_flight, 1);
-    return chain_advance(c);
+    if (!live) return cut;
+    int rc = chain_advance(c);
+    return rc != 0 ? 1 : cut;
 }
 
 /* Submit chunk idx of a long-form chain (poll-loop thread only).
@@ -555,12 +639,15 @@ static s2p_status submit_chunk(http_srv* s, conn* c, int idx) {
         req.ref_text = c->lf_voice->transcript;
         req.cache_key = c->lf_voice->name;
     }
+    chunk_slot* sl = &c->slots[idx];
     s2p_sampling_cfg sampling = c->lf_sampling;
     if (sampling.seed != 0) {
-        sampling.seed += 1000003ull * (uint64_t)idx;
+        sampling.seed += 1000003ull * (uint64_t)idx +
+                         7919ull * (uint64_t)sl->attempt;
         if (sampling.seed == 0) sampling.seed = 1;
     }
-    chunk_slot* sl = &c->slots[idx];
+    sl->attempt++;
+    atomic_store(&sl->retry, 0);
     atomic_fetch_add(&c->in_flight, 1); /* before submit: the final may race */
     s2p_status rc = s2p_sched_submit(s->sched, &req, &sampling, tts_chunk_cb,
                                      sl, &sl->req_id);
@@ -573,10 +660,24 @@ static s2p_status submit_chunk(http_srv* s, conn* c, int idx) {
     return rc;
 }
 
+static int chain_has_retry(const conn* c) {
+    for (int i = 0; i < c->n_chunks; i++)
+        if (atomic_load(&c->slots[i].retry)) return 1;
+    return 0;
+}
+
 /* Submit every chunk the in-flight window allows (poll-loop thread only). A
  * full scheduler queue is not an error for a later chunk: it is retried on
  * the next loop. */
 static s2p_status chain_submit_ready(http_srv* s, conn* c) {
+    /* regenerations first: their slot already counted toward the window */
+    for (int i = 0; i < c->n_chunks; i++) {
+        chunk_slot* sl = &c->slots[i];
+        if (!atomic_load(&sl->retry)) continue;
+        s2p_status rc = submit_chunk(s, c, i);
+        if (rc == S2P_ERR_FULL) return S2P_OK; /* retried next loop */
+        if (rc != S2P_OK) return rc;
+    }
     while (c->next_submit < c->n_chunks &&
            atomic_load(&c->in_flight) < c->parallel &&
            (c->next_submit == 0 || c->parallel == 1 ||
@@ -908,6 +1009,9 @@ static void route_tts(http_srv* s, conn* c) {
                 for (int i = 0; i < n; i++) {
                     slots[i].owner = c;
                     slots[i].idx = i;
+                    slots[i].cap_samples = guard_cap_samples(strlen(chunks[i]));
+                    slots[i].retries = GUARD_RETRIES;
+                    atomic_store(&slots[i].retry, 0);
                 }
                 c->chunks = chunks;
                 c->n_chunks = n;
@@ -952,6 +1056,8 @@ static void route_tts(http_srv* s, conn* c) {
     c->wav = wav;
     c->sent_wav_hdr = 0;
     c->buffered = buffered;
+    c->samples = 0;
+    c->cap_samples = c->n_chunks > 1 ? 0 : guard_cap_samples(strlen(text_c));
     atomic_store(&c->finished, 0);
     atomic_store(&c->in_flight, 0);
     atomic_store(&c->first_audio, 0);
@@ -1147,7 +1253,7 @@ s2p_status s2p_server_run(s2p_sched* sched, const s2p_server_opts* opts) {
                 continue;
             }
             if (c->st == C_STREAMING && c->n_chunks > 1 &&
-                c->next_submit < c->n_chunks) {
+                (c->next_submit < c->n_chunks || chain_has_retry(c))) {
                 /* long-form chain: submit what the in-flight window allows */
                 s2p_status crc = chain_submit_ready(&srv, c);
                 if (crc != S2P_OK) {
