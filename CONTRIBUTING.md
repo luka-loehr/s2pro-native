@@ -57,7 +57,7 @@ standard.
 - *Technical reports* (`docs/QUANT.md`, `docs/DAC-KERNELS.md`,
   `docs/QAT-RUNS.md`, `benchmarks/parity/README.md`): fixed skeleton —
   scope, problem statement, method, evaluation, results (negative results
-  reported with the same rigor as positive ones), reproduction.
+  reported alongside positive ones), reproduction.
 - *Specifications* (`docs/PORTING.md`, `CONTRACT.md`): normative
   statements; every constant traceable to source or checkpoint; inferred
   values flagged.
