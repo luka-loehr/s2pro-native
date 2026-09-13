@@ -11,7 +11,8 @@ repository-code: https://github.com/luka-loehr/s2pro-native
 abstract: >-
   A native C and CUDA streaming runtime for Fish Audio S2-Pro text-to-speech
   on NVIDIA DGX Spark, with a Dual-AR transformer implementation, RVQ
-  vocoder, FP8 block-scale GEMM integration, and a dependency-free HTTP
+  vocoder, INT8 and group-wise INT4 weight quantization validated by
+  layer parity against a PyTorch reference, and a dependency-free HTTP
   streaming service.
 keywords:
   - text-to-speech
@@ -19,5 +20,5 @@ keywords:
   - C
   - CUDA
   - streaming inference
-  - FP8
+  - quantization
   - NVIDIA DGX Spark
