@@ -40,10 +40,8 @@ pub fn pcm_from_le_bytes(bytes: &[u8]) -> Result<Vec<i16>> {
     if !bytes.len().is_multiple_of(2) {
         bail!("l16 payload has an odd byte count ({})", bytes.len());
     }
-    Ok(bytes
-        .chunks_exact(2)
-        .map(|b| i16::from_le_bytes([b[0], b[1]]))
-        .collect())
+    let (pairs, _) = bytes.as_chunks::<2>();
+    Ok(pairs.iter().map(|&b| i16::from_le_bytes(b)).collect())
 }
 
 #[cfg(test)]

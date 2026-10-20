@@ -10,6 +10,12 @@ for published releases.
 
 ## [Unreleased]
 
+### Security
+- `tools/voicegen` (the offline voice generator, not part of the runtime):
+  rustls 0.23.43 → 0.23.46 (RUSTSEC-2026-0285, -0346, -0348, -0349) and
+  h2 0.4.15 → 0.4.20 (RUSTSEC-2026-0258), plus patch updates of tokio
+  (1.53.3), reqwest (0.13.5) and serde_json (1.0.154).
+
 ## [1.1.0] — 2026-09-10
 
 ### Added
